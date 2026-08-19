@@ -1,0 +1,18 @@
+[Unit]
+Description=symbol static site hosting
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=samuel
+Group=samuel
+WorkingDirectory=/home/samuel/symbol
+ExecStart=/home/samuel/symbol/target/release/symbol --bind 127.0.0.1:4340 --root /var/lib/symbol
+Restart=on-failure
+StateDirectory=symbol
+Environment=RUST_LOG=info
+Environment=SYMBOL_BIND=127.0.0.1:4340
+Environment=SYMBOL_ROOT=/var/lib/symbol
+
+[Install]
+WantedBy=multi-user.target

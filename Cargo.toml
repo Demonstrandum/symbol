@@ -1,0 +1,27 @@
+[package]
+name = "symbol"
+version = "0.1.0"
+edition = "2021"
+description = "Tiny static-site hosting for the tailnet"
+
+[dependencies]
+axum = "0.8"
+blake3 = "1"
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+flate2 = "1"
+getrandom = "0.4"
+mime_guess = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+tar = "0.4"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-util", "net", "signal"] }
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tempfile = "3"

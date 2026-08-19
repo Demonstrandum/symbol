@@ -1,0 +1,12 @@
+/target
+/data
+/result
+/result-*
+/.direnv
+/flake.lock
+
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+

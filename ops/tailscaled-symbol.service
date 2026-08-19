@@ -1,0 +1,20 @@
+# One-time login (from gpu-3):
+#   sudo tailscale --socket=/run/tailscale-symbol/tailscaled.sock up \
+#     --hostname=symbol --advertise-tags=tag:research
+#   sudo tailscale --socket=/run/tailscale-symbol/tailscaled.sock serve --bg http://127.0.0.1:80
+#
+# UDP port 41647 is next after robotics (41646).
+
+[Unit]
+Description=Userspace tailscaled: symbol static hosting
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/sbin/tailscaled --tun=userspace-networking --statedir=/var/lib/tailscale-symbol --socket=/run/tailscale-symbol/tailscaled.sock --port=41647
+RuntimeDirectory=tailscale-symbol
+StateDirectory=tailscale-symbol
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
