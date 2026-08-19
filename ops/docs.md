@@ -23,7 +23,7 @@ symbol put hello index.html  # upload html to {host}/hello
 symbol put hello ./dist      # upload whole folder to {host}/hello
 symbol put -u hello site.zip # upload and unzip contents of zip
 symbol add hello style.css   # add a file to the site {host}/hello
-symbol ls          # list all sites
+symbol ls         # list all sites
 symbol pop hello  # removes a site and downloads its tar.gz
 symbol rm hello   # removes a site without backup
 symbol update     # reinstall this client
