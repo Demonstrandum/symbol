@@ -19,8 +19,10 @@
         fileset = lib.fileset.unions [
           ./Cargo.toml
           ./Cargo.lock
+          ./build.rs
           ./src
           ./ops
+          ./static
         ];
       };
     in

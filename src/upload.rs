@@ -20,6 +20,10 @@ pub enum UploadError {
     Junk,
     #[error("error: too many files")]
     TooManyFiles,
+    #[error("error: archive upload is too large")]
+    ArchiveTooLarge,
+    #[error("error: file upload is too large")]
+    FileTooLarge,
     #[error("error: extracted site is too large")]
     TooLarge,
     #[error("{0}")]

@@ -404,6 +404,12 @@ put_body() {
     *.gz) ctype=application/gzip ;;
     *.tar) ctype=application/x-tar ;;
     *.html|*.htm) ctype=text/html ;;
+    *.mp3) ctype=audio/mpeg ;;
+    *.m4a) ctype=audio/mp4 ;;
+    *.mp4|*.m4v) ctype=video/mp4 ;;
+    *.webm) ctype=video/webm ;;
+    *.ogg|*.oga) ctype=audio/ogg ;;
+    *.wav) ctype=audio/wav ;;
     *) ctype=application/octet-stream ;;
   esac
   if [ "$unpack" -eq 1 ]; then

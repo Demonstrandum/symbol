@@ -23,6 +23,7 @@ symbol put hello index.html  # upload html to {host}/hello
 symbol put hello ./dist      # upload whole folder to {host}/hello
 symbol put -u hello site.zip # upload and unzip contents of zip
 symbol add hello style.css   # add a file to the site {host}/hello
+symbol add hello song.mp3    # large media uploads stream from disk
 symbol ls         # list all sites
 symbol ls -l      # list sites with full URLs
 symbol stats      # counts, storage totals, and size distributions
@@ -47,6 +48,17 @@ add a file to that site: PUT
 curl -T style.css {host}/hello/style.css
 curl -T style.css {host}/hello/  # same; curl appends the local filename
 ```
+
+large stored files are uploaded and served as streams. byte ranges, seeking,
+resume, HEAD, and browser buffering are supported for media such as mp3/mp4.
+
+```
+curl -T movie.mp4 {host}/media/movie.mp4
+curl -H 'Range: bytes=1000000-' {host}/media/movie.mp4
+```
+
+individual stored files can be up to 4 GiB. archive unpacking is limited to
+50 MiB compressed and 80 MiB extracted.
 
 a zip, stored as a file
 

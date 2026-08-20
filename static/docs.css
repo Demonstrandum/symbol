@@ -1,0 +1,90 @@
+header {
+  margin-bottom: 1.6rem;
+}
+
+p {
+  max-width: 48rem;
+  margin: 0 0 1rem;
+  padding-left: 7ch;
+  color: var(--ink);
+}
+
+h2 {
+  margin: 1.8rem 0 .7rem;
+  color: var(--mark);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .16em;
+  text-transform: uppercase;
+}
+
+pre {
+  overflow: auto;
+  margin: 0 0 .7rem;
+  padding: .85rem 1rem;
+  border-left: 3px solid var(--mark);
+  background: var(--paper);
+  color: var(--ok);
+  cursor: pointer;
+  white-space: pre-wrap;
+}
+
+pre:hover { outline: 1px solid var(--rule); }
+pre .cmd { color: var(--mark); }
+pre .flag { color: var(--ink); }
+pre .str { color: var(--str); }
+pre .cmt,
+pre .punct { color: var(--dim); }
+
+pre .url {
+  color: var(--ok);
+  text-decoration: underline;
+  text-underline-offset: .15em;
+}
+
+.row { margin-bottom: 1.1rem; }
+.row pre { margin-left: 14ch; }
+
+.cap {
+  margin: 0 0 .35rem;
+  color: var(--dim);
+  font-size: 12px;
+}
+
+code {
+  font: inherit;
+  font-weight: 600;
+}
+
+a { color: var(--ink); }
+a:hover { color: var(--mark); }
+
+footer {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-top: 2.4rem;
+  border-top: 1px solid var(--rule);
+  padding-top: .8rem;
+  color: var(--dim);
+  font-size: 12px;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+}
+
+.toast {
+  position: fixed;
+  right: 1rem;
+  bottom: 1rem;
+  padding: .35rem .6rem;
+  background: var(--mark);
+  color: #1c1916;
+  font-size: 12px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  opacity: 0;
+  transition: opacity .15s;
+  pointer-events: none;
+}
+
+.toast.on { opacity: 1; }

@@ -1,9 +1,12 @@
 use std::sync::OnceLock;
 
 use axum::http::{HeaderMap, HeaderValue, header};
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
+use maud::{DOCTYPE, Markup, PreEscaped, html};
 
-const SOURCE: &str = include_str!("../ops/docs.md");
+use crate::http_cache::{self, Representation};
+
+const SOURCE: &str = static_asset!("docs.md");
 const HOST_PLACEHOLDER: &str = concat!("{", "host", "}");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,7 +37,7 @@ pub enum Block {
 
 fn source_page() -> &'static Page {
     static PAGE: OnceLock<Page> = OnceLock::new();
-    PAGE.get_or_init(|| parse(SOURCE).expect("ops/docs.md"))
+    PAGE.get_or_init(|| parse(SOURCE).expect("static/docs.md"))
 }
 
 struct Templates {
@@ -68,54 +71,35 @@ pub fn negotiate(headers: &HeaderMap) -> Flavor {
     })
 }
 
-pub fn render(host: &str, flavor: Flavor) -> Response {
+pub fn render(headers: &HeaderMap, host: &str, flavor: Flavor) -> Response {
     match flavor {
-        Flavor::Html => html_response(host),
-        Flavor::Plain => plain_response(host, false),
-        Flavor::Man => plain_response(host, true),
+        Flavor::Html => html_response(headers, host),
+        Flavor::Plain => plain_response(headers, host, false),
+        Flavor::Man => plain_response(headers, host, true),
     }
 }
 
-fn html_response(host: &str) -> Response {
-    (
-        [
-            (
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("text/html; charset=utf-8"),
-            ),
-            (header::CACHE_CONTROL, HeaderValue::from_static("no-cache")),
-            (header::VARY, HeaderValue::from_static("Accept, User-Agent")),
-            (
-                header::LINK,
-                HeaderValue::from_static("</>; rel=\"alternate\"; type=\"text/plain\""),
-            ),
-        ],
-        fill_html(host),
-    )
-        .into_response()
+fn html_response(headers: &HeaderMap, host: &str) -> Response {
+    let mut representation = Representation::new(fill_html(host), "text/html; charset=utf-8");
+    representation.vary = Some(HeaderValue::from_static("Accept, User-Agent"));
+    representation.link = Some(HeaderValue::from_static(
+        "</>; rel=\"alternate\"; type=\"text/plain\"",
+    ));
+    http_cache::respond(headers, representation)
 }
 
-fn plain_response(host: &str, man: bool) -> Response {
-    (
-        [
-            (
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("text/plain; charset=utf-8"),
-            ),
-            (header::CACHE_CONTROL, HeaderValue::from_static("no-cache")),
-            (header::VARY, HeaderValue::from_static("Accept, User-Agent")),
-            (
-                header::LINK,
-                HeaderValue::from_static("</>; rel=\"alternate\"; type=\"text/html\""),
-            ),
-        ],
-        if man {
-            fill_man(host)
-        } else {
-            render_plain(host)
-        },
-    )
-        .into_response()
+fn plain_response(headers: &HeaderMap, host: &str, man: bool) -> Response {
+    let body = if man {
+        fill_man(host)
+    } else {
+        render_plain(host)
+    };
+    let mut representation = Representation::new(body, "text/plain; charset=utf-8");
+    representation.vary = Some(HeaderValue::from_static("Accept, User-Agent"));
+    representation.link = Some(HeaderValue::from_static(
+        "</>; rel=\"alternate\"; type=\"text/html\"",
+    ));
+    http_cache::respond(headers, representation)
 }
 
 pub fn render_plain(host: &str) -> String {
@@ -127,7 +111,9 @@ fn fill_man(host: &str) -> String {
 }
 
 fn fill_html(host: &str) -> String {
-    templates().html.replace(HOST_PLACEHOLDER, &escape(host))
+    templates()
+        .html
+        .replace(HOST_PLACEHOLDER, &html! { (host) }.into_string())
 }
 
 fn render_plain_template(page: &Page, tty: bool) -> String {
@@ -181,64 +167,57 @@ fn render_plain_template(page: &Page, tty: bool) -> String {
 
 fn render_html(page: &Page) -> String {
     let (name, description) = intro(&page.title, &page.lead);
-    let mut body = String::new();
-    body.push_str("<!DOCTYPE html>\n<meta charset=\"utf-8\">\n");
-    body.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n");
-    body.push_str("<title>");
-    body.push_str(&escape(&page.title));
-    body.push_str("</title>\n<style>\n");
-    body.push_str(STYLE);
-    body.push_str("\n</style>\n<main>\n  <header>\n    <span>");
-    body.push_str(MAN);
-    body.push_str("</span>\n    <span>");
-    body.push_str(MAN_MID);
-    body.push_str("</span>\n    <span>");
-    body.push_str(MAN);
-    body.push_str("</span>\n  </header>\n  <h2>NAME</h2>\n  <p>");
-    body.push_str(&inline_html(&name));
-    body.push_str("</p>\n");
-    if !description.is_empty() {
-        body.push_str("  <h2>DESCRIPTION</h2>\n");
-        for para in &description {
-            body.push_str("  <p>");
-            body.push_str(&inline_html(para));
-            body.push_str("</p>\n");
+    html! {
+        (DOCTYPE)
+        meta charset="utf-8";
+        meta name="viewport" content="width=device-width, initial-scale=1";
+        title { (&page.title) }
+        style {
+            (PreEscaped(BASE_STYLE))
+            (PreEscaped(STYLE))
         }
-    }
-    for section in &page.sections {
-        body.push_str("  <h2>");
-        body.push_str(&escape(&section.heading));
-        body.push_str("</h2>\n");
-        for block in &section.blocks {
-            match block {
-                Block::Prose(text) => {
-                    body.push_str("  <p>");
-                    body.push_str(&inline_html(text));
-                    body.push_str("</p>\n");
-                }
-                Block::Example { caption, commands } => {
-                    body.push_str("  <div class=\"row\">\n");
-                    if !caption.is_empty() {
-                        body.push_str("    <p class=\"cap\">");
-                        body.push_str(&inline_html(caption));
-                        body.push_str("</p>\n");
-                    }
-                    body.push_str("    <pre>");
-                    body.push_str(&highlight_shell(commands));
-                    body.push_str("</pre>\n  </div>\n");
+        main {
+            header {
+                span { (MAN) }
+                span { (MAN_MID) }
+                span { (MAN) }
+            }
+            h2 { "NAME" }
+            p { (inline_html(&name)) }
+            @if !description.is_empty() {
+                h2 { "DESCRIPTION" }
+                @for paragraph in &description {
+                    p { (inline_html(paragraph)) }
                 }
             }
+            @for section in &page.sections {
+                h2 { (&section.heading) }
+                @for block in &section.blocks {
+                    @match block {
+                        Block::Prose(text) => {
+                            p { (inline_html(text)) }
+                        }
+                        Block::Example { caption, commands } => {
+                            .row {
+                                @if !caption.is_empty() {
+                                    p.cap { (inline_html(caption)) }
+                                }
+                                pre { (highlight_shell(commands)) }
+                            }
+                        }
+                    }
+                }
+            }
+            footer {
+                span { (MAN) }
+                span { "click a command to copy" }
+                span { (MAN) }
+            }
         }
+        .toast #toast { "copied" }
+        script { (PreEscaped(SCRIPT)) }
     }
-    body.push_str("  <footer>\n    <span>");
-    body.push_str(MAN);
-    body.push_str("</span>\n    <span>click a command to copy</span>\n    <span>");
-    body.push_str(MAN);
-    body.push_str(
-        "</span>\n  </footer>\n</main>\n<div class=\"toast\" id=\"toast\">copied</div>\n",
-    );
-    body.push_str(SCRIPT);
-    body
+    .into_string()
 }
 
 const MAN: &str = "SYMBOL(1)";
@@ -402,13 +381,6 @@ fn intro(title: &str, lead: &str) -> (String, Vec<String>) {
     (name, description)
 }
 
-fn escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
 #[derive(Clone, Copy)]
 enum Hl {
     Cmd,
@@ -434,28 +406,32 @@ impl Hl {
     }
 }
 
-fn highlight_shell(src: &str) -> String {
-    let mut out = String::with_capacity(src.len() * 2);
+fn highlight_shell(src: &str) -> Markup {
+    let mut out = Vec::new();
     let mut continued = false;
     for line in src.split_inclusive('\n') {
         let body = line.strip_suffix('\n').unwrap_or(line);
         highlight_line(body, !continued, &mut out);
         if line.ends_with('\n') {
-            out.push('\n');
+            out.push(html! { "\n" });
         }
         continued = body.trim_end().ends_with('\\');
     }
-    out
+    html! {
+        @for part in out {
+            (part)
+        }
+    }
 }
 
-fn highlight_line(line: &str, mut expect_cmd: bool, out: &mut String) {
+fn highlight_line(line: &str, mut expect_cmd: bool, out: &mut Vec<Markup>) {
     let mut rest = line;
     while !rest.is_empty() {
         if rest.starts_with(|ch: char| ch.is_whitespace()) {
             let n = rest
                 .find(|ch: char| !ch.is_whitespace())
                 .unwrap_or(rest.len());
-            out.push_str(&rest[..n]);
+            out.push(html! { (&rest[..n]) });
             rest = &rest[n..];
             continue;
         }
@@ -523,16 +499,10 @@ fn classify(tok: &str, expect_cmd: bool) -> Hl {
     Hl::Text
 }
 
-fn emit(out: &mut String, kind: Hl, text: &str) {
+fn emit(out: &mut Vec<Markup>, kind: Hl, text: &str) {
     match kind.class() {
-        Some(class) => {
-            out.push_str("<span class=\"");
-            out.push_str(class);
-            out.push_str("\">");
-            out.push_str(&escape(text));
-            out.push_str("</span>");
-        }
-        None => out.push_str(&escape(text)),
+        Some(class) => out.push(html! { span class=(class) { (text) } }),
+        None => out.push(html! { (text) }),
     }
 }
 
@@ -590,67 +560,70 @@ fn ticks(s: &str, tty: bool) -> String {
     out
 }
 
-fn inline_html(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+fn inline_html(s: &str) -> Markup {
+    let mut out = Vec::new();
     let mut rest = s;
     loop {
         let tick = rest.find('`');
         let brack = rest.find('[');
         let next = match (tick, brack) {
             (None, None) => {
-                out.push_str(&escape(rest));
-                return out;
+                out.push(html! { (rest) });
+                return html! {
+                    @for part in out {
+                        (part)
+                    }
+                };
             }
             (Some(t), None) => t,
             (None, Some(b)) => b,
             (Some(t), Some(b)) => t.min(b),
         };
-        out.push_str(&escape(&rest[..next]));
+        out.push(html! { (&rest[..next]) });
         rest = &rest[next..];
         if rest.starts_with('`') {
             rest = &rest[1..];
             if let Some(end) = rest.find('`') {
-                out.push_str("<code>");
-                out.push_str(&escape(&rest[..end]));
-                out.push_str("</code>");
+                out.push(html! { code { (&rest[..end]) } });
                 rest = &rest[end + 1..];
             } else {
-                out.push('`');
-                out.push_str(&escape(rest));
-                return out;
+                out.push(html! { "`" (rest) });
+                return html! {
+                    @for part in out {
+                        (part)
+                    }
+                };
             }
         } else if let Some((label, href, after)) = take_link(rest) {
-            out.push_str("<a href=\"");
-            out.push_str(&escape(href));
-            out.push_str("\">");
-            out.push_str(&codes_html(label));
-            out.push_str("</a>");
+            out.push(html! { a href=(href) { (codes_html(label)) } });
             rest = after;
         } else {
-            out.push('[');
+            out.push(html! { "[" });
             rest = &rest[1..];
         }
     }
 }
 
-fn codes_html(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+fn codes_html(s: &str) -> Markup {
+    let mut out = Vec::new();
     let mut rest = s;
     while let Some(start) = rest.find('`') {
-        out.push_str(&escape(&rest[..start]));
+        out.push(html! { (&rest[..start]) });
         rest = &rest[start + 1..];
         if let Some(end) = rest.find('`') {
-            out.push_str("<code>");
-            out.push_str(&escape(&rest[..end]));
-            out.push_str("</code>");
+            out.push(html! { code { (&rest[..end]) } });
             rest = &rest[end + 1..];
         } else {
-            out.push('`');
+            out.push(html! { "`" });
             break;
         }
     }
-    out.push_str(&escape(rest));
-    out
+    out.push(html! { (rest) });
+    html! {
+        @for part in out {
+            (part)
+        }
+    }
 }
 
 fn header_str(headers: &HeaderMap, name: header::HeaderName) -> &str {
@@ -794,113 +767,24 @@ fn parse(src: &str) -> Result<Page, String> {
     })
 }
 
-const STYLE: &str = r#":root {
-    --bg: #1c1916;
-    --paper: #11100e;
-    --ink: #d9d0c4;
-    --dim: #8a8176;
-    --rule: #3d3833;
-    --mark: #e85d04;
-    --ok: #c4d39d;
-    --str: #e6c07b;
-  }
-  * { box-sizing: border-box; }
-  html, body { margin: 0; background: var(--bg); color: var(--ink); }
-  body {
-    font: 15px/1.45 ui-monospace, "Cascadia Code", "SF Mono", Menlo, Consolas, monospace;
-    padding: 2.5rem 1.25rem 4rem;
-  }
-  main { max-width: 44rem; margin: 0 auto; }
-  header {
-    display: flex;
-    justify-content: space-between;
-    gap: 1rem;
-    border-bottom: 1px solid var(--rule);
-    padding-bottom: .6rem;
-    margin-bottom: 1.6rem;
-    color: var(--dim);
-    font-size: 12px;
-    letter-spacing: .12em;
-    text-transform: uppercase;
-  }
-  p { color: var(--ink); margin: 0 0 1rem; padding-left: 7ch; max-width: 48rem; }
-  h2 {
-    margin: 1.8rem 0 .7rem;
-    font-size: 11px;
-    letter-spacing: .16em;
-    text-transform: uppercase;
-    color: var(--mark);
-    font-weight: 600;
-  }
-  pre {
-    background: var(--paper);
-    border-left: 3px solid var(--mark);
-    padding: .85rem 1rem;
-    overflow: auto;
-    margin: 0 0 .7rem;
-    color: var(--ok);
-    cursor: pointer;
-    white-space: pre-wrap;
-  }
-  pre:hover { outline: 1px solid var(--rule); }
-  pre .cmd { color: var(--mark); }
-  pre .flag { color: var(--ink); }
-  pre .str { color: var(--str); }
-  pre .cmt, pre .punct { color: var(--dim); }
-  pre .url { color: var(--ok); text-decoration: underline; text-underline-offset: .15em; }
-  .row { margin-bottom: 1.1rem; }
-  .row pre { margin-left: 14ch; }
-  .cap {
-    color: var(--dim);
-    font-size: 12px;
-    margin: 0 0 .35rem;
-  }
-  code { font: inherit; font-weight: 600; }
-  a { color: var(--ink); }
-  a:hover { color: var(--mark); }
-  footer {
-    display: flex;
-    justify-content: space-between;
-    gap: 1rem;
-    margin-top: 2.4rem;
-    border-top: 1px solid var(--rule);
-    padding-top: .8rem;
-    color: var(--dim);
-    font-size: 12px;
-    letter-spacing: .12em;
-    text-transform: uppercase;
-  }
-  .toast {
-    position: fixed;
-    right: 1rem;
-    bottom: 1rem;
-    background: var(--mark);
-    color: #1c1916;
-    padding: .35rem .6rem;
-    font-size: 12px;
-    letter-spacing: .08em;
-    text-transform: uppercase;
-    opacity: 0;
-    transition: opacity .15s;
-    pointer-events: none;
-  }
-  .toast.on { opacity: 1; }"#;
-
-const SCRIPT: &str = r#"<script>
-  const toast = document.getElementById("toast");
-  document.querySelectorAll("pre").forEach((el) => {
-    el.addEventListener("click", async () => {
-      await navigator.clipboard.writeText(el.innerText);
-      toast.classList.add("on");
-      setTimeout(() => toast.classList.remove("on"), 700);
-    });
-  });
-</script>
-"#;
+const BASE_STYLE: &str = static_asset!("base.css");
+const STYLE: &str = static_asset!("docs.css");
+const SCRIPT: &str = static_asset!("docs.js");
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rendered_docs_support_conditional_requests() {
+        let response = render(&HeaderMap::new(), "https://symbol.test", Flavor::Html);
+        let etag = response.headers()[header::ETAG].clone();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::IF_NONE_MATCH, etag);
+
+        let response = render(&headers, "https://symbol.test", Flavor::Html);
+        assert_eq!(response.status(), axum::http::StatusCode::NOT_MODIFIED);
+    }
 
     #[test]
     fn parses_real_docs() {
@@ -998,15 +882,16 @@ mod tests {
             "see a (b) and c"
         );
         assert_eq!(
-            inline_html("see [`x`]({host}/x)"),
+            inline_html("see [`x`]({host}/x)").into_string(),
             "see <a href=\"{host}/x\"><code>x</code></a>"
         );
-        assert_eq!(inline_html("not [a link"), "not [a link");
+        assert_eq!(inline_html("not [a link").into_string(), "not [a link");
     }
 
     #[test]
     fn highlights_shell_in_html() {
-        let html = highlight_shell("curl -T index.html {host}/hello  # put\n'quoted' | sh \\\n");
+        let html = highlight_shell("curl -T index.html {host}/hello  # put\n'quoted' | sh \\\n")
+            .into_string();
         assert!(html.contains("class=\"cmd\">curl</span>"));
         assert!(html.contains("class=\"flag\">-T</span>"));
         assert!(html.contains("class=\"url\">{host}/hello</span>"));
@@ -1016,9 +901,9 @@ mod tests {
         assert!(html.contains("class=\"punct\">|</span>"));
         assert!(html.contains("class=\"punct\">\\</span>"));
         assert!(!html.contains("<script>"));
-        let html = highlight_shell("echo '<b>'");
+        let html = highlight_shell("echo '<b>'").into_string();
         assert!(html.contains("&lt;b&gt;"));
-        let html = highlight_shell("ls \u{00a0}# nbsp");
+        let html = highlight_shell("ls \u{00a0}# nbsp").into_string();
         assert!(html.contains("class=\"cmt\"># nbsp</span>"));
     }
 }

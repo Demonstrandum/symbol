@@ -18,14 +18,18 @@ serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 tar = "0.4"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-util", "net", "signal"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-util", "net", "signal", "sync"] }
 tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
+maud = "0.27.0"
+tokio-util = { version = "0.7.19", features = ["io"] }
+futures-util = "=0.3.32"
 
 [dev-dependencies]
 tempfile = "3"
+tower = { version = "0.5.3", features = ["util"] }
 
 [lints.rust]
 unsafe_code = "warn"
@@ -42,6 +46,7 @@ assigning_clones = "warn"
 borrowed_box = "warn"
 box_collection = "warn"
 clone_on_ref_ptr = "warn"
+clone_on_copy = "warn"
 implicit_clone = "warn"
 iter_overeager_cloned = "warn"
 large_enum_variant = "warn"
@@ -75,3 +80,6 @@ trait_duplication_in_bounds = "warn"
 type_repetition_in_bounds = "warn"
 unnested_or_patterns = "warn"
 use_self = "warn"
+
+[build-dependencies]
+lightningcss = { version = "1.0.0-alpha.72", default-features = false }

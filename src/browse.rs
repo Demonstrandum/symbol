@@ -1,9 +1,11 @@
 use std::fmt::Write as _;
 
-use axum::Json;
-use axum::http::{HeaderMap, header};
-use axum::response::{IntoResponse, Response};
+use axum::body::Bytes;
+use axum::http::{HeaderMap, HeaderValue, header};
+use axum::response::Response;
+use maud::{DOCTYPE, PreEscaped, html};
 
+use crate::http_cache::{self, Representation};
 use crate::page;
 use crate::store::{DirList, EntryKind, SiteList};
 
@@ -44,70 +46,25 @@ pub fn sites(headers: &HeaderMap, list: &SiteList) -> Response {
                 bytes: entry.bytes,
             })
             .collect();
-        return json_response(ListingJson {
-            path: "/".to_string(),
-            files: list.files,
-            bytes: list.bytes,
-            entries,
-        });
+        return json_response(
+            headers,
+            &ListingJson {
+                path: "/".to_string(),
+                files: list.files,
+                bytes: list.bytes,
+                entries,
+            },
+        );
     }
     let flavor = page::negotiate(headers);
     match flavor {
         page::Flavor::Plain | page::Flavor::Man => {
             let body = render_sites_plain(list);
-            (
-                [
-                    (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
-                    (header::CACHE_CONTROL, "no-cache"),
-                    (header::VARY, "Accept, User-Agent"),
-                ],
-                body,
-            )
-                .into_response()
+            cached_response(headers, body, "text/plain; charset=utf-8")
         }
         page::Flavor::Html => {
-            let mut rows = String::new();
-            for entry in &list.entries {
-                writeln!(
-                    rows,
-                    "    <a class=\"row\" href=\"/{name}/FILES/\"><span class=\"name\">{esc}/</span><span class=\"meta\">{files} files · {size}</span></a>",
-                    name = entry.name,
-                    esc = html_escape(&entry.name),
-                    files = entry.files,
-                    size = size_label(entry.bytes),
-                )
-                .unwrap();
-            }
-            let summary = format!("{} files · {} logical", list.files, size_label(list.bytes));
-            let body = format!(
-                r#"<!DOCTYPE html>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>sites</title>
-<style>
-{STYLE}
-</style>
-<main>
-  <header>
-    <span>FILES</span>
-    <span>sites</span>
-    <span><a href="/">docs</a></span>
-  </header>
-  <div class="summary">{summary}</div>
-  <div class="list">
-{rows}  </div>
-</main>
-"#,
-            );
-            (
-                [
-                    (header::CONTENT_TYPE, "text/html; charset=utf-8"),
-                    (header::CACHE_CONTROL, "no-cache"),
-                    (header::VARY, "Accept, User-Agent"),
-                ],
-                body,
-            )
-                .into_response()
+            let body = render_sites_html(list);
+            cached_response(headers, body, "text/html; charset=utf-8")
         }
     }
 }
@@ -133,38 +90,25 @@ pub fn listing(
                 bytes: entry.bytes,
             })
             .collect();
-        return json_response(ListingJson {
-            path: display_path(site, rel),
-            files: list.files,
-            bytes: list.bytes,
-            entries,
-        });
+        return json_response(
+            headers,
+            &ListingJson {
+                path: display_path(site, rel),
+                files: list.files,
+                bytes: list.bytes,
+                entries,
+            },
+        );
     }
     let flavor = page::negotiate(headers);
     match flavor {
         page::Flavor::Plain | page::Flavor::Man => {
             let body = render_plain(site, rel, list);
-            (
-                [
-                    (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
-                    (header::CACHE_CONTROL, "no-cache"),
-                    (header::VARY, "Accept, User-Agent"),
-                ],
-                body,
-            )
-                .into_response()
+            cached_response(headers, body, "text/plain; charset=utf-8")
         }
         page::Flavor::Html => {
             let body = render_html(site, rel, list, files_view);
-            (
-                [
-                    (header::CONTENT_TYPE, "text/html; charset=utf-8"),
-                    (header::CACHE_CONTROL, "no-cache"),
-                    (header::VARY, "Accept, User-Agent"),
-                ],
-                body,
-            )
-                .into_response()
+            cached_response(headers, body, "text/html; charset=utf-8")
         }
     }
 }
@@ -209,6 +153,40 @@ fn render_sites_plain(list: &SiteList) -> String {
     }
     push_listing_row(&mut out, "", Some(list.files), list.bytes, layout, " total");
     out
+}
+
+fn render_sites_html(list: &SiteList) -> String {
+    html! {
+        (DOCTYPE)
+        meta charset="utf-8";
+        meta name="viewport" content="width=device-width, initial-scale=1";
+        title { "sites" }
+        style {
+            (PreEscaped(BASE_STYLE))
+            (PreEscaped(STYLE))
+        }
+        main {
+            header {
+                span { "FILES" }
+                span { "sites" }
+                span { a href="/" { "docs" } }
+            }
+            .summary {
+                (list.files) " files · " (size_label(list.bytes)) " logical"
+            }
+            .list {
+                @for entry in &list.entries {
+                    a.row href=(format!("/{}/FILES/", entry.name)) {
+                        span.name { (&entry.name) "/" }
+                        span.meta {
+                            (entry.files) " files · " (size_label(entry.bytes))
+                        }
+                    }
+                }
+            }
+        }
+    }
+    .into_string()
 }
 
 fn render_plain(site: &str, rel: &str, list: &DirList) -> String {
@@ -260,74 +238,65 @@ fn render_plain(site: &str, rel: &str, list: &DirList) -> String {
 fn render_html(site: &str, rel: &str, list: &DirList, files_view: bool) -> String {
     let display = display_path(site, rel);
     let parent = parent_href(site, rel, files_view);
-    let mut rows = String::new();
-    if let Some(href) = parent {
-        writeln!(
-            rows,
-            "    <a class=\"row\" href=\"{href}\"><span class=\"name\">..</span><span class=\"meta\">dir</span></a>"
-        )
-        .unwrap();
-    }
-    for entry in &list.entries {
-        let href = entry_href(site, rel, &entry.name, entry.kind, files_view);
-        let meta = match entry.kind {
-            EntryKind::Directory => {
-                format!("{} files · {}", entry.files, size_label(entry.bytes))
-            }
-            EntryKind::File => size_label(entry.bytes),
-        };
-        let name = match entry.kind {
-            EntryKind::Directory => format!("{}/", html_escape(&entry.name)),
-            EntryKind::File => html_escape(&entry.name),
-        };
-        writeln!(
-            rows,
-            "    <a class=\"row\" href=\"{href}\"><span class=\"name\">{name}</span><span class=\"meta\">{meta}</span></a>"
-        )
-        .unwrap();
-    }
     let files_href = format!("/{site}/FILES/");
     let site_href = format!("/{site}/");
-    let see_site = if files_view
+    let see_site = files_view
         && list.entries.iter().any(|entry| {
             entry.kind == EntryKind::File
                 && matches!(entry.name.as_str(), "index.html" | "index.htm")
-        }) {
-        format!(
-            "<a class=\"see-site\" href=\"{}\">see site</a>",
-            html_escape(&dir_href(site, rel, false))
-        )
-    } else {
-        String::new()
-    };
-    format!(
-        r#"<!DOCTYPE html>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{title}</title>
-<style>
-{style}
-</style>
-<main>
-  <header>
-    <span>FILES</span>
-    <span>{title}</span>
-    <span><a href="{site_href}">site</a> · <a href="{files_href}">files</a></span>
-  </header>
-  <div class="summary"><span>{files} files · {size} logical</span>{see_site}</div>
-  <div class="list">
-{rows}  </div>
-</main>
-"#,
-        title = html_escape(&display),
-        style = STYLE,
-        rows = rows,
-        site_href = site_href,
-        files_href = files_href,
-        files = list.files,
-        size = size_label(list.bytes),
-        see_site = see_site,
-    )
+        });
+    html! {
+        (DOCTYPE)
+        meta charset="utf-8";
+        meta name="viewport" content="width=device-width, initial-scale=1";
+        title { (&display) }
+        style {
+            (PreEscaped(BASE_STYLE))
+            (PreEscaped(STYLE))
+        }
+        main {
+            header {
+                span { "FILES" }
+                span { (&display) }
+                span {
+                    a href=(site_href) { "site" }
+                    " · "
+                    a href=(files_href) { "files" }
+                }
+            }
+            .summary {
+                span { (list.files) " files · " (size_label(list.bytes)) " logical" }
+                @if see_site {
+                    a.see-site href=(dir_href(site, rel, false)) { "see site" }
+                }
+            }
+            .list {
+                @if let Some(href) = parent {
+                    a.row href=(href) {
+                        span.name { ".." }
+                        span.meta { "dir" }
+                    }
+                }
+                @for entry in &list.entries {
+                    a.row href=(entry_href(site, rel, &entry.name, entry.kind, files_view)) {
+                        span.name {
+                            (&entry.name)
+                            @if entry.kind == EntryKind::Directory { "/" }
+                        }
+                        span.meta {
+                            @match entry.kind {
+                                EntryKind::Directory => {
+                                    (entry.files) " files · " (size_label(entry.bytes))
+                                }
+                                EntryKind::File => (size_label(entry.bytes)),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    .into_string()
 }
 
 fn display_path(site: &str, rel: &str) -> String {
@@ -349,15 +318,19 @@ fn wants_json(headers: &HeaderMap) -> bool {
         })
 }
 
-fn json_response(value: ListingJson) -> Response {
-    (
-        [
-            (header::CACHE_CONTROL, "no-cache"),
-            (header::VARY, "Accept, User-Agent"),
-        ],
-        Json(value),
-    )
-        .into_response()
+fn json_response(headers: &HeaderMap, value: &ListingJson) -> Response {
+    let body = serde_json::to_vec(&value).expect("listing serializes");
+    cached_response(headers, Bytes::from(body), "application/json")
+}
+
+fn cached_response(
+    headers: &HeaderMap,
+    body: impl Into<Bytes>,
+    content_type: &'static str,
+) -> Response {
+    let mut representation = Representation::new(body, content_type);
+    representation.vary = Some(HeaderValue::from_static("Accept, User-Agent"));
+    http_cache::respond(headers, representation)
 }
 
 fn push_listing_row(
@@ -528,81 +501,8 @@ const fn digits(n: u64) -> usize {
     if n == 0 { 1 } else { n.ilog10() as usize + 1 }
 }
 
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
-const STYLE: &str = r#":root {
-    --bg: #1c1916;
-    --paper: #11100e;
-    --ink: #d9d0c4;
-    --dim: #8a8176;
-    --rule: #3d3833;
-    --mark: #e85d04;
-    --ok: #c4d39d;
-  }
-  * { box-sizing: border-box; }
-  html, body { margin: 0; background: var(--bg); color: var(--ink); }
-  body {
-    font: 15px/1.45 ui-monospace, "Cascadia Code", "SF Mono", Menlo, Consolas, monospace;
-    padding: 2.5rem 1.25rem 4rem;
-  }
-  main { max-width: 44rem; margin: 0 auto; }
-  header {
-    display: flex;
-    justify-content: space-between;
-    gap: 1rem;
-    border-bottom: 1px solid var(--rule);
-    padding-bottom: .6rem;
-    margin-bottom: 1.2rem;
-    color: var(--dim);
-    font-size: 12px;
-    letter-spacing: .12em;
-    text-transform: uppercase;
-  }
-  header a { color: var(--dim); text-decoration: none; }
-  header a:hover { color: var(--mark); }
-  .summary {
-    display: flex;
-    align-items: center;
-    justify-content: flex-end;
-    gap: .75rem;
-    margin: -.45rem .7rem .75rem;
-    color: var(--dim);
-    font-size: 12px;
-    text-align: right;
-    font-variant-numeric: tabular-nums;
-  }
-  .see-site {
-    padding: .25rem .5rem;
-    background: var(--mark);
-    color: var(--paper);
-    font-weight: 700;
-    letter-spacing: .08em;
-    text-decoration: none;
-    text-transform: uppercase;
-  }
-  .see-site:hover { color: var(--paper); filter: brightness(1.15); }
-  .list { display: flex; flex-direction: column; }
-  a.row {
-    display: grid;
-    grid-template-columns: 1fr auto;
-    gap: 1rem;
-    padding: .45rem .7rem;
-    color: var(--ink);
-    text-decoration: none;
-    border-left: 3px solid transparent;
-  }
-  a.row:hover { background: var(--paper); border-left-color: var(--mark); }
-  .name { color: var(--ok); }
-  .meta {
-    color: var(--dim);
-    font-size: 12px;
-    font-variant-numeric: tabular-nums;
-  }"#;
+const BASE_STYLE: &str = static_asset!("base.css");
+const STYLE: &str = static_asset!("browse.css");
 
 #[cfg(test)]
 mod tests {
@@ -710,6 +610,32 @@ mod tests {
         assert!(body.contains("1 files · 512 B"));
         assert!(body.contains(r#"href="/hello/FILES/""#));
         assert!(body.contains("font-variant-numeric: tabular-nums"));
+    }
+
+    #[test]
+    fn listing_etag_revalidates_and_changes_with_content() {
+        let mut list = SiteList {
+            files: 1,
+            bytes: 5,
+            entries: vec![SiteEnt {
+                name: "hello".to_string(),
+                files: 1,
+                bytes: 5,
+            }],
+        };
+        let response = sites(&HeaderMap::new(), &list);
+        let etag = response.headers()[header::ETAG].clone();
+
+        let mut conditional = HeaderMap::new();
+        conditional.insert(header::IF_NONE_MATCH, etag.clone());
+        let response = sites(&conditional, &list);
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+
+        list.bytes += 1;
+        list.entries[0].bytes += 1;
+        let response = sites(&conditional, &list);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_ne!(response.headers()[header::ETAG], etag);
     }
 
     #[test]
