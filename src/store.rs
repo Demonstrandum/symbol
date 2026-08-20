@@ -52,7 +52,7 @@ pub struct DirEnt {
     pub size: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct Stats {
     pub sites: i64,
     pub files: i64,

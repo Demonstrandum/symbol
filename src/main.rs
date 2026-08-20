@@ -14,7 +14,7 @@ use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
-use axum::Router;
+use axum::{Json, Router};
 use clap::Parser;
 use store::{Store, StoreError};
 use tokio::net::TcpListener;
@@ -163,13 +163,7 @@ async fn symbol_sh_hash(State(app): State<App>) -> Response {
 
 async fn stats(State(app): State<App>) -> Response {
     match app.store.stats() {
-        Ok(s) => plain(
-            StatusCode::OK,
-            format!(
-                "sites {}\nfiles {}\nblobs {}\nbytes {}",
-                s.sites, s.files, s.blobs, s.bytes
-            ),
-        ),
+        Ok(s) => Json(s).into_response(),
         Err(err) => err.into_response(),
     }
 }

@@ -148,6 +148,38 @@ request() {
   curl -sS -X "$method" "$@" "${HOST}${path}"
 }
 
+print_stats() {
+  awk -F '[,:{}]' '
+    function human(n, base, binary, labels, units, i) {
+      labels = binary ? "B KiB MiB GiB TiB PiB" : "B kB MB GB TB PB"
+      split(labels, units, " ")
+      i = 1
+      while (n >= base && i < 6) {
+        n /= base
+        i++
+      }
+      if (i == 1) return sprintf("%.0f %s", n, units[i])
+      return sprintf("%.2f %s", n, units[i])
+    }
+    {
+      for (i = 2; i < NF; i += 2) {
+        key = $i
+        value = $(i + 1)
+        gsub(/["[:space:]]/, "", key)
+        gsub(/[[:space:]]/, "", value)
+        if (key == "sites") sites = value
+        else if (key == "files") files = value
+        else if (key == "blobs") blobs = value
+        else if (key == "bytes") bytes = value
+      }
+    }
+    END {
+      printf "sites %s\nfiles %s\nblobs %s\n", sites, files, blobs
+      printf "bytes %s (%s / %s)\n", bytes, human(bytes, 1000, 0), human(bytes, 1024, 1)
+    }
+  '
+}
+
 put_body() {
   src=$1
   dest=$2
@@ -282,7 +314,8 @@ case "$cmd" in
     fi
     ;;
   stats)
-    request GET /STATS
+    stats_json=$(request GET /STATS)
+    printf '%s\n' "$stats_json" | print_stats
     ;;
   -h|--help|help|"")
     usage

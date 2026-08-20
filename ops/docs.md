@@ -31,7 +31,7 @@ symbol update     # reinstall this client
 
 ## curl
 
-no name provided gets you a a 4-character id, e.g. {host}/k7qm/
+no name provided gets you a a 4-character id, e.g. [{host}/k7qm/]({host}/k7qm/)
 
 ```
 curl -T index.html {host}/
