@@ -70,7 +70,7 @@ pub fn sites(headers: &HeaderMap, list: &SiteList) -> Response {
             for entry in &list.entries {
                 writeln!(
                     rows,
-                    "    <a class=\"row\" href=\"/{name}/FILES/\"><span class=\"name\">{esc}/</span><span class=\"meta\">{files} files · {size}</span></a>\n",
+                    "    <a class=\"row\" href=\"/{name}/FILES/\"><span class=\"name\">{esc}/</span><span class=\"meta\">{files} files · {size}</span></a>",
                     name = entry.name,
                     esc = html_escape(&entry.name),
                     files = entry.files,
@@ -264,7 +264,7 @@ fn render_html(site: &str, rel: &str, list: &DirList, files_view: bool) -> Strin
     if let Some(href) = parent {
         writeln!(
             rows,
-            "    <a class=\"row\" href=\"{href}\"><span class=\"name\">..</span><span class=\"meta\">dir</span></a>\n"
+            "    <a class=\"row\" href=\"{href}\"><span class=\"name\">..</span><span class=\"meta\">dir</span></a>"
         )
         .unwrap();
     }
@@ -282,7 +282,7 @@ fn render_html(site: &str, rel: &str, list: &DirList, files_view: bool) -> Strin
         };
         writeln!(
             rows,
-            "    <a class=\"row\" href=\"{href}\"><span class=\"name\">{name}</span><span class=\"meta\">{meta}</span></a>\n"
+            "    <a class=\"row\" href=\"{href}\"><span class=\"name\">{name}</span><span class=\"meta\">{meta}</span></a>"
         )
         .unwrap();
     }
@@ -374,7 +374,7 @@ fn push_listing_row(
     );
     writeln!(
         out,
-        "{name:<width$} {count}   {}{suffix}\n",
+        "{name:<width$} {count}   {}{suffix}",
         HumanSize::new(bytes).aligned(layout.size),
         width = layout.name,
     )
@@ -439,38 +439,40 @@ struct HumanSize {
 }
 
 impl HumanSize {
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "human-readable sizes are intentionally approximate"
-    )]
     fn new(bytes: u64) -> Self {
-        let (value, unit) = if bytes < 1024 {
-            (bytes as f64, "B")
+        let (divisor, unit) = if bytes < 1024 {
+            (1, "B")
         } else if bytes < 1024 * 1024 {
-            (bytes as f64 / 1024.0, "KiB")
+            (1024, "KiB")
         } else if bytes < 1024 * 1024 * 1024 {
-            (bytes as f64 / 1024.0 / 1024.0, "MiB")
+            (1024 * 1024, "MiB")
         } else if bytes < 1024_u64.pow(4) {
-            (bytes as f64 / 1024.0_f64.powi(3), "GiB")
+            (1024_u64.pow(3), "GiB")
         } else {
-            (bytes as f64 / 1024.0_f64.powi(4), "TiB")
+            (1024_u64.pow(4), "TiB")
         };
-        let precision = if unit == "B" || value >= 100.0 {
+        let precision = if divisor == 1 || bytes >= divisor * 100 {
             0
-        } else if value >= 10.0 {
+        } else if bytes >= divisor * 10 {
             1
         } else {
             2
         };
-        let text = format!("{value:.precision$}");
-        let (integer, fraction) = text
-            .split_once('.')
-            .map_or((text.as_str(), ""), |(integer, fraction)| {
-                (integer, fraction)
-            });
+        let scale = match precision {
+            0 => 1,
+            1 => 10,
+            2 => 100,
+            _ => unreachable!(),
+        };
+        let divisor = u128::from(divisor);
+        let rounded = (u128::from(bytes) * scale + divisor / 2) / divisor;
         Self {
-            integer: integer.to_string(),
-            fraction: fraction.to_string(),
+            integer: (rounded / scale).to_string(),
+            fraction: if precision == 0 {
+                String::new()
+            } else {
+                format!("{:0width$}", rounded % scale, width = precision)
+            },
             unit,
         }
     }

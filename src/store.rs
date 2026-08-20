@@ -175,19 +175,20 @@ impl Store {
     pub fn stats(&self) -> Result<Stats, StoreError> {
         let db = self.inner.db.lock().unwrap();
         let sites = db.query_row("SELECT COUNT(*) FROM sites", [], |row| {
-            row.get::<_, i64>(0).map(|n| n as u64)
+            row.get::<_, i64>(0).map(i64::cast_unsigned)
         })?;
         let file_values = load_sizes(&db, "SELECT size FROM files ORDER BY size")?;
         let blob_values = load_sizes(&db, "SELECT size FROM blobs ORDER BY size")?;
-        let files = file_values.len() as u64;
-        let blobs = blob_values.len() as u64;
+        drop(db);
+        let files = u64::try_from(file_values.len()).expect("file count fits in u64");
+        let blobs = u64::try_from(blob_values.len()).expect("blob count fits in u64");
         let logical_bytes = file_values.iter().sum();
         let bytes = blob_values.iter().sum();
         let saved_bytes = logical_bytes - bytes;
         let saved_fraction = if logical_bytes == 0 {
             0.0
         } else {
-            saved_bytes as f64 / logical_bytes as f64
+            u64_to_f64(saved_bytes) / u64_to_f64(logical_bytes)
         };
         Ok(Stats {
             sites,
@@ -214,11 +215,13 @@ impl Store {
             .query_map([], |row| {
                 Ok(SiteEnt {
                     name: row.get(0)?,
-                    files: row.get::<_, i64>(1)? as u64,
-                    bytes: row.get::<_, i64>(2)? as u64,
+                    files: row.get::<_, i64>(1)?.cast_unsigned(),
+                    bytes: row.get::<_, i64>(2)?.cast_unsigned(),
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+        drop(db);
         let files = entries.iter().map(|entry| entry.files).sum();
         let bytes = entries.iter().map(|entry| entry.bytes).sum();
         Ok(SiteList {
@@ -241,6 +244,8 @@ impl Store {
         let paths = stmt
             .query_map(params![name], |row| row.get(0))?
             .collect::<Result<Vec<String>, _>>()?;
+        drop(stmt);
+        drop(db);
         Ok(paths)
     }
 
@@ -259,12 +264,17 @@ impl Store {
             "SELECT path, size FROM files WHERE site_id = (SELECT id FROM sites WHERE name = ?1) ORDER BY path",
         )?;
         let rows = stmt.query_map(params![name], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?.cast_unsigned(),
+            ))
         })?;
         let mut files = Vec::new();
         for row in rows {
             files.push(row?);
         }
+        drop(stmt);
+        drop(db);
         Ok(dirents(&files, &rel))
     }
 
@@ -283,18 +293,20 @@ impl Store {
             return Err(StoreError::NotFound);
         }
         let db = self.inner.db.lock().unwrap();
-        match node_locked(&db, name, &rel)? {
-            NodeKind::Missing => Err(StoreError::NotFound),
-            NodeKind::Dir => Ok(Node::Dir),
+        let node = match node_locked(&db, name, &rel)? {
+            NodeKind::Missing => return Err(StoreError::NotFound),
+            NodeKind::Dir => Node::Dir,
             NodeKind::File => {
                 let hash: String = db.query_row(
                     "SELECT hash FROM files WHERE site_id = (SELECT id FROM sites WHERE name = ?1) AND path = ?2",
                     params![name, rel],
                     |row| row.get(0),
                 )?;
-                Ok(Node::File { logical: rel, hash })
+                Node::File { logical: rel, hash }
             }
-        }
+        };
+        drop(db);
+        Ok(node)
     }
 
     pub fn child_blob(&self, name: &str, rel: &str, child: &str) -> Result<Node, StoreError> {
@@ -387,6 +399,7 @@ impl Store {
         tx.execute("DELETE FROM sites WHERE name = ?1", params![name])?;
         gc_blobs(&tx)?;
         tx.commit()?;
+        drop(db);
         Ok(packed)
     }
 
@@ -394,6 +407,7 @@ impl Store {
         let name = parse_site_name(name)?;
         let db = self.inner.db.lock().unwrap();
         let archive = site_files(&db, name)?;
+        drop(db);
         match format {
             ArchiveFormat::Tar => pack_tar(&archive.files),
             ArchiveFormat::TarGz => pack_tar_gz(&archive.files),
@@ -437,6 +451,7 @@ impl Store {
         }
         gc_blobs(&tx)?;
         tx.commit()?;
+        drop(db);
         Ok(())
     }
 
@@ -469,6 +484,7 @@ impl Store {
         }
         gc_blobs(&tx)?;
         tx.commit()?;
+        drop(db);
         Ok(())
     }
 
@@ -496,6 +512,7 @@ impl Store {
         )?;
         gc_blobs(&tx)?;
         tx.commit()?;
+        drop(db);
         Ok(())
     }
 
@@ -503,6 +520,7 @@ impl Store {
         {
             let db = self.inner.db.lock().unwrap();
             let n: i64 = db.query_row("SELECT COUNT(*) FROM sites", [], |row| row.get(0))?;
+            drop(db);
             if n > 0 {
                 return Ok(());
             }
@@ -626,6 +644,7 @@ impl Store {
         }
         gc_blobs(&tx)?;
         tx.commit()?;
+        drop(db);
         Ok(())
     }
 
@@ -686,16 +705,28 @@ fn node_locked(db: &Connection, name: &str, rel: &str) -> Result<NodeKind, Store
 
 fn load_sizes(db: &Connection, sql: &str) -> Result<Vec<u64>, rusqlite::Error> {
     let mut stmt = db.prepare(sql)?;
-    let rows = stmt.query_map([], |row| row.get::<_, i64>(0).map(|size| size as u64))?;
+    let rows = stmt.query_map([], |row| row.get::<_, i64>(0).map(i64::cast_unsigned))?;
     rows.collect()
 }
 
-fn quantile(sorted: &[u64], p: f64) -> f64 {
-    let position = (sorted.len() - 1) as f64 * p;
-    let lower = position.floor() as usize;
-    let upper = position.ceil() as usize;
-    let weight = position - lower as f64;
-    (sorted[upper] as f64).mul_add(weight, sorted[lower] as f64 * (1.0 - weight))
+fn u64_to_f64(value: u64) -> f64 {
+    const U32_RADIX: f64 = u32::MAX as f64 + 1.0;
+
+    let high = u32::try_from(value >> u32::BITS).expect("upper half fits in u32");
+    let low = u32::try_from(value & u64::from(u32::MAX)).expect("lower half fits in u32");
+    f64::from(high).mul_add(U32_RADIX, f64::from(low))
+}
+
+fn quantile(sorted: &[u64], numerator: u8, denominator: u8) -> f64 {
+    let position = u128::try_from(sorted.len() - 1).expect("slice length fits in u128")
+        * u128::from(numerator);
+    let denominator_u128 = u128::from(denominator);
+    let lower = usize::try_from(position / denominator_u128).expect("quantile index fits in usize");
+    let remainder =
+        u8::try_from(position % denominator_u128).expect("quantile remainder fits in u8");
+    let upper = lower + usize::from(remainder != 0);
+    let weight = f64::from(remainder) / f64::from(denominator);
+    u64_to_f64(sorted[upper]).mul_add(weight, u64_to_f64(sorted[lower]) * (1.0 - weight))
 }
 
 fn distribution(sorted: &[u64]) -> SizeDistribution {
@@ -711,18 +742,19 @@ fn distribution(sorted: &[u64]) -> SizeDistribution {
             stddev: None,
         };
     }
-    let p25 = quantile(sorted, 0.25);
-    let median = quantile(sorted, 0.5);
-    let p75 = quantile(sorted, 0.75);
-    let mean = sorted.iter().map(|size| *size as f64).sum::<f64>() / sorted.len() as f64;
+    let p25 = quantile(sorted, 1, 4);
+    let median = quantile(sorted, 1, 2);
+    let p75 = quantile(sorted, 3, 4);
+    let len = u64::try_from(sorted.len()).expect("sample count fits in u64");
+    let mean = sorted.iter().copied().map(u64_to_f64).sum::<f64>() / u64_to_f64(len);
     let variance = sorted
         .iter()
         .map(|size| {
-            let delta = *size as f64 - mean;
+            let delta = u64_to_f64(*size) - mean;
             delta * delta
         })
         .sum::<f64>()
-        / sorted.len() as f64;
+        / u64_to_f64(len);
     SizeDistribution {
         min: sorted.first().copied(),
         p25: Some(p25),
@@ -824,7 +856,7 @@ fn stage_bytes(path: &str, bytes: &[u8]) -> StagedFile {
     let hash = blake3::hash(bytes);
     StagedFile {
         path: path.to_string(),
-        size: bytes.len() as i64,
+        size: i64::try_from(bytes.len()).expect("file size fits in SQLite INTEGER"),
         hash: hash.to_hex().to_string(),
         bytes: bytes.to_vec(),
     }
@@ -914,7 +946,9 @@ fn normalize_rel(rel: &str) -> Result<String, StoreError> {
 fn now_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as i64)
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_millis()).expect("timestamp fits in i64")
+        })
 }
 
 fn map_sql(err: rusqlite::Error) -> StoreError {
@@ -999,10 +1033,11 @@ mod tests {
         {
             let db = Connection::open(dir.path().join("symbol.db")).unwrap();
             let apple = [0x00u8, 0x05, 0x16, 0x07, 0, 2, 0, 0];
+            let apple_len = i64::try_from(apple.len()).unwrap();
             let hash = blake3::hash(&apple).to_hex().to_string();
             db.execute(
                 "INSERT INTO blobs (hash, bytes, size) VALUES (?1, ?2, ?3)",
-                params![hash, apple.as_slice(), apple.len() as i64],
+                params![hash, apple.as_slice(), apple_len],
             )
             .unwrap();
             let site_id: i64 = db
@@ -1012,12 +1047,12 @@ mod tests {
                 .unwrap();
             db.execute(
                 "INSERT INTO files (site_id, path, hash, size) VALUES (?1, ?2, ?3, ?4)",
-                params![site_id, "._index.html", hash, apple.len() as i64],
+                params![site_id, "._index.html", hash, apple_len],
             )
             .unwrap();
             db.execute(
                 "INSERT INTO files (site_id, path, hash, size) VALUES (?1, ?2, ?3, ?4)",
-                params![site_id, "keep.bin", hash, apple.len() as i64],
+                params![site_id, "keep.bin", hash, apple_len],
             )
             .unwrap();
         }
@@ -1079,7 +1114,7 @@ mod tests {
         assert_eq!(stats.bytes, 4);
         assert_eq!(stats.logical_bytes, 8);
         assert_eq!(stats.saved_bytes, 4);
-        assert_eq!(stats.saved_fraction, 0.5);
+        assert!((stats.saved_fraction - 0.5).abs() < f64::EPSILON);
         assert_eq!(stats.file_sizes.median, Some(4.0));
         assert_eq!(stats.blob_sizes.median, Some(4.0));
     }

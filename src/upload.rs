@@ -77,22 +77,17 @@ pub fn sniff(bytes: &[u8], content_type: Option<&str>, filename: Option<&str>) -
         }
     }
     if let Some(name) = filename {
-        let lower = name.to_ascii_lowercase();
-        if lower.ends_with(".zip") {
+        if has_extension(name, "zip") {
             return Kind::Zip;
         }
-        if lower.ends_with(".tar.gz")
-            || lower.ends_with(".tgz")
-            || lower.ends_with(".tar")
-            || lower.ends_with(".gz")
-        {
-            return if lower.ends_with(".tar") {
+        if has_extension(name, "tgz") || has_extension(name, "tar") || has_extension(name, "gz") {
+            return if has_extension(name, "tar") {
                 Kind::Tar
             } else {
                 Kind::Gzip
             };
         }
-        if lower.ends_with(".html") || lower.ends_with(".htm") {
+        if has_extension(name, "html") || has_extension(name, "htm") {
             return Kind::Html;
         }
     }
@@ -118,6 +113,18 @@ fn looks_like_html(bytes: &[u8]) -> bool {
         || rest.starts_with(b"<HTML")
         || rest.starts_with(b"<head")
         || rest.starts_with(b"<HEAD")
+}
+
+fn has_extension(name: &str, extension: &str) -> bool {
+    Path::new(name)
+        .extension()
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(extension))
+}
+
+fn has_ascii_suffix(value: &str, suffix: &str) -> bool {
+    value
+        .get(value.len().saturating_sub(suffix.len())..)
+        .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix))
 }
 
 pub fn write_payload(
@@ -165,11 +172,10 @@ fn unpack_payload(
 fn extract_gzip(dest: &Path, bytes: &[u8], filename: Option<&str>) -> Result<usize, UploadError> {
     let inner = gunzip(bytes)?;
     let name = filename.unwrap_or("");
-    let lower = name.to_ascii_lowercase();
     let as_tar = looks_like_tar(&inner)
-        || lower.ends_with(".tar.gz")
-        || lower.ends_with(".tgz")
-        || lower.ends_with(".tar");
+        || has_ascii_suffix(name, ".tar.gz")
+        || has_extension(name, "tgz")
+        || has_extension(name, "tar");
     if as_tar {
         return extract_tar(dest, Cursor::new(inner));
     }
@@ -190,8 +196,7 @@ fn strip_gz_name(name: &str) -> Option<&str> {
     if name.is_empty() {
         return None;
     }
-    let lower = name.to_ascii_lowercase();
-    if lower.ends_with(".gz") {
+    if has_extension(name, "gz") {
         Some(&name[..name.len() - 3])
     } else {
         Some(name)

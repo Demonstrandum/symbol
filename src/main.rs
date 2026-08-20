@@ -182,7 +182,7 @@ fn strip_hash_path(path: &str) -> Option<&str> {
     path.strip_suffix("/HASH")
 }
 
-async fn send_hash(app: &App, name: &str, rel: &str) -> Response {
+fn send_hash(app: &App, name: &str, rel: &str) -> Response {
     let lookup = if rel.is_empty() {
         ["index.html", "index.htm"].iter().find_map(|index| {
             app.store
@@ -190,7 +190,7 @@ async fn send_hash(app: &App, name: &str, rel: &str) -> Response {
                 .ok()
                 .and_then(|node| match node {
                     store::Node::File { hash, .. } => Some(hash),
-                    _ => None,
+                    store::Node::Dir => None,
                 })
         })
     } else {
@@ -200,10 +200,10 @@ async fn send_hash(app: &App, name: &str, rel: &str) -> Response {
             Err(err) => return err.into_response(),
         }
     };
-    match lookup {
-        Some(hash) => plain(StatusCode::OK, hash),
-        None => StoreError::NotFound.into_response(),
-    }
+    lookup.map_or_else(
+        || StoreError::NotFound.into_response(),
+        |hash| plain(StatusCode::OK, hash),
+    )
 }
 
 async fn docs(headers: HeaderMap) -> Response {
@@ -405,7 +405,7 @@ async fn serve_index(
     Path(name): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    serve_from(&app, &name, "", &headers).await
+    serve_from(&app, &name, "", &headers)
 }
 
 async fn serve_path(
@@ -414,12 +414,12 @@ async fn serve_path(
     headers: HeaderMap,
 ) -> Response {
     if let Some(rel) = strip_hash_path(&path) {
-        return send_hash(&app, &name, rel).await;
+        return send_hash(&app, &name, rel);
     }
-    serve_from(&app, &name, &path, &headers).await
+    serve_from(&app, &name, &path, &headers)
 }
 
-async fn serve_from(app: &App, name: &str, rel: &str, headers: &HeaderMap) -> Response {
+fn serve_from(app: &App, name: &str, rel: &str, headers: &HeaderMap) -> Response {
     match app.store.lookup(name, rel) {
         Ok(store::Node::Dir) => {
             if !rel.is_empty() && !rel.ends_with('/') {
@@ -429,17 +429,17 @@ async fn serve_from(app: &App, name: &str, rel: &str, headers: &HeaderMap) -> Re
                 if let Ok(store::Node::File { logical, hash }) =
                     app.store.child_blob(name, rel, index)
                 {
-                    return send_blob(headers, &logical, &hash, app).await;
+                    return send_blob(headers, &logical, &hash, app);
                 }
             }
             browse_dir(app, name, rel, false, headers)
         }
-        Ok(store::Node::File { logical, hash }) => send_blob(headers, &logical, &hash, app).await,
+        Ok(store::Node::File { logical, hash }) => send_blob(headers, &logical, &hash, app),
         Err(err) => err.into_response(),
     }
 }
 
-async fn send_blob(headers: &HeaderMap, logical: &str, hash: &str, app: &App) -> Response {
+fn send_blob(headers: &HeaderMap, logical: &str, hash: &str, app: &App) -> Response {
     let etag = format!("\"{hash}\"");
     if headers
         .get(header::IF_NONE_MATCH)

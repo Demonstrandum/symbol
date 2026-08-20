@@ -4,6 +4,7 @@ use axum::http::{HeaderMap, HeaderValue, header};
 use axum::response::{IntoResponse, Response};
 
 const SOURCE: &str = include_str!("../ops/docs.md");
+const HOST_PLACEHOLDER: &str = concat!("{", "host", "}");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Flavor {
@@ -55,9 +56,7 @@ fn templates() -> &'static Templates {
 }
 
 pub fn negotiate(headers: &HeaderMap) -> Flavor {
-    if let Some(flavor) = accept_flavor(header_str(headers, header::ACCEPT)) {
-        flavor
-    } else {
+    accept_flavor(header_str(headers, header::ACCEPT)).unwrap_or_else(|| {
         let ua = header_str(headers, header::USER_AGENT);
         if looks_like_browser(ua) {
             Flavor::Html
@@ -66,7 +65,7 @@ pub fn negotiate(headers: &HeaderMap) -> Flavor {
         } else {
             Flavor::Plain
         }
-    }
+    })
 }
 
 pub fn render(host: &str, flavor: Flavor) -> Response {
@@ -120,15 +119,15 @@ fn plain_response(host: &str, man: bool) -> Response {
 }
 
 pub fn render_plain(host: &str) -> String {
-    templates().plain.replace("{host}", host)
+    templates().plain.replace(HOST_PLACEHOLDER, host)
 }
 
 fn fill_man(host: &str) -> String {
-    templates().man.replace("{host}", host)
+    templates().man.replace(HOST_PLACEHOLDER, host)
 }
 
 fn fill_html(host: &str) -> String {
-    templates().html.replace("{host}", &escape(host))
+    templates().html.replace(HOST_PLACEHOLDER, &escape(host))
 }
 
 fn render_plain_template(page: &Page, tty: bool) -> String {
@@ -923,7 +922,7 @@ mod tests {
                 assert_eq!(caption, "hello there");
                 assert_eq!(commands, "cmd");
             }
-            other => panic!("{other:?}"),
+            other @ Block::Prose(_) => panic!("{other:?}"),
         }
     }
 
