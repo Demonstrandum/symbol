@@ -11,12 +11,12 @@ use std::sync::{Arc, Mutex};
 
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use clap::Parser;
-use store::{Store, StoreError};
+use store::{ArchiveFormat, Store, StoreError};
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 
@@ -79,12 +79,18 @@ fn router(app: App) -> Router {
         .route("/{name}/FILES", get(browse_root))
         .route("/{name}/FILES/", get(browse_root))
         .route("/{name}/FILES/{*path}", get(browse_path))
-        .route("/{name}/", get(serve_index).put(put_site).delete(delete_site))
+        .route(
+            "/{name}/",
+            get(serve_index).put(put_site).delete(delete_site),
+        )
         .route(
             "/{name}/{*path}",
             get(serve_path).put(put_file).delete(delete_file),
         )
-        .route("/{name}", get(redirect_site).put(put_site).delete(delete_site))
+        .route(
+            "/{name}",
+            get(redirect_site).put(put_site).delete(delete_site),
+        )
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .layer(TraceLayer::new_for_http())
         .with_state(app)
@@ -179,10 +185,13 @@ fn strip_hash_path(path: &str) -> Option<&str> {
 async fn send_hash(app: &App, name: &str, rel: &str) -> Response {
     let lookup = if rel.is_empty() {
         ["index.html", "index.htm"].iter().find_map(|index| {
-            app.store.child_blob(name, "", index).ok().and_then(|node| match node {
-                store::Node::File { hash, .. } => Some(hash),
-                _ => None,
-            })
+            app.store
+                .child_blob(name, "", index)
+                .ok()
+                .and_then(|node| match node {
+                    store::Node::File { hash, .. } => Some(hash),
+                    _ => None,
+                })
         })
     } else {
         match app.store.lookup(name, rel) {
@@ -216,12 +225,8 @@ async fn list_sites(State(app): State<App>, headers: HeaderMap) -> Response {
     }
 }
 
-async fn put_site_unnamed(
-    State(app): State<App>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    publish(&app, None, &headers, body)
+async fn put_site_unnamed(State(app): State<App>, headers: HeaderMap, body: Bytes) -> Response {
+    publish(&app, None, &headers, &body)
 }
 
 async fn put_site(
@@ -230,19 +235,22 @@ async fn put_site(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    publish(&app, Some(name.as_str()), &headers, body)
+    publish(&app, Some(name.as_str()), &headers, &body)
 }
 
-fn publish(app: &App, wanted: Option<&str>, headers: &HeaderMap, body: Bytes) -> Response {
+fn publish(app: &App, wanted: Option<&str>, headers: &HeaderMap, body: &Bytes) -> Response {
     let filename = filename_from(headers);
     let ctype = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok());
-    let kind = upload::sniff(&body, ctype, filename.as_deref());
-    match app
-        .store
-        .publish(wanted, wants_unpack(headers), &body, kind, filename.as_deref())
-    {
+    let kind = upload::sniff(body, ctype, filename.as_deref());
+    match app.store.publish(
+        wanted,
+        wants_unpack(headers),
+        body,
+        kind,
+        filename.as_deref(),
+    ) {
         Ok((name, n)) => {
             let url = format!("{}/{name}/", base_url(headers));
             (
@@ -299,7 +307,57 @@ async fn delete_file(
     }
 }
 
+#[derive(Clone, Copy)]
+struct ArchiveDownload<'a> {
+    name: &'a str,
+    format: ArchiveFormat,
+    extension: &'static str,
+    content_type: &'static str,
+}
+
+fn archive_download(path: &str) -> Option<ArchiveDownload<'_>> {
+    [
+        (".tar.gz", ArchiveFormat::TarGz, "application/gzip"),
+        (".tar", ArchiveFormat::Tar, "application/x-tar"),
+        (".zip", ArchiveFormat::Zip, "application/zip"),
+    ]
+    .into_iter()
+    .find_map(|(extension, format, content_type)| {
+        path.strip_suffix(extension).map(|name| ArchiveDownload {
+            name,
+            format,
+            extension,
+            content_type,
+        })
+    })
+}
+
+fn download_site(app: &App, request: ArchiveDownload<'_>) -> Response {
+    match app.store.pack_site(request.name, request.format) {
+        Ok(bytes) => (
+            [
+                (header::CONTENT_TYPE, request.content_type.to_string()),
+                (
+                    header::CONTENT_DISPOSITION,
+                    format!(
+                        "attachment; filename=\"{}{}\"",
+                        request.name, request.extension
+                    ),
+                ),
+                (header::CACHE_CONTROL, "no-cache".to_string()),
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(err) => err.into_response(),
+    }
+}
+
 async fn redirect_site(State(app): State<App>, Path(name): Path<String>) -> Response {
+    if let Some(request) = archive_download(&name) {
+        return download_site(&app, request);
+    }
     if app.store.site_exists(&name) {
         Redirect::temporary(&format!("/{name}/")).into_response()
     } else {
@@ -307,7 +365,11 @@ async fn redirect_site(State(app): State<App>, Path(name): Path<String>) -> Resp
     }
 }
 
-async fn browse_root(State(app): State<App>, Path(name): Path<String>, headers: HeaderMap) -> Response {
+async fn browse_root(
+    State(app): State<App>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Response {
     browse_dir(&app, &name, "", true, &headers)
 }
 
@@ -324,7 +386,9 @@ async fn browse_path(
             }
             browse_dir(&app, &name, rel, true, &headers)
         }
-        Ok(store::Node::File { .. }) => Redirect::temporary(&format!("/{name}/{rel}")).into_response(),
+        Ok(store::Node::File { .. }) => {
+            Redirect::temporary(&format!("/{name}/{rel}")).into_response()
+        }
         Err(err) => err.into_response(),
     }
 }
@@ -362,7 +426,8 @@ async fn serve_from(app: &App, name: &str, rel: &str, headers: &HeaderMap) -> Re
                 return Redirect::temporary(&format!("/{name}/{rel}/")).into_response();
             }
             for index in ["index.html", "index.htm"] {
-                if let Ok(store::Node::File { logical, hash }) = app.store.child_blob(name, rel, index)
+                if let Ok(store::Node::File { logical, hash }) =
+                    app.store.child_blob(name, rel, index)
                 {
                     return send_blob(headers, &logical, &hash, app).await;
                 }
@@ -460,12 +525,44 @@ fn plain(status: StatusCode, body: impl AsRef<str>) -> Response {
 impl IntoResponse for StoreError {
     fn into_response(self) -> Response {
         let status = match &self {
-            StoreError::NotFound => StatusCode::NOT_FOUND,
-            StoreError::Upload(upload::UploadError::TooLarge)
-            | StoreError::Upload(upload::UploadError::TooManyFiles) => StatusCode::PAYLOAD_TOO_LARGE,
-            StoreError::Io(_) | StoreError::Sqlite(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::NotFound => StatusCode::NOT_FOUND,
+            Self::Upload(upload::UploadError::TooLarge | upload::UploadError::TooManyFiles) => {
+                StatusCode::PAYLOAD_TOO_LARGE
+            }
+            Self::Io(_) | Self::Sqlite(_) => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::BAD_REQUEST,
         };
         plain(status, self.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+
+    #[tokio::test]
+    async fn stats_response_keeps_original_fields_and_adds_distributions() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::new(root.path().to_path_buf()).unwrap();
+        store.put_file("one", "a.txt", b"same").unwrap();
+        store.put_file("two", "b.txt", b"same").unwrap();
+        let response = stats(State(App {
+            store,
+            hashes: Arc::new(Mutex::new(HashMap::new())),
+        }))
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["sites"], 2);
+        assert_eq!(json["files"], 2);
+        assert_eq!(json["blobs"], 1);
+        assert_eq!(json["bytes"], 4);
+        assert_eq!(json["logical_bytes"], 8);
+        assert_eq!(json["saved_bytes"], 4);
+        assert_eq!(json["file_sizes"]["median"], 4.0);
+        assert_eq!(json["blob_sizes"]["median"], 4.0);
     }
 }

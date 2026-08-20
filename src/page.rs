@@ -1,6 +1,6 @@
 use std::sync::OnceLock;
 
-use axum::http::{header, HeaderMap, HeaderValue};
+use axum::http::{HeaderMap, HeaderValue, header};
 use axum::response::{IntoResponse, Response};
 
 const SOURCE: &str = include_str!("../ops/docs.md");
@@ -9,6 +9,7 @@ const SOURCE: &str = include_str!("../ops/docs.md");
 pub enum Flavor {
     Html,
     Plain,
+    Man,
 }
 
 #[derive(Debug)]
@@ -38,6 +39,7 @@ fn source_page() -> &'static Page {
 struct Templates {
     html: String,
     plain: String,
+    man: String,
 }
 
 fn templates() -> &'static Templates {
@@ -46,20 +48,23 @@ fn templates() -> &'static Templates {
         let page = source_page();
         Templates {
             html: render_html(page),
-            plain: render_plain_template(page),
+            plain: render_plain_template(page, false),
+            man: render_plain_template(page, true),
         }
     })
 }
 
 pub fn negotiate(headers: &HeaderMap) -> Flavor {
-    match accept_flavor(header_str(headers, header::ACCEPT)) {
-        Some(flavor) => flavor,
-        None => {
-            if looks_like_browser(header_str(headers, header::USER_AGENT)) {
-                Flavor::Html
-            } else {
-                Flavor::Plain
-            }
+    if let Some(flavor) = accept_flavor(header_str(headers, header::ACCEPT)) {
+        flavor
+    } else {
+        let ua = header_str(headers, header::USER_AGENT);
+        if looks_like_browser(ua) {
+            Flavor::Html
+        } else if looks_like_cli(ua) {
+            Flavor::Man
+        } else {
+            Flavor::Plain
         }
     }
 }
@@ -67,14 +72,18 @@ pub fn negotiate(headers: &HeaderMap) -> Flavor {
 pub fn render(host: &str, flavor: Flavor) -> Response {
     match flavor {
         Flavor::Html => html_response(host),
-        Flavor::Plain => plain_response(host),
+        Flavor::Plain => plain_response(host, false),
+        Flavor::Man => plain_response(host, true),
     }
 }
 
 fn html_response(host: &str) -> Response {
     (
         [
-            (header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8")),
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/html; charset=utf-8"),
+            ),
             (header::CACHE_CONTROL, HeaderValue::from_static("no-cache")),
             (header::VARY, HeaderValue::from_static("Accept, User-Agent")),
             (
@@ -87,10 +96,13 @@ fn html_response(host: &str) -> Response {
         .into_response()
 }
 
-fn plain_response(host: &str) -> Response {
+fn plain_response(host: &str, man: bool) -> Response {
     (
         [
-            (header::CONTENT_TYPE, HeaderValue::from_static("text/plain; charset=utf-8")),
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            ),
             (header::CACHE_CONTROL, HeaderValue::from_static("no-cache")),
             (header::VARY, HeaderValue::from_static("Accept, User-Agent")),
             (
@@ -98,7 +110,11 @@ fn plain_response(host: &str) -> Response {
                 HeaderValue::from_static("</>; rel=\"alternate\"; type=\"text/html\""),
             ),
         ],
-        render_plain(host),
+        if man {
+            fill_man(host)
+        } else {
+            render_plain(host)
+        },
     )
         .into_response()
 }
@@ -107,36 +123,50 @@ pub fn render_plain(host: &str) -> String {
     templates().plain.replace("{host}", host)
 }
 
+fn fill_man(host: &str) -> String {
+    templates().man.replace("{host}", host)
+}
+
 fn fill_html(host: &str) -> String {
     templates().html.replace("{host}", &escape(host))
 }
 
-fn render_plain_template(page: &Page) -> String {
+fn render_plain_template(page: &Page, tty: bool) -> String {
+    let (name, description) = intro(&page.title, &page.lead);
     let mut out = String::new();
-    out.push_str(&page.title);
+    out.push_str(&banner(MAN_MID, tty));
     out.push_str("\n\n");
-    out.push_str(&page.lead);
-    out.push('\n');
+    push_heading(&mut out, "NAME", tty);
+    push_name_line(&mut out, &name, tty);
+    if !description.is_empty() {
+        out.push('\n');
+        push_heading(&mut out, "DESCRIPTION", tty);
+        for para in &description {
+            out.push('\n');
+            push_wrapped(&mut out, &inline_plain(para, tty), INDENT);
+        }
+    }
     for section in &page.sections {
         out.push('\n');
-        out.push_str(&section.heading.to_uppercase());
-        out.push('\n');
+        push_heading(
+            &mut out,
+            &inline_plain(&section.heading, false).to_uppercase(),
+            tty,
+        );
         for block in &section.blocks {
             match block {
                 Block::Prose(text) => {
                     out.push('\n');
-                    out.push_str(text);
-                    out.push('\n');
+                    push_wrapped(&mut out, &inline_plain(text, tty), INDENT);
                 }
                 Block::Example { caption, commands } => {
                     if !caption.is_empty() {
                         out.push('\n');
-                        out.push_str(caption);
-                        out.push('\n');
+                        push_wrapped(&mut out, &inline_plain(caption, tty), INDENT);
                     }
                     out.push('\n');
                     for line in commands.lines() {
-                        out.push_str("    ");
+                        out.extend(std::iter::repeat_n(' ', EXDENT));
                         out.push_str(line);
                         out.push('\n');
                     }
@@ -145,10 +175,13 @@ fn render_plain_template(page: &Page) -> String {
         }
     }
     out.push('\n');
+    out.push_str(&banner(MAN_MID, tty));
+    out.push('\n');
     out
 }
 
 fn render_html(page: &Page) -> String {
+    let (name, description) = intro(&page.title, &page.lead);
     let mut body = String::new();
     body.push_str("<!DOCTYPE html>\n<meta charset=\"utf-8\">\n");
     body.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n");
@@ -156,11 +189,23 @@ fn render_html(page: &Page) -> String {
     body.push_str(&escape(&page.title));
     body.push_str("</title>\n<style>\n");
     body.push_str(STYLE);
-    body.push_str("\n</style>\n<main>\n  <header>\n    <span>SYMBOL(1)</span>\n    <span>Tailnet static hosting</span>\n    <span>SYMBOL(1)</span>\n  </header>\n  <h1>");
-    body.push_str(&heading_html(&page.title));
-    body.push_str("</h1>\n  <p class=\"lead\">");
-    body.push_str(&inline_html(&page.lead));
+    body.push_str("\n</style>\n<main>\n  <header>\n    <span>");
+    body.push_str(MAN);
+    body.push_str("</span>\n    <span>");
+    body.push_str(MAN_MID);
+    body.push_str("</span>\n    <span>");
+    body.push_str(MAN);
+    body.push_str("</span>\n  </header>\n  <h2>NAME</h2>\n  <p>");
+    body.push_str(&inline_html(&name));
     body.push_str("</p>\n");
+    if !description.is_empty() {
+        body.push_str("  <h2>DESCRIPTION</h2>\n");
+        for para in &description {
+            body.push_str("  <p>");
+            body.push_str(&inline_html(para));
+            body.push_str("</p>\n");
+        }
+    }
     for section in &page.sections {
         body.push_str("  <h2>");
         body.push_str(&escape(&section.heading));
@@ -186,9 +231,176 @@ fn render_html(page: &Page) -> String {
             }
         }
     }
-    body.push_str("  <footer>click a command to copy · {host}</footer>\n</main>\n<div class=\"toast\" id=\"toast\">copied</div>\n");
+    body.push_str("  <footer>\n    <span>");
+    body.push_str(MAN);
+    body.push_str("</span>\n    <span>click a command to copy</span>\n    <span>");
+    body.push_str(MAN);
+    body.push_str(
+        "</span>\n  </footer>\n</main>\n<div class=\"toast\" id=\"toast\">copied</div>\n",
+    );
     body.push_str(SCRIPT);
     body
+}
+
+const MAN: &str = "SYMBOL(1)";
+const MAN_MID: &str = "Tailnet static hosting";
+const COLS: usize = 78;
+const INDENT: usize = 7;
+const EXDENT: usize = 14;
+
+fn banner(mid: &str, tty: bool) -> String {
+    let ends = MAN.len() * 2;
+    let line = if COLS <= ends + mid.len() {
+        format!("{MAN} {mid} {MAN}")
+    } else {
+        let gap = COLS - ends;
+        let left_pad = gap.saturating_sub(mid.len()) / 2;
+        let right_pad = gap - mid.len() - left_pad;
+        let mut s = String::with_capacity(COLS);
+        s.push_str(MAN);
+        s.extend(std::iter::repeat_n(' ', left_pad));
+        s.push_str(mid);
+        s.extend(std::iter::repeat_n(' ', right_pad));
+        s.push_str(MAN);
+        s
+    };
+    if !tty {
+        return line;
+    }
+    let inner = &line[MAN.len()..line.len() - MAN.len()];
+    let mut out = overstrike(MAN);
+    out.push_str(inner);
+    out.push_str(&overstrike(MAN));
+    out
+}
+
+fn overstrike(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for c in s.chars() {
+        out.push(c);
+        out.push('\u{8}');
+        out.push(c);
+    }
+    out
+}
+
+fn vis(s: &str) -> usize {
+    let mut n = 0;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{8}' {
+            continue;
+        }
+        n += 1;
+        if chars.peek() == Some(&'\u{8}') {
+            chars.next();
+            chars.next();
+        }
+    }
+    n
+}
+
+fn push_heading(out: &mut String, s: &str, tty: bool) {
+    if tty {
+        out.push_str(&overstrike(s));
+    } else {
+        out.push_str(s);
+    }
+    out.push('\n');
+}
+
+fn push_name_line(out: &mut String, name: &str, tty: bool) {
+    let (title, rest) = name.split_once(" - ").unwrap_or((name, ""));
+    let rest = inline_plain(rest, tty);
+    out.extend(std::iter::repeat_n(' ', INDENT));
+    if tty {
+        out.push_str(&overstrike(title));
+    } else {
+        out.push_str(title);
+    }
+    if rest.is_empty() {
+        out.push('\n');
+        return;
+    }
+    out.push_str(" - ");
+    let first_fill = COLS
+        .saturating_sub(INDENT + title.chars().count() + 3)
+        .max(1);
+    let fill = COLS.saturating_sub(INDENT).max(1);
+    let mut line = String::new();
+    let mut first = true;
+    for word in rest.split_whitespace() {
+        if line.is_empty() {
+            line.push_str(word);
+            continue;
+        }
+        let limit = if first { first_fill } else { fill };
+        if vis(&line) + 1 + vis(word) > limit {
+            out.push_str(&line);
+            out.push('\n');
+            out.extend(std::iter::repeat_n(' ', INDENT));
+            line.clear();
+            line.push_str(word);
+            first = false;
+        } else {
+            line.push(' ');
+            line.push_str(word);
+        }
+    }
+    out.push_str(&line);
+    out.push('\n');
+}
+
+fn push_wrapped(out: &mut String, text: &str, indent: usize) {
+    let fill = COLS.saturating_sub(indent).max(1);
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if line.is_empty() {
+            line.push_str(word);
+            continue;
+        }
+        if vis(&line) + 1 + vis(word) > fill {
+            out.extend(std::iter::repeat_n(' ', indent));
+            out.push_str(&line);
+            out.push('\n');
+            line.clear();
+        } else {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() {
+        out.extend(std::iter::repeat_n(' ', indent));
+        out.push_str(&line);
+        out.push('\n');
+    }
+}
+
+fn flow(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn first_sentence(s: &str) -> (&str, &str) {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'.' && bytes[i + 1].is_ascii_whitespace() {
+            return (&s[..=i], s[i + 1..].trim_start());
+        }
+        i += 1;
+    }
+    (s, "")
+}
+
+fn intro(title: &str, lead: &str) -> (String, Vec<String>) {
+    let (head, tail) = first_sentence(lead.trim());
+    let name = format!("{} - {}", title, flow(head));
+    let description = tail
+        .split("\n\n")
+        .map(flow)
+        .filter(|p| !p.is_empty())
+        .collect();
+    (name, description)
 }
 
 fn escape(s: &str) -> String {
@@ -210,15 +422,15 @@ enum Hl {
 }
 
 impl Hl {
-    fn class(self) -> Option<&'static str> {
+    const fn class(self) -> Option<&'static str> {
         match self {
-            Hl::Cmd => Some("cmd"),
-            Hl::Flag => Some("flag"),
-            Hl::Str => Some("str"),
-            Hl::Cmt => Some("cmt"),
-            Hl::Url => Some("url"),
-            Hl::Punct => Some("punct"),
-            Hl::Text => None,
+            Self::Cmd => Some("cmd"),
+            Self::Flag => Some("flag"),
+            Self::Str => Some("str"),
+            Self::Cmt => Some("cmt"),
+            Self::Url => Some("url"),
+            Self::Punct => Some("punct"),
+            Self::Text => None,
         }
     }
 }
@@ -241,7 +453,9 @@ fn highlight_line(line: &str, mut expect_cmd: bool, out: &mut String) {
     let mut rest = line;
     while !rest.is_empty() {
         if rest.starts_with(|ch: char| ch.is_whitespace()) {
-            let n = rest.find(|ch: char| !ch.is_whitespace()).unwrap_or(rest.len());
+            let n = rest
+                .find(|ch: char| !ch.is_whitespace())
+                .unwrap_or(rest.len());
             out.push_str(&rest[..n]);
             rest = &rest[n..];
             continue;
@@ -323,47 +537,138 @@ fn emit(out: &mut String, kind: Hl, text: &str) {
     }
 }
 
-fn inline_html(s: &str) -> String {
-    let escaped = escape(s);
-    let mut out = String::with_capacity(escaped.len());
-    let mut rest = escaped.as_str();
+fn take_link(s: &str) -> Option<(&str, &str, &str)> {
+    let rest = s.strip_prefix('[')?;
+    let close = rest.find(']')?;
+    let label = &rest[..close];
+    let rest = rest[close + 1..].strip_prefix('(')?;
+    let end = rest.find(')')?;
+    Some((label, &rest[..end], &rest[end + 1..]))
+}
+
+fn inline_plain(s: &str, tty: bool) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('[') {
+        if let Some((label, href, after)) = take_link(&rest[i..]) {
+            out.push_str(&rest[..i]);
+            out.push_str(label);
+            if label != href {
+                out.push_str(" (");
+                out.push_str(href);
+                out.push(')');
+            }
+            rest = after;
+        } else {
+            out.push_str(&rest[..=i]);
+            rest = &rest[i + 1..];
+        }
+    }
+    out.push_str(rest);
+    ticks(&out, tty)
+}
+
+fn ticks(s: &str, tty: bool) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
     while let Some(start) = rest.find('`') {
         out.push_str(&rest[..start]);
         rest = &rest[start + 1..];
-        match rest.find('`') {
-            Some(end) => {
-                out.push_str("<code>");
-                out.push_str(&rest[..end]);
-                out.push_str("</code>");
-                rest = &rest[end + 1..];
+        if let Some(end) = rest.find('`') {
+            let code = &rest[..end];
+            if tty && !code.contains("{host}") {
+                out.push_str(&overstrike(code));
+            } else {
+                out.push_str(code);
             }
-            None => {
-                out.push('`');
-                break;
-            }
+            rest = &rest[end + 1..];
+        } else {
+            out.push('`');
+            break;
         }
     }
     out.push_str(rest);
     out
 }
 
-fn heading_html(title: &str) -> String {
-    let html = inline_html(title);
-    if let Some(rest) = html.strip_prefix("symbol") {
-        if rest.starts_with(":") {
-            return format!("<span>symbol</span>{rest}");
+fn inline_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    loop {
+        let tick = rest.find('`');
+        let brack = rest.find('[');
+        let next = match (tick, brack) {
+            (None, None) => {
+                out.push_str(&escape(rest));
+                return out;
+            }
+            (Some(t), None) => t,
+            (None, Some(b)) => b,
+            (Some(t), Some(b)) => t.min(b),
+        };
+        out.push_str(&escape(&rest[..next]));
+        rest = &rest[next..];
+        if rest.starts_with('`') {
+            rest = &rest[1..];
+            if let Some(end) = rest.find('`') {
+                out.push_str("<code>");
+                out.push_str(&escape(&rest[..end]));
+                out.push_str("</code>");
+                rest = &rest[end + 1..];
+            } else {
+                out.push('`');
+                out.push_str(&escape(rest));
+                return out;
+            }
+        } else if let Some((label, href, after)) = take_link(rest) {
+            out.push_str("<a href=\"");
+            out.push_str(&escape(href));
+            out.push_str("\">");
+            out.push_str(&codes_html(label));
+            out.push_str("</a>");
+            rest = after;
+        } else {
+            out.push('[');
+            rest = &rest[1..];
         }
     }
-    html
+}
+
+fn codes_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find('`') {
+        out.push_str(&escape(&rest[..start]));
+        rest = &rest[start + 1..];
+        if let Some(end) = rest.find('`') {
+            out.push_str("<code>");
+            out.push_str(&escape(&rest[..end]));
+            out.push_str("</code>");
+            rest = &rest[end + 1..];
+        } else {
+            out.push('`');
+            break;
+        }
+    }
+    out.push_str(&escape(rest));
+    out
 }
 
 fn header_str(headers: &HeaderMap, name: header::HeaderName) -> &str {
-    headers.get(name).and_then(|v| v.to_str().ok()).unwrap_or("")
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
 }
 
 fn looks_like_browser(ua: &str) -> bool {
     let ua = ua.to_ascii_lowercase();
     ua.contains("mozilla") || ua.contains("browser")
+}
+
+fn looks_like_cli(ua: &str) -> bool {
+    let ua = ua.to_ascii_lowercase();
+    ua.contains("curl/") || ua.contains("wget") || ua.contains("httpie")
 }
 
 fn accept_flavor(accept: &str) -> Option<Flavor> {
@@ -406,23 +711,22 @@ fn parse(src: &str) -> Result<Page, String> {
     let mut in_fence = false;
     let mut fence_buf = String::new();
 
-    let flush_pending = |pending: &mut Option<String>,
-                         lead: &mut String,
-                         sections: &mut Vec<Section>| {
-        let Some(text) = pending.take() else {
-            return;
-        };
-        if sections.is_empty() {
-            if lead.is_empty() {
-                *lead = text;
-            } else {
-                lead.push('\n');
-                lead.push_str(&text);
+    let flush_pending =
+        |pending: &mut Option<String>, lead: &mut String, sections: &mut Vec<Section>| {
+            let Some(text) = pending.take() else {
+                return;
+            };
+            if sections.is_empty() {
+                if lead.is_empty() {
+                    *lead = text;
+                } else {
+                    lead.push_str("\n\n");
+                    lead.push_str(&text);
+                }
+            } else if let Some(section) = sections.last_mut() {
+                section.blocks.push(Block::Prose(text));
             }
-        } else if let Some(section) = sections.last_mut() {
-            section.blocks.push(Block::Prose(text));
-        }
-    };
+        };
 
     for line in src.lines() {
         if in_fence {
@@ -520,15 +824,7 @@ const STYLE: &str = r#":root {
     letter-spacing: .12em;
     text-transform: uppercase;
   }
-  h1 {
-    font-size: 1.15rem;
-    font-weight: 600;
-    letter-spacing: .08em;
-    margin: 0 0 1.1rem;
-  }
-  h1 span { color: var(--mark); }
-  p { color: var(--ink); margin: 0 0 1rem; max-width: 40rem; }
-  p.lead { color: var(--dim); }
+  p { color: var(--ink); margin: 0 0 1rem; padding-left: 7ch; max-width: 48rem; }
   h2 {
     margin: 1.8rem 0 .7rem;
     font-size: 11px;
@@ -554,20 +850,26 @@ const STYLE: &str = r#":root {
   pre .cmt, pre .punct { color: var(--dim); }
   pre .url { color: var(--ok); text-decoration: underline; text-underline-offset: .15em; }
   .row { margin-bottom: 1.1rem; }
+  .row pre { margin-left: 14ch; }
   .cap {
     color: var(--dim);
     font-size: 12px;
     margin: 0 0 .35rem;
   }
-  code { font: inherit; }
+  code { font: inherit; font-weight: 600; }
   a { color: var(--ink); }
   a:hover { color: var(--mark); }
   footer {
+    display: flex;
+    justify-content: space-between;
+    gap: 1rem;
     margin-top: 2.4rem;
     border-top: 1px solid var(--rule);
     padding-top: .8rem;
     color: var(--dim);
     font-size: 12px;
+    letter-spacing: .12em;
+    text-transform: uppercase;
   }
   .toast {
     position: fixed;
@@ -642,6 +944,10 @@ mod tests {
     #[test]
     fn curl_is_not_a_browser() {
         assert!(!looks_like_browser("curl/8.5.0"));
+        assert!(looks_like_cli("curl/8.5.0"));
+        assert!(!looks_like_cli(
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0"
+        ));
         assert!(looks_like_browser(
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0"
         ));
@@ -650,8 +956,28 @@ mod tests {
     #[test]
     fn host_is_filled_in_plain() {
         let text = render_plain("http://symbol");
+        assert!(text.starts_with("SYMBOL(1)"));
+        assert!(text.contains("NAME\n"));
+        assert!(text.contains("symbol - tailnet hosting of static sites on http://symbol."));
+        assert!(text.contains("DESCRIPTION\n"));
         assert!(text.contains("curl -T index.html http://symbol/hello"));
+        assert!(text.contains("e.g. http://symbol/k7qm/"));
+        assert!(!text.contains("[http://symbol/k7qm/]"));
         assert!(!text.contains("{host}"));
+        assert!(!text.contains('`'));
+        assert!(text.trim_end().ends_with("SYMBOL(1)"));
+        assert!(!text.contains('\u{8}'));
+    }
+
+    #[test]
+    fn man_overstrike_for_less() {
+        let text = fill_man("http://symbol");
+        assert!(text.contains('\u{8}'));
+        assert!(text.contains("http://symbol/hello"));
+        assert!(!text.contains("{host}"));
+        assert!(text.contains(&overstrike("NAME")));
+        assert!(text.contains(&overstrike("symbol")));
+        assert!(!render_plain("http://symbol").contains('\u{8}'));
     }
 
     #[test]
@@ -659,16 +985,29 @@ mod tests {
         let html = fill_html("http://symbol");
         assert!(html.contains("class=\"url\">http://symbol/hello</span>"));
         assert!(html.contains("class=\"cmd\">curl</span>"));
+        assert!(html.contains("<a href=\"http://symbol/k7qm/\">http://symbol/k7qm/</a>"));
+        assert!(html.contains("<h2>NAME</h2>"));
         assert!(!html.contains("{host}"));
         assert!(templates().html.contains("{host}"));
         assert!(templates().html.contains("class=\"cmd\">curl</span>"));
     }
 
     #[test]
-    fn highlights_shell_in_html() {
-        let html = highlight_shell(
-            "curl -T index.html {host}/hello  # put\n'quoted' | sh \\\n",
+    fn markdown_links() {
+        assert_eq!(
+            inline_plain("see [a](b) and [c](c)", false),
+            "see a (b) and c"
         );
+        assert_eq!(
+            inline_html("see [`x`]({host}/x)"),
+            "see <a href=\"{host}/x\"><code>x</code></a>"
+        );
+        assert_eq!(inline_html("not [a link"), "not [a link");
+    }
+
+    #[test]
+    fn highlights_shell_in_html() {
+        let html = highlight_shell("curl -T index.html {host}/hello  # put\n'quoted' | sh \\\n");
         assert!(html.contains("class=\"cmd\">curl</span>"));
         assert!(html.contains("class=\"flag\">-T</span>"));
         assert!(html.contains("class=\"url\">{host}/hello</span>"));

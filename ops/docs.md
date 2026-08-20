@@ -24,6 +24,9 @@ symbol put hello ./dist      # upload whole folder to {host}/hello
 symbol put -u hello site.zip # upload and unzip contents of zip
 symbol add hello style.css   # add a file to the site {host}/hello
 symbol ls         # list all sites
+symbol ls -l      # list sites with full URLs
+symbol stats      # counts, storage totals, and size distributions
+symbol get hello  # downloads hello.tar.gz without removing the site
 symbol pop hello  # removes a site and downloads its tar.gz
 symbol rm hello   # removes a site without backup
 symbol update     # reinstall this client
@@ -67,13 +70,24 @@ tar -czf - -C ./dist . | curl -T -    \
   -H unpack:1 {host}/hello
 ```
 
-file browse: GET {host}/FILES lists sites. GET {host}/path/HASH is that file's hash.
+file browse: GET {host}/FILES lists sites. site and folder sizes are recursive
+logical sizes, so duplicate content is counted once per file reference.
+GET {host}/path/HASH is that file's hash.
 
 ```
 curl {host}/FILES
 curl {host}/hello/FILES
 curl {host}/hello/FILES/css/
+curl -H 'Accept: application/json' {host}/hello/FILES
 curl {host}/hello/index.html/HASH
+```
+
+download a site without removing it
+
+```
+curl -OJ {host}/hello.tar.gz
+curl -OJ {host}/hello.tar
+curl -OJ {host}/hello.zip
 ```
 
 delete a file, or pop a site (DELETE returns the site as tar.gz)

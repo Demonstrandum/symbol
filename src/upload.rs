@@ -3,7 +3,7 @@ use std::path::Path;
 
 use flate2::read::GzDecoder;
 
-use crate::pathutil::{is_noise_path, safe_rel_path, PathError};
+use crate::pathutil::{PathError, is_junk, is_noise_path, looks_like_apple_fork, safe_rel_path};
 
 const MAX_FILES: usize = 5000;
 const MAX_EXTRACTED: u64 = 80 * 1024 * 1024;
@@ -16,6 +16,8 @@ pub enum UploadError {
     EmptyArchive,
     #[error("error: not an archive (pass a zip, tar, tar.gz, or gz, or drop Unpack)")]
     NotArchive,
+    #[error("error: junk file")]
+    Junk,
     #[error("error: too many files")]
     TooManyFiles,
     #[error("error: extracted site is too large")]
@@ -38,19 +40,24 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub fn default_filename(self) -> &'static str {
+    pub const fn default_filename(self) -> &'static str {
         match self {
-            Kind::Zip => "archive.zip",
-            Kind::Tar => "archive.tar",
-            Kind::Gzip => "archive.gz",
-            Kind::Html => "index.html",
-            Kind::File => "file",
+            Self::Zip => "archive.zip",
+            Self::Tar => "archive.tar",
+            Self::Gzip => "archive.gz",
+            Self::Html => "index.html",
+            Self::File => "file",
         }
     }
 }
 
 pub fn sniff(bytes: &[u8], content_type: Option<&str>, filename: Option<&str>) -> Kind {
-    if bytes.len() >= 4 && bytes[0] == b'P' && bytes[1] == b'K' && bytes[2] == 0x03 && bytes[3] == 0x04 {
+    if bytes.len() >= 4
+        && bytes[0] == b'P'
+        && bytes[1] == b'K'
+        && bytes[2] == 0x03
+        && bytes[3] == 0x04
+    {
         return Kind::Zip;
     }
     if bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b {
@@ -79,7 +86,11 @@ pub fn sniff(bytes: &[u8], content_type: Option<&str>, filename: Option<&str>) -
             || lower.ends_with(".tar")
             || lower.ends_with(".gz")
         {
-            return if lower.ends_with(".tar") { Kind::Tar } else { Kind::Gzip };
+            return if lower.ends_with(".tar") {
+                Kind::Tar
+            } else {
+                Kind::Gzip
+            };
         }
         if lower.ends_with(".html") || lower.ends_with(".htm") {
             return Kind::Html;
@@ -96,7 +107,10 @@ fn looks_like_tar(bytes: &[u8]) -> bool {
 }
 
 fn looks_like_html(bytes: &[u8]) -> bool {
-    let start = bytes.iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(0);
+    let start = bytes
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(0);
     let rest = &bytes[start..];
     rest.starts_with(b"<!DOCTYPE")
         || rest.starts_with(b"<!doctype")
@@ -119,8 +133,13 @@ pub fn write_payload(
     if unpack {
         return unpack_payload(dest, bytes, kind, filename);
     }
-    let name = filename.filter(|s| !s.is_empty()).unwrap_or(kind.default_filename());
+    let name = filename
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| kind.default_filename());
     let rel = safe_rel_path(name)?;
+    if is_junk(&rel, Some(bytes)) {
+        return Err(UploadError::Junk);
+    }
     let path = dest.join(&rel);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -156,6 +175,9 @@ fn extract_gzip(dest: &Path, bytes: &[u8], filename: Option<&str>) -> Result<usi
     }
     let out_name = strip_gz_name(name).unwrap_or("file");
     let rel = safe_rel_path(out_name)?;
+    if is_junk(&rel, Some(&inner)) {
+        return Err(UploadError::EmptyArchive);
+    }
     let path = dest.join(&rel);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -209,27 +231,18 @@ fn extract_zip(dest: &Path, bytes: &[u8]) -> Result<usize, UploadError> {
             continue;
         }
         let rel = safe_rel_path(&enclosed.to_string_lossy())?;
-        files += 1;
-        if files > MAX_FILES {
-            return Err(UploadError::TooManyFiles);
-        }
         let size = file.size();
         total = total.saturating_add(size);
         if total > MAX_EXTRACTED {
             return Err(UploadError::TooLarge);
         }
-        let path = dest.join(&rel);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+        if !write_kept_file(dest, &rel, &mut file)? {
+            total = total.saturating_sub(size);
+            continue;
         }
-        let mut out = std::fs::File::create(path)?;
-        let mut buf = [0u8; 64 * 1024];
-        loop {
-            let n = file.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            out.write_all(&buf[..n])?;
+        files += 1;
+        if files > MAX_FILES {
+            return Err(UploadError::TooManyFiles);
         }
     }
     if files == 0 {
@@ -253,27 +266,43 @@ fn extract_tar<R: Read>(dest: &Path, reader: R) -> Result<usize, UploadError> {
             continue;
         }
         let rel = safe_rel_path(&path.to_string_lossy())?;
-        files += 1;
-        if files > MAX_FILES {
-            return Err(UploadError::TooManyFiles);
-        }
         let size = entry.header().size()?;
         total = total.saturating_add(size);
         if total > MAX_EXTRACTED {
             return Err(UploadError::TooLarge);
         }
-        let path = dest.join(&rel);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+        if !write_kept_file(dest, &rel, &mut entry)? {
+            total = total.saturating_sub(size);
+            continue;
         }
-        let mut out = std::fs::File::create(path)?;
-        std::io::copy(&mut entry, &mut out)?;
+        files += 1;
+        if files > MAX_FILES {
+            return Err(UploadError::TooManyFiles);
+        }
     }
     if files == 0 {
         return Err(UploadError::EmptyArchive);
     }
     strip_single_root(dest)?;
     Ok(files)
+}
+
+fn write_kept_file<R: Read>(dest: &Path, rel: &Path, reader: &mut R) -> Result<bool, UploadError> {
+    let mut buf = [0u8; 64 * 1024];
+    let n = reader.read(&mut buf)?;
+    if looks_like_apple_fork(&buf[..n]) {
+        return Ok(false);
+    }
+    let path = dest.join(rel);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut out = std::fs::File::create(path)?;
+    if n > 0 {
+        out.write_all(&buf[..n])?;
+        std::io::copy(reader, &mut out)?;
+    }
+    Ok(true)
 }
 
 fn strip_single_root(dest: &Path) -> Result<(), UploadError> {
@@ -318,7 +347,14 @@ mod tests {
     #[test]
     fn zip_without_unpack_is_stored() {
         let dir = tempfile::tempdir().unwrap();
-        write_payload(dir.path(), b"PK\x03\x04rest", Kind::Zip, Some("site.zip"), false).unwrap();
+        write_payload(
+            dir.path(),
+            b"PK\x03\x04rest",
+            Kind::Zip,
+            Some("site.zip"),
+            false,
+        )
+        .unwrap();
         assert!(dir.path().join("site.zip").is_file());
         assert!(!dir.path().join("index.html").exists());
     }
@@ -341,6 +377,43 @@ mod tests {
             "<h1>z</h1>"
         );
         assert!(!dir.path().join("site.zip").exists());
+    }
+
+    #[test]
+    fn zip_skips_junk() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut buf);
+            let opts = zip::write::SimpleFileOptions::default();
+            zip.start_file("index.html", opts).unwrap();
+            std::io::Write::write_all(&mut zip, b"<h1>ok</h1>").unwrap();
+            zip.start_file("._index.html", opts).unwrap();
+            std::io::Write::write_all(&mut zip, &[0x00, 0x05, 0x16, 0x07, 0, 2, 0, 0]).unwrap();
+            zip.start_file("._.", opts).unwrap();
+            std::io::Write::write_all(&mut zip, &[0x00, 0x05, 0x16, 0x07, 0, 2, 0, 0]).unwrap();
+            zip.start_file(".DS_Store", opts).unwrap();
+            std::io::Write::write_all(&mut zip, b"ds").unwrap();
+            zip.start_file("__MACOSX/._index.html", opts).unwrap();
+            std::io::Write::write_all(&mut zip, &[0x00, 0x05, 0x16, 0x07]).unwrap();
+            zip.start_file("desktop.ini", opts).unwrap();
+            std::io::Write::write_all(&mut zip, b"[.ShellClassInfo]").unwrap();
+            zip.start_file("keep.bin", opts).unwrap();
+            std::io::Write::write_all(&mut zip, &[0x00, 0x05, 0x16, 0x07, 0, 2, 0, 0]).unwrap();
+            zip.finish().unwrap();
+        }
+        let bytes = buf.into_inner();
+        write_payload(dir.path(), &bytes, Kind::Zip, Some("site.zip"), true).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("index.html")).unwrap(),
+            "<h1>ok</h1>"
+        );
+        assert!(!dir.path().join("._index.html").exists());
+        assert!(!dir.path().join("._.").exists());
+        assert!(!dir.path().join(".DS_Store").exists());
+        assert!(!dir.path().join("desktop.ini").exists());
+        assert!(!dir.path().join("keep.bin").exists());
+        assert!(!dir.path().join("__MACOSX").exists());
     }
 
     #[test]
@@ -385,5 +458,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = write_payload(dir.path(), b"<h1>hi</h1>", Kind::Html, None, true).unwrap_err();
         assert!(matches!(err, UploadError::NotArchive));
+    }
+
+    #[test]
+    fn single_junk_file_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let err =
+            write_payload(dir.path(), b"ds", Kind::File, Some(".DS_Store"), false).unwrap_err();
+        assert!(matches!(err, UploadError::Junk));
+        let apple = [0x00, 0x05, 0x16, 0x07, 0, 2, 0, 0];
+        let err =
+            write_payload(dir.path(), &apple, Kind::File, Some("meta.bin"), false).unwrap_err();
+        assert!(matches!(err, UploadError::Junk));
     }
 }

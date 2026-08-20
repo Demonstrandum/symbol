@@ -1,0 +1,6 @@
+too-many-lines-threshold = 100
+cognitive-complexity-threshold = 20
+too-many-arguments-threshold = 6
+type-complexity-threshold = 200
+pass-by-value-size-limit = 128
+array-size-threshold = 131072

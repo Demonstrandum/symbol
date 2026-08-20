@@ -14,7 +14,10 @@ pub fn parse_site_name(raw: &str) -> Result<&str, NameError> {
     if !bytes[bytes.len() - 1].is_ascii_alphanumeric() {
         return Err(NameError::Invalid);
     }
-    if !bytes.iter().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-') {
+    if !bytes
+        .iter()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+    {
         return Err(NameError::Invalid);
     }
     if RESERVED.contains(&raw) {

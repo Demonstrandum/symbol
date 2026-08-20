@@ -1,7 +1,8 @@
 [package]
 name = "symbol"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+rust-version = "1.98.0"
 description = "Tiny static-site hosting for the tailnet"
 
 [dependencies]
@@ -25,3 +26,52 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+correctness = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+
+# Allocation and ownership costs.
+arc_with_non_send_sync = "warn"
+assigning_clones = "warn"
+borrowed_box = "warn"
+box_collection = "warn"
+clone_on_ref_ptr = "warn"
+implicit_clone = "warn"
+iter_overeager_cloned = "warn"
+large_enum_variant = "warn"
+large_stack_arrays = "warn"
+large_types_passed_by_value = "warn"
+needless_collect = "warn"
+needless_pass_by_value = "warn"
+owned_cow = "warn"
+rc_buffer = "warn"
+redundant_clone = "warn"
+unnecessary_to_owned = "warn"
+vec_box = "warn"
+
+# Performance traps.
+inefficient_to_string = "warn"
+manual_memcpy = "warn"
+mutex_atomic = "warn"
+mutex_integer = "warn"
+or_fun_call = "warn"
+
+# Duplication and unnecessary complexity.
+branches_sharing_code = "warn"
+cognitive_complexity = "warn"
+manual_let_else = "warn"
+match_same_arms = "warn"
+missing_const_for_fn = "warn"
+same_functions_in_if_condition = "warn"
+semicolon_if_nothing_returned = "warn"
+too_many_lines = "warn"
+trait_duplication_in_bounds = "warn"
+type_repetition_in_bounds = "warn"
+unnested_or_patterns = "warn"
+use_self = "warn"
