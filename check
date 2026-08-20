@@ -4,3 +4,6 @@ set -eu
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --all-targets --all-features --locked
+sh -n static/symbol.sh
+sh -n tests/symbol_client.sh
+tests/symbol_client.sh

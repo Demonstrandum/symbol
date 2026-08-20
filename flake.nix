@@ -2,9 +2,13 @@
   description = "Tiny static-site hosting for the tailnet";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs.rust-overlay = {
+    url = "github:oxalica/rust-overlay";
+    inputs.nixpkgs.follows = "nixpkgs";
+  };
 
   outputs =
-    { self, nixpkgs }:
+    { self, nixpkgs, rust-overlay }:
     let
       inherit (nixpkgs) lib;
       systems = [
@@ -13,7 +17,17 @@
         "x86_64-darwin"
         "aarch64-darwin"
       ];
-      forEachSystem = f: lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
+      forEachSystem =
+        f:
+        lib.genAttrs systems (
+          system:
+          f (
+            import nixpkgs {
+              inherit system;
+              overlays = [ rust-overlay.overlays.default ];
+            }
+          )
+        );
       src = lib.fileset.toSource {
         root = ./.;
         fileset = lib.fileset.unions [
@@ -30,7 +44,12 @@
       packages = forEachSystem (
         pkgs:
         let
-          symbol = pkgs.rustPlatform.buildRustPackage {
+          rust = pkgs.rust-bin.stable."1.98.0".default;
+          rustPlatform = pkgs.makeRustPlatform {
+            cargo = rust;
+            rustc = rust;
+          };
+          symbol = rustPlatform.buildRustPackage {
             pname = "symbol";
             version = "0.1.0";
             inherit src;
@@ -52,11 +71,14 @@
         default = pkgs.mkShell {
           inputsFrom = [ self.packages.${pkgs.stdenv.hostPlatform.system}.symbol ];
           packages = [
-            pkgs.cargo
-            pkgs.clippy
-            pkgs.rust-analyzer
-            pkgs.rustc
-            pkgs.rustfmt
+            (pkgs.rust-bin.stable."1.98.0".default.override {
+              extensions = [
+                "clippy"
+                "rust-analyzer"
+                "rust-src"
+                "rustfmt"
+              ];
+            })
           ];
         };
       });

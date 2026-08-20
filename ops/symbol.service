@@ -13,6 +13,12 @@ StateDirectory=symbol
 Environment=RUST_LOG=info
 Environment=SYMBOL_BIND=127.0.0.1:4340
 Environment=SYMBOL_ROOT=/var/lib/symbol
+Environment=SYMBOL_PUBLIC_URL=http://symbol
+Environment=SYMBOL_MAX_FILE_SIZE=4294967296
+Environment=SYMBOL_EXPIRY_MIN_AGE=30d
+Environment=SYMBOL_EXPIRY_MAX_AGE=365d
+Environment=SYMBOL_EXPIRY_MAX_SIZE=512MiB
+Environment=SYMBOL_EXPIRY_POWER=3
 
 [Install]
 WantedBy=multi-user.target

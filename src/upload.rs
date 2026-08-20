@@ -1,9 +1,14 @@
-use std::io::{Cursor, Read, Write};
+#[cfg(test)]
+use std::io::Cursor;
+use std::io::{BufRead, BufReader, Read, Seek, Write};
 use std::path::Path;
 
 use flate2::read::GzDecoder;
 
-use crate::pathutil::{PathError, is_junk, is_noise_path, looks_like_apple_fork, safe_rel_path};
+#[cfg(test)]
+use crate::pathutil::is_junk;
+use crate::pathutil::{PathError, is_noise_path, looks_like_apple_fork, safe_rel_path};
+use crate::sanitize;
 
 const MAX_FILES: usize = 5000;
 const MAX_EXTRACTED: u64 = 80 * 1024 * 1024;
@@ -26,6 +31,10 @@ pub enum UploadError {
     FileTooLarge,
     #[error("error: extracted site is too large")]
     TooLarge,
+    #[error("error: path is reserved by symbol")]
+    ReservedPath,
+    #[error("error: supported archive contains a Symbol management secret; unpack or remove it")]
+    OpaqueSecret,
     #[error("{0}")]
     Path(#[from] PathError),
     #[error("error: zip: {0}")]
@@ -131,6 +140,7 @@ fn has_ascii_suffix(value: &str, suffix: &str) -> bool {
         .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix))
 }
 
+#[cfg(test)]
 pub fn write_payload(
     dest: &Path,
     bytes: &[u8],
@@ -159,6 +169,100 @@ pub fn write_payload(
     Ok(1)
 }
 
+pub fn write_payload_file(
+    dest: &Path,
+    source: &Path,
+    kind: Kind,
+    filename: Option<&str>,
+    unpack: bool,
+) -> Result<usize, UploadError> {
+    if !unpack {
+        let name = filename
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| kind.default_filename());
+        let rel = safe_rel_path(name)?;
+        let path = dest.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(source, path)?;
+        return Ok(1);
+    }
+    match kind {
+        Kind::Zip => extract_zip_reader(dest, std::fs::File::open(source)?),
+        Kind::Tar => extract_tar(dest, std::fs::File::open(source)?),
+        Kind::Gzip => extract_gzip_reader(dest, source, filename),
+        Kind::Html | Kind::File => Err(UploadError::NotArchive),
+    }
+}
+
+pub fn reject_secrets_in_opaque_archive(source: &Path, kind: Kind) -> Result<(), UploadError> {
+    let found = match kind {
+        Kind::Zip => zip_contains_secret(source)?,
+        Kind::Tar => tar_contains_secret(std::fs::File::open(source)?)?,
+        Kind::Gzip => gzip_contains_secret(source)?,
+        Kind::Html | Kind::File => false,
+    };
+    if found {
+        Err(UploadError::OpaqueSecret)
+    } else {
+        Ok(())
+    }
+}
+
+fn zip_contains_secret(source: &Path) -> Result<bool, UploadError> {
+    let mut archive = zip::ZipArchive::new(std::fs::File::open(source)?)?;
+    let mut total = 0_u64;
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index)?;
+        if !entry.is_file() {
+            continue;
+        }
+        total = total.saturating_add(entry.size());
+        if total > MAX_EXTRACTED {
+            return Err(UploadError::TooLarge);
+        }
+        if sanitize::count_reader(&mut entry)?.total() > 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn tar_contains_secret(reader: impl Read) -> Result<bool, UploadError> {
+    let mut archive = tar::Archive::new(reader);
+    let mut total = 0_u64;
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        total = total.saturating_add(entry.header().size()?);
+        if total > MAX_EXTRACTED {
+            return Err(UploadError::TooLarge);
+        }
+        if sanitize::count_reader(&mut entry)?.total() > 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn gzip_contains_secret(source: &Path) -> Result<bool, UploadError> {
+    let decoder = GzDecoder::new(std::fs::File::open(source)?);
+    let mut reader = BufReader::new(decoder);
+    if looks_like_tar(reader.fill_buf()?) {
+        return tar_contains_secret(reader);
+    }
+    let mut limited = reader.take(MAX_EXTRACTED + 1);
+    let found = sanitize::count_reader(&mut limited)?.total() > 0;
+    if limited.limit() == 0 {
+        return Err(UploadError::TooLarge);
+    }
+    Ok(found)
+}
+
+#[cfg(test)]
 fn unpack_payload(
     dest: &Path,
     bytes: &[u8],
@@ -173,6 +277,7 @@ fn unpack_payload(
     }
 }
 
+#[cfg(test)]
 fn extract_gzip(dest: &Path, bytes: &[u8], filename: Option<&str>) -> Result<usize, UploadError> {
     let inner = gunzip(bytes)?;
     let name = filename.unwrap_or("");
@@ -196,6 +301,36 @@ fn extract_gzip(dest: &Path, bytes: &[u8], filename: Option<&str>) -> Result<usi
     Ok(1)
 }
 
+fn extract_gzip_reader(
+    dest: &Path,
+    source: &Path,
+    filename: Option<&str>,
+) -> Result<usize, UploadError> {
+    let decoder = GzDecoder::new(std::fs::File::open(source)?);
+    let mut reader = BufReader::new(decoder);
+    let prefix = reader.fill_buf()?;
+    let name = filename.unwrap_or("");
+    let as_tar = looks_like_tar(prefix)
+        || has_ascii_suffix(name, ".tar.gz")
+        || has_extension(name, "tgz")
+        || has_extension(name, "tar");
+    if as_tar {
+        return extract_tar(dest, reader);
+    }
+    let out_name = strip_gz_name(name).unwrap_or("file");
+    let rel = safe_rel_path(out_name)?;
+    let path = dest.join(rel);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut output = std::fs::File::create(path)?;
+    let copied = std::io::copy(&mut reader.take(MAX_EXTRACTED + 1), &mut output)?;
+    if copied > MAX_EXTRACTED {
+        return Err(UploadError::TooLarge);
+    }
+    Ok(1)
+}
+
 fn strip_gz_name(name: &str) -> Option<&str> {
     if name.is_empty() {
         return None;
@@ -207,6 +342,7 @@ fn strip_gz_name(name: &str) -> Option<&str> {
     }
 }
 
+#[cfg(test)]
 fn gunzip(bytes: &[u8]) -> Result<Vec<u8>, UploadError> {
     let mut dec = GzDecoder::new(Cursor::new(bytes));
     let mut out = Vec::new();
@@ -224,8 +360,13 @@ fn gunzip(bytes: &[u8]) -> Result<Vec<u8>, UploadError> {
     Ok(out)
 }
 
+#[cfg(test)]
 fn extract_zip(dest: &Path, bytes: &[u8]) -> Result<usize, UploadError> {
-    let mut archive = zip::ZipArchive::new(Cursor::new(bytes))?;
+    extract_zip_reader(dest, Cursor::new(bytes))
+}
+
+fn extract_zip_reader<R: Read + Seek>(dest: &Path, reader: R) -> Result<usize, UploadError> {
+    let mut archive = zip::ZipArchive::new(reader)?;
     let mut files = 0usize;
     let mut total = 0u64;
     for i in 0..archive.len() {
@@ -389,6 +530,31 @@ mod tests {
     }
 
     #[test]
+    fn spooled_zip_is_unpacked_without_loading_archive_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive_path = dir.path().join("upload.zip");
+        {
+            let file = std::fs::File::create(&archive_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            zip.start_file("site/index.html", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"streamed").unwrap();
+            zip.finish().unwrap();
+        }
+        let output = dir.path().join("output");
+        std::fs::create_dir(&output).unwrap();
+        assert_eq!(
+            write_payload_file(&output, &archive_path, Kind::Zip, Some("upload.zip"), true)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            std::fs::read(output.join("index.html")).unwrap(),
+            b"streamed"
+        );
+    }
+
+    #[test]
     fn zip_skips_junk() {
         let dir = tempfile::tempdir().unwrap();
         let mut buf = Cursor::new(Vec::new());
@@ -479,5 +645,36 @@ mod tests {
         let err =
             write_payload(dir.path(), &apple, Kind::File, Some("meta.bin"), false).unwrap_err();
         assert!(matches!(err, UploadError::Junk));
+    }
+
+    #[test]
+    fn opaque_supported_archives_reject_embedded_management_secrets() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive_path = directory.path().join("site.zip");
+        let management =
+            "sym_mgmt_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        {
+            let file = std::fs::File::create(&archive_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            zip.start_file("index.html", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(management.as_bytes()).unwrap();
+            zip.finish().unwrap();
+        }
+        assert!(matches!(
+            reject_secrets_in_opaque_archive(&archive_path, Kind::Zip),
+            Err(UploadError::OpaqueSecret)
+        ));
+
+        let clean_path = directory.path().join("clean.zip");
+        {
+            let file = std::fs::File::create(&clean_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            zip.start_file("index.html", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"clean").unwrap();
+            zip.finish().unwrap();
+        }
+        reject_secrets_in_opaque_archive(&clean_path, Kind::Zip).unwrap();
     }
 }

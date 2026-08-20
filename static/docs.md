@@ -4,11 +4,11 @@ tailnet hosting of static sites on {host}.
 an HTML file, a folder of pages and assets, or an archive.
 archives (zip, tar, tar.gz, gz) can be unpacked with `-H unpack:1`.
 
-GET is the site. PUT writes it. DELETE pops a site as tar.gz.
+GET is the site. PUT adds files. DELETE pops a site as tar.gz.
 
 ## the client
 
-for conveience, you may install the utility client.
+for convenience, you may install the utility client.
 drops `symbol` in ~/.local/bin
 
 ```
@@ -20,22 +20,29 @@ then
 ```
 symbol put index.html        # upload html, random name
 symbol put hello index.html  # upload html to {host}/hello
-symbol put hello ./dist      # upload whole folder to {host}/hello
-symbol put -u hello site.zip # upload and unzip contents of zip
-symbol add hello style.css   # add a file to the site {host}/hello
-symbol add hello song.mp3    # large media uploads stream from disk
-symbol ls         # list all sites
-symbol ls -l      # list sites with full URLs
-symbol stats      # counts, storage totals, and size distributions
-symbol get hello  # downloads hello.tar.gz without removing the site
-symbol pop hello  # removes a site and downloads its tar.gz
-symbol rm hello   # removes a site without backup
-symbol update     # reinstall this client
+symbol put hello ./dist      # merge a folder into {host}/hello
+symbol put -u hello site.zip # merge an unpacked zip
+symbol put hello style.css   # add or update one file
+symbol clone hello           # make a local checkout
+symbol sync                  # publish if upstream has not changed
+symbol ls                    # list all sites
+symbol stats                 # storage totals and distributions
+symbol get hello             # download without removing
+symbol pop hello             # download and remove
+symbol rm hello              # remove without backup
+symbol undo --stack hello    # changes that can be undone
+symbol expire                # expiry help and retention graph
+symbol update                # reinstall this client
 ```
+
+uploading to an existing site only adds or updates the files you send; it does
+not remove anything else. every clone contains a generated `symbol.toml`, so
+running bare `symbol put` from that directory publishes it to the same site.
+`symbol sync` is stricter and refuses if upstream has changed.
 
 ## curl
 
-no name provided gets you a a 4-character id, e.g. [{host}/k7qm/]({host}/k7qm/)
+no name provided gets you a 4-character id, e.g. [{host}/k7qm/]({host}/k7qm/)
 
 ```
 curl -T index.html {host}/
@@ -92,6 +99,16 @@ curl {host}/hello/FILES
 curl {host}/hello/FILES/css/
 curl -H 'Accept: application/json' {host}/hello/FILES
 curl {host}/hello/index.html/HASH
+```
+
+copy, move, undo, and expiry are HTTP methods too
+
+```
+curl -X COPY {host}/hello -H 'Destination: /hello-copy'
+curl -X MOVE {host}/hello-copy -H 'Destination: /hello-moved'
+curl {host}/hello/UNDO
+curl -X UNDO {host}/hello
+curl -X EXPIRE {host}/hello
 ```
 
 download a site without removing it
