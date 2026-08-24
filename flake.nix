@@ -34,9 +34,11 @@
           ./Cargo.toml
           ./Cargo.lock
           ./build.rs
+          ./migrations
           ./src
           ./ops
           ./static
+          ./tests
         ];
       };
     in
@@ -64,6 +66,14 @@
         {
           inherit symbol;
           default = symbol;
+        }
+      );
+
+      checks = forEachSystem (
+        pkgs:
+        import ./nix/posix-checks.nix {
+          inherit pkgs lib;
+          root = ./.;
         }
       );
 
