@@ -1,0 +1,16 @@
+DROP TABLE IF EXISTS path_aggregates;
+DROP TABLE IF EXISTS management_idempotency;
+DROP TABLE IF EXISTS management_audit;
+DROP TABLE IF EXISTS management_tombstones;
+DROP TABLE IF EXISTS idempotency_records;
+DROP TABLE IF EXISTS undo_expiry_policies;
+DROP TABLE IF EXISTS expiry_policies;
+DROP TABLE IF EXISTS undo_files;
+DROP TABLE IF EXISTS undo_sites;
+DROP TABLE IF EXISTS undo_names;
+DROP TABLE IF EXISTS undo_operations;
+DROP TABLE IF EXISTS files;
+DROP TABLE IF EXISTS metadata;
+DROP TABLE IF EXISTS blobs;
+DROP TABLE IF EXISTS sites;
+PRAGMA user_version = 0;
