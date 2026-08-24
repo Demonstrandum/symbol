@@ -11,50 +11,50 @@ UPDATE_NOTE=
 
 client_path() {
   cmd=$0
-  case "$cmd" in
+  case "${cmd}" in
     /*)
-      printf '%s\n' "$cmd"
+      printf '%s\n' "${cmd}"
       return
       ;;
     */*)
-      printf '%s\n' "$(pwd)/$cmd"
+      printf '%s\n' "$(pwd)/${cmd}"
       return
       ;;
   esac
-  oldifs=$IFS
+  oldifs=${IFS}
   IFS=:
-  for dir in $PATH; do
-    if [ -n "$dir" ] && [ -f "$dir/$cmd" ] && [ -x "$dir/$cmd" ]; then
-      IFS=$oldifs
-      printf '%s\n' "$dir/$cmd"
+  for dir in ${PATH}; do
+    if [ -n "${dir}" ] && [ -f "${dir}/${cmd}" ] && [ -x "${dir}/${cmd}" ]; then
+      IFS=${oldifs}
+      printf '%s\n' "${dir}/${cmd}"
       return
     fi
   done
-  IFS=$oldifs
-  printf '%s\n' "$cmd"
+  IFS=${oldifs}
+  printf '%s\n' "${cmd}"
 }
 
 start_update_check() {
   case "${1:-}" in
     update|upgrade|-h|--help|help|"") return 0 ;;
   esac
-  case "$HOST" in
+  case "${HOST}" in
     http://*|https://*) ;;
     *) return 0 ;;
   esac
   hashfile=$(dirname "$(client_path)")/.symbol.blake3
   UPDATE_NOTE=$(mktemp) || return 0
   {
-    if [ ! -f "$hashfile" ]; then
-      printf '\nsymbol client is missing its hash file. run:\n  symbol update\n' > "$UPDATE_NOTE"
+    if [ ! -f "${hashfile}" ]; then
+      printf '\nsymbol client is missing its hash file. run:\n  symbol update\n' > "${UPDATE_NOTE}"
       exit 0
     fi
     remote=$(curl -fsS --max-time 2 "${HOST}/symbol.sh/HASH" 2>/dev/null || true)
-    remote=$(printf '%s' "$remote" | tr -d ' \t\r\n')
-    [ -n "$remote" ] || exit 0
-    have=$(tr -d ' \t\r\n' < "$hashfile")
-    if [ "$remote" != "$have" ]; then
-      printf '\nsymbol client is out of date. run:\n  symbol update\n' > "$UPDATE_NOTE"
+    remote=$(printf '%s' "${remote}" | tr -d ' \t\r\n')
+    [ -n "${remote}" ] || exit 0
+    have=$(tr -d ' \t\r\n' < "${hashfile}")
+    if [ "${remote}" != "${have}" ]; then
+      printf '\nsymbol client is out of date. run:\n  symbol update\n' > "${UPDATE_NOTE}"
     fi
   } &
   UPDATE_PID=$!
@@ -62,20 +62,20 @@ start_update_check() {
 
 join_update_check() {
   if [ -n "${UPDATE_PID:-}" ]; then
-    wait "$UPDATE_PID" 2>/dev/null || true
+    wait "${UPDATE_PID}" 2>/dev/null || true
     UPDATE_PID=
   fi
   if [ -n "${UPDATE_NOTE:-}" ]; then
-    if [ -s "$UPDATE_NOTE" ]; then
+    if [ -s "${UPDATE_NOTE}" ]; then
       if update_check_color; then
         printf '\033[33m' >&2
-        cat "$UPDATE_NOTE" >&2
+        cat "${UPDATE_NOTE}" >&2
         printf '\033[0m' >&2
       else
-        cat "$UPDATE_NOTE" >&2
+        cat "${UPDATE_NOTE}" >&2
       fi
     fi
-    rm -f "$UPDATE_NOTE"
+    rm -f "${UPDATE_NOTE}"
     UPDATE_NOTE=
   fi
 }
@@ -106,6 +106,7 @@ usage:
   symbol undo [--stack] [NAME [TOKEN]]
   symbol expire [NAME [PATH]] [POLICY]
   symbol manage [NAME ACTION]
+  symbol recover
   symbol ls [-l] [NAME]
   symbol rm NAME [PATH]
   symbol url NAME
@@ -143,7 +144,7 @@ need() {
 
 diff_stats() {
   out=$(mktemp) || return 0
-  diff -u "$1" "$2" > "$out" || true
+  diff -u "$1" "$2" > "${out}" || true
   awk '
     substr($0,1,3) == "+++" { next }
     substr($0,1,3) == "---" { next }
@@ -154,15 +155,15 @@ diff_stats() {
       if (a+0 == 0 && d+0 == 0) exit
       printf "%d insertion%s(+), %d deletion%s(-)\n", a+0, (a==1)?"":"s", d+0, (d==1)?"":"s"
     }
-  ' "$out"
-  rm -f "$out"
+  ' "${out}"
+  rm -f "${out}"
 }
 
 request() {
   method=$1
   path=$2
   shift 2
-  curl -sS -X "$method" "$@" "${HOST}${path}"
+  curl -sS -X "${method}" "$@" "${HOST}${path}"
 }
 
 print_stats() {
@@ -337,7 +338,7 @@ print_stats() {
 print_links() {
   base=${1%/}
   nested=$2
-  awk -v base="$base" -v nested="$nested" '
+  awk -v base="${base}" -v nested="${nested}" '
     function spaces(n, out) {
       out = ""
       while (n-- > 0) out = out " "
@@ -434,34 +435,34 @@ urlencode_path() {
 
 manifest_find() {
   dir=${1:-$(pwd)}
-  case "$dir" in
+  case "${dir}" in
     /*) ;;
-    *) dir=$(cd "$dir" 2>/dev/null && pwd) || return 1 ;;
+    *) dir=$(cd "${dir}" 2>/dev/null && pwd) || return 1 ;;
   esac
-  if stat -c %d "$dir" >/dev/null 2>&1; then
-    device=$(stat -c %d "$dir")
+  if stat -c %d "${dir}" >/dev/null 2>&1; then
+    device=$(stat -c %d "${dir}")
     stat_device() { stat -c %d "$1"; }
   else
-    device=$(stat -f %d "$dir")
+    device=$(stat -f %d "${dir}")
     stat_device() { stat -f %d "$1"; }
   fi
   while :; do
-    if [ -f "$dir/symbol.toml" ]; then
-      printf '%s\n' "$dir/symbol.toml"
+    if [ -f "${dir}/symbol.toml" ]; then
+      printf '%s\n' "${dir}/symbol.toml"
       return 0
     fi
     parent=${dir%/*}
-    [ -n "$parent" ] || parent=/
-    [ "$parent" != "$dir" ] || return 1
-    [ "$(stat_device "$parent")" = "$device" ] || return 1
-    dir=$parent
+    [ -n "${parent}" ] || parent=/
+    [ "${parent}" != "${dir}" ] || return 1
+    [ "$(stat_device "${parent}")" = "${device}" ] || return 1
+    dir=${parent}
   done
 }
 
 manifest_value() {
   key=$1
   file=$2
-  awk -v wanted="$key" '
+  awk -v wanted="${key}" '
     /^[[:space:]]*\[/ { exit }
     /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
     {
@@ -485,44 +486,44 @@ manifest_value() {
       exit
     }
     END { if (!found) exit 1 }
-  ' "$file"
+  ' "${file}"
 }
 
 manifest_target() {
   MANIFEST=$(manifest_find) || die "no symbol.toml found; specify a site"
-  MANIFEST_DIR=$(dirname "$MANIFEST")
-  MANIFEST_HOST=$(manifest_value host "$MANIFEST") ||
+  MANIFEST_DIR=$(dirname "${MANIFEST}")
+  MANIFEST_HOST=$(manifest_value host "${MANIFEST}") ||
     die "invalid symbol.toml: missing top-level host"
-  MANIFEST_NAME=$(manifest_value name "$MANIFEST") ||
+  MANIFEST_NAME=$(manifest_value name "${MANIFEST}") ||
     die "invalid symbol.toml: missing top-level name"
-  case "$MANIFEST_HOST" in http://*|https://*) ;; *) die "invalid symbol.toml host" ;; esac
-  is_site_name "$MANIFEST_NAME" || die "invalid symbol.toml site name"
+  case "${MANIFEST_HOST}" in http://*|https://*) ;; *) die "invalid symbol.toml host" ;; esac
+  is_site_name "${MANIFEST_NAME}" || die "invalid symbol.toml site name"
 }
 
 token_from_manifest() {
   file=$1
-  value=$(manifest_value token "$file" 2>/dev/null || true)
-  [ -n "$value" ] || return 1
-  case "$value" in
-    sym_mgmt_*) printf '%s\n' "$value" ;;
+  value=$(manifest_value token "${file}" 2>/dev/null || true)
+  [ -n "${value}" ] || return 1
+  case "${value}" in
+    sym_mgmt_*) printf '%s\n' "${value}" ;;
     *)
-      case "$value" in /*) path=$value ;; *) path=$(dirname "$file")/$value ;; esac
-      [ -f "$path" ] || die "management token file not found: $path"
-      tr -d '\r\n' < "$path"
+      case "${value}" in /*) path=${value} ;; *) path=$(dirname "${file}")/${value} ;; esac
+      [ -f "${path}" ] || die "management token file not found: ${path}"
+      tr -d '\r\n' < "${path}"
       ;;
   esac
 }
 
 claim_from_manifest() {
   file=$1
-  value=$(manifest_value claim "$file" 2>/dev/null || true)
-  [ -n "$value" ] || return 1
-  case "$value" in
-    sym_claim_*) printf '%s\n' "$value" ;;
+  value=$(manifest_value claim "${file}" 2>/dev/null || true)
+  [ -n "${value}" ] || return 1
+  case "${value}" in
+    sym_claim_*) printf '%s\n' "${value}" ;;
     *)
-      case "$value" in /*) path=$value ;; *) path=$(dirname "$file")/$value ;; esac
-      [ -f "$path" ] || die "creator claim file not found: $path"
-      tr -d '\r\n' < "$path"
+      case "${value}" in /*) path=${value} ;; *) path=$(dirname "${file}")/${value} ;; esac
+      [ -f "${path}" ] || die "creator claim file not found: ${path}"
+      tr -d '\r\n' < "${path}"
       ;;
   esac
 }
@@ -531,19 +532,19 @@ TOKEN_EXPLICIT=
 TOKEN_SEEN=0
 parse_global_tokens() {
   args=$(mktemp) || exit 1
-  : > "$args"
+  : > "${args}"
   after_dash=0
   while [ "$#" -gt 0 ]; do
-    if [ "$after_dash" -eq 0 ]; then
+    if [ "${after_dash}" -eq 0 ]; then
       case "$1" in
         --)
           after_dash=1
-          printf '%s\n' "$1" >> "$args"
+          printf '%s\n' "$1" >> "${args}"
           shift
           continue
           ;;
         -t|--token)
-          [ "$TOKEN_SEEN" -eq 0 ] || usage_error "management token specified more than once"
+          [ "${TOKEN_SEEN}" -eq 0 ] || usage_error "management token specified more than once"
           [ "$#" -ge 2 ] || usage_error "$1 requires a token"
           TOKEN_EXPLICIT=$2
           TOKEN_SEEN=1
@@ -551,40 +552,39 @@ parse_global_tokens() {
           continue
           ;;
         --token=*)
-          [ "$TOKEN_SEEN" -eq 0 ] || usage_error "management token specified more than once"
+          [ "${TOKEN_SEEN}" -eq 0 ] || usage_error "management token specified more than once"
           TOKEN_EXPLICIT=${1#*=}
-          [ -n "$TOKEN_EXPLICIT" ] || usage_error "--token requires a token"
+          [ -n "${TOKEN_EXPLICIT}" ] || usage_error "--token requires a token"
           TOKEN_SEEN=1
           shift
           continue
           ;;
       esac
     fi
-    printf '%s\n' "$1" >> "$args"
+    printf '%s\n' "$1" >> "${args}"
     shift
   done
   set --
   while IFS= read -r arg; do
-    set -- "$@" "$arg"
-  done < "$args"
-  rm -f "$args"
-  PARSED_ARGC=$#
+    set -- "$@" "${arg}"
+  done < "${args}"
+  rm -f "${args}"
   PARSED_ARGS=$(mktemp) || exit 1
-  : > "$PARSED_ARGS"
-  for arg do printf '%s\n' "$arg" >> "$PARSED_ARGS"; done
+  : > "${PARSED_ARGS}"
+  for arg do printf '%s\n' "${arg}" >> "${PARSED_ARGS}"; done
 }
 
 select_token() {
   TOKEN=
-  if [ "$TOKEN_SEEN" -eq 1 ]; then
-    TOKEN=$TOKEN_EXPLICIT
+  if [ "${TOKEN_SEEN}" -eq 1 ]; then
+    TOKEN=${TOKEN_EXPLICIT}
   elif [ -n "${SYMBOL_TOKEN:-}" ]; then
-    TOKEN=$SYMBOL_TOKEN
+    TOKEN=${SYMBOL_TOKEN}
   else
     local_manifest=$(manifest_find 2>/dev/null || true)
-    if [ -n "$local_manifest" ]; then
-      if manifest_value token "$local_manifest" >/dev/null 2>&1; then
-        TOKEN=$(token_from_manifest "$local_manifest")
+    if [ -n "${local_manifest}" ]; then
+      if manifest_value token "${local_manifest}" >/dev/null 2>&1; then
+        TOKEN=$(token_from_manifest "${local_manifest}")
       fi
     fi
   fi
@@ -592,9 +592,9 @@ select_token() {
 
 auth_args_file() {
   file=$1
-  : > "$file"
+  : > "${file}"
   if [ -n "${TOKEN:-}" ]; then
-    printf '%s\n%s\n' '-H' "Authorization: Bearer $TOKEN" >> "$file"
+    printf '%s\n%s\n' '-H' "Authorization: Bearer ${TOKEN}" >> "${file}"
   fi
 }
 
@@ -608,7 +608,7 @@ random_key() {
 
 HTTP_DIR=
 http_cleanup() {
-  [ -z "${HTTP_DIR:-}" ] || rm -rf "$HTTP_DIR"
+  [ -z "${HTTP_DIR:-}" ] || rm -rf "${HTTP_DIR}"
   HTTP_DIR=
 }
 
@@ -618,23 +618,23 @@ http_request() {
   shift 2
   http_cleanup
   HTTP_DIR=$(mktemp -d) || exit 1
-  HTTP_HEADERS=$HTTP_DIR/headers
-  HTTP_BODY=$HTTP_DIR/body
-  HTTP_STATUS=$(curl -sS -X "$method" -D "$HTTP_HEADERS" -o "$HTTP_BODY" \
-    -w '%{http_code}' "$@" "$url") || {
+  HTTP_HEADERS=${HTTP_DIR}/headers
+  HTTP_BODY=${HTTP_DIR}/body
+  HTTP_STATUS=$(curl -sS -X "${method}" -D "${HTTP_HEADERS}" -o "${HTTP_BODY}" \
+    -w '%{http_code}' "$@" "${url}") || {
       status=$?
-      [ -s "$HTTP_BODY" ] && cat "$HTTP_BODY" >&2
-      return "$status"
+      [ -s "${HTTP_BODY}" ] && cat "${HTTP_BODY}" >&2
+      return "${status}"
     }
-  case "$HTTP_STATUS" in
+  case "${HTTP_STATUS}" in
     2??) return 0 ;;
-    *) [ -s "$HTTP_BODY" ] && cat "$HTTP_BODY" >&2; return 1 ;;
+    *) [ -s "${HTTP_BODY}" ] && cat "${HTTP_BODY}" >&2; return 1 ;;
   esac
 }
 
 header_value() {
   wanted=$1
-  awk -v wanted="$wanted" '
+  awk -v wanted="${wanted}" '
     {
       line = $0
       sub(/\r$/, "", line)
@@ -645,27 +645,27 @@ header_value() {
       }
     }
     END { if (value != "") print value }
-  ' "$HTTP_HEADERS"
+  ' "${HTTP_HEADERS}"
 }
 
 print_mutation_result() {
   suppress_body=${2:-0}
-  if [ "$suppress_body" -eq 0 ] && [ -s "$HTTP_BODY" ]; then
-    cat "$HTTP_BODY"
-    last=$(tail -c 1 "$HTTP_BODY" 2>/dev/null || true)
-    [ -z "$last" ] || printf '\n'
+  if [ "${suppress_body}" -eq 0 ] && [ -s "${HTTP_BODY}" ]; then
+    cat "${HTTP_BODY}"
+    last=$(tail -c 1 "${HTTP_BODY}" 2>/dev/null || true)
+    [ -z "${last}" ] || printf '\n'
   fi
   undo=$(header_value Undo-Token)
-  if [ -n "$undo" ]; then
-    printf 'undo within 4h: symbol undo %s %s\n' "$1" "$undo"
+  if [ -n "${undo}" ]; then
+    printf 'undo within 4h: symbol undo %s %s\n' "$1" "${undo}"
   fi
   management_count=$(header_value Sanitized-Management-Tokens)
   claim_count=$(header_value Sanitized-Creator-Claims)
   management_count=${management_count:-0}
   claim_count=${claim_count:-0}
-  if [ "$management_count" != 0 ] || [ "$claim_count" != 0 ]; then
+  if [ "${management_count}" != 0 ] || [ "${claim_count}" != 0 ]; then
     printf 'warning: redacted %s management tokens and %s creator claims from uploaded files\n' \
-      "$management_count" "$claim_count" >&2
+      "${management_count}" "${claim_count}" >&2
   fi
 }
 
@@ -683,6 +683,7 @@ sync sync
 undo undo
 expire expire
 manage manage
+recover recover
 ls ls list
 rm rm delete
 url url
@@ -698,7 +699,7 @@ fi
 
 resolve_command() {
   query=$1
-  command_registry | awk -v q="$query" '
+  command_registry | awk -v q="${query}" '
     function add(id, spelling, canonical_match, exact_match) {
       if (!seen[id]++) {
         order[++count] = id
@@ -752,17 +753,17 @@ resolve_command() {
 
 parse_global_tokens "$@"
 set --
-while IFS= read -r arg; do set -- "$@" "$arg"; done < "$PARSED_ARGS"
-rm -f "$PARSED_ARGS"
+while IFS= read -r arg; do set -- "$@" "${arg}"; done < "${PARSED_ARGS}"
+rm -f "${PARSED_ARGS}"
 raw_cmd=${1:-help}
 [ "$#" -eq 0 ] || shift
-cmd=$(resolve_command "$raw_cmd") || exit $?
+cmd=$(resolve_command "${raw_cmd}") || exit $?
 if [ "${SYMBOL_TEST_RESOLVE_ONLY:-0}" = 1 ]; then
-  printf '%s\n' "$cmd"
+  printf '%s\n' "${cmd}"
   exit 0
 fi
 select_token
-start_update_check "$cmd"
+start_update_check "${cmd}"
 trap join_update_check EXIT
 
 archive_suffix() {
@@ -780,41 +781,41 @@ archive_transfer() {
   base=$2
   name=$3
   dest=$4
-  suffix=$(archive_suffix "$dest")
+  suffix=$(archive_suffix "${dest}")
   url="${base}/${name}${suffix}"
   auth=$(mktemp) || exit 1
   archive_headers=$(mktemp) || exit 1
-  auth_args_file "$auth"
-  set -- -D "$archive_headers"
-  while IFS= read -r arg; do set -- "$@" "$arg"; done < "$auth"
-  rm -f "$auth"
-  if [ "$dest" = "-" ]; then
-    if ! curl -sS -f -X "$method" "$@" "$url"; then
-      rm -f "$archive_headers"
+  auth_args_file "${auth}"
+  set -- -D "${archive_headers}"
+  while IFS= read -r arg; do set -- "$@" "${arg}"; done < "${auth}"
+  rm -f "${auth}"
+  if [ "${dest}" = "-" ]; then
+    if ! curl -sS -f -X "${method}" "$@" "${url}"; then
+      rm -f "${archive_headers}"
       die "archive transfer failed"
     fi
-    if [ "$method" = DELETE ]; then
-      HTTP_HEADERS=$archive_headers
+    if [ "${method}" = DELETE ]; then
+      HTTP_HEADERS=${archive_headers}
       undo=$(header_value Undo-Token)
-      [ -z "$undo" ] ||
-        printf 'undo within 4h: symbol undo %s %s\n' "$name" "$undo" >&2
+      [ -z "${undo}" ] ||
+        printf 'undo within 4h: symbol undo %s %s\n' "${name}" "${undo}" >&2
     fi
-    rm -f "$archive_headers"
+    rm -f "${archive_headers}"
     return
   fi
   tmp=$(mktemp) || exit 1
-  if curl -sS -f -X "$method" "$@" "$url" -o "$tmp"; then
-    mv "$tmp" "$dest"
-    if [ "$method" = DELETE ]; then
-      HTTP_HEADERS=$archive_headers
+  if curl -sS -f -X "${method}" "$@" "${url}" -o "${tmp}"; then
+    mv "${tmp}" "${dest}"
+    if [ "${method}" = DELETE ]; then
+      HTTP_HEADERS=${archive_headers}
       undo=$(header_value Undo-Token)
-      [ -z "$undo" ] ||
-        printf 'undo within 4h: symbol undo %s %s\n' "$name" "$undo" >&2
+      [ -z "${undo}" ] ||
+        printf 'undo within 4h: symbol undo %s %s\n' "${name}" "${undo}" >&2
     fi
-    rm -f "$archive_headers"
+    rm -f "${archive_headers}"
   else
-    rm -f "$tmp"
-    rm -f "$archive_headers"
+    rm -f "${tmp}"
+    rm -f "${archive_headers}"
     return 1
   fi
 }
@@ -843,14 +844,14 @@ content_type() {
 
 validate_remote_path() {
   remote=$1
-  [ -n "$remote" ] || return 0
-  case "/$remote/" in
-    */../*|*/./*|*'//'*) usage_error "invalid remote path: $remote" ;;
+  [ -n "${remote}" ] || return 0
+  case "/${remote}/" in
+    */../*|*/./*|*'//'*) usage_error "invalid remote path: ${remote}" ;;
   esac
-  terminal=$(basename "$remote")
-  case "$terminal" in
+  terminal=$(basename "${remote}")
+  case "${terminal}" in
     symbol.toml|.symbol-token|.symbol-claim|FILES|HASH|UNDO|EXPIRES)
-      usage_error "reserved remote path: $remote"
+      usage_error "reserved remote path: ${remote}"
       ;;
   esac
 }
@@ -859,23 +860,23 @@ stage_upload_directory() {
   source=$1
   STAGE_ROOT=$(mktemp -d) || exit 1
   (
-    cd "$source"
+    cd "${source}"
     find . -type f ! -path './.git/*' \
       ! -name '.symbol-token' ! -name '.symbol-claim' \
       ! -name 'symbol.toml' -print
   ) | while IFS= read -r path; do
     relative=${path#./}
-    mkdir -p "$STAGE_ROOT/$(dirname "$relative")"
-    cp "$source/$relative" "$STAGE_ROOT/$relative"
+    mkdir -p "${STAGE_ROOT}/$(dirname "${relative}")"
+    cp "${source}/${relative}" "${STAGE_ROOT}/${relative}"
   done
 }
 
 make_archive_from_directory() {
   source=$1
-  stage_upload_directory "$source"
+  stage_upload_directory "${source}"
   ARCHIVE_FILE=$(mktemp) || exit 1
-  tar -czf "$ARCHIVE_FILE" -C "$STAGE_ROOT" .
-  rm -rf "$STAGE_ROOT"
+  tar -czf "${ARCHIVE_FILE}" -C "${STAGE_ROOT}" .
+  rm -rf "${STAGE_ROOT}"
   STAGE_ROOT=
 }
 
@@ -883,14 +884,14 @@ write_secret_sidecar() {
   kind=$1
   secret=$2
   manifest=$3
-  dir=$(dirname "$manifest")
-  case "$kind" in
+  dir=$(dirname "${manifest}")
+  case "${kind}" in
     token) sidecar=.symbol-token; key=token ;;
     claim) sidecar=.symbol-claim; key=claim ;;
   esac
-  (umask 077; printf '%s\n' "$secret" > "$dir/$sidecar")
-  tmp=$(mktemp "$dir/.symbol.toml.XXXXXX") || exit 1
-  awk -v key="$key" -v value="./$sidecar" '
+  (umask 077; printf '%s\n' "${secret}" > "${dir}/${sidecar}")
+  tmp=$(mktemp "${dir}/.symbol.toml.XXXXXX") || exit 1
+  awk -v key="${key}" -v value="./${sidecar}" '
     BEGIN { written = 0; section = 0 }
     /^[[:space:]]*\[/ && !written {
       printf "%s = \"%s\"\n", key, value
@@ -906,86 +907,232 @@ write_secret_sidecar() {
       print
     }
     END { if (!written) printf "%s = \"%s\"\n", key, value }
-  ' "$manifest" > "$tmp"
-  mv "$tmp" "$manifest"
-  if [ -d "$dir/.git" ] || [ -f "$dir/.gitignore" ]; then
-    touch "$dir/.gitignore"
-    if ! awk -v line="/$sidecar" '$0 == line { found=1 } END { exit !found }' "$dir/.gitignore"; then
-      printf '/%s\n' "$sidecar" >> "$dir/.gitignore"
+  ' "${manifest}" > "${tmp}"
+  mv "${tmp}" "${manifest}"
+  if [ -d "${dir}/.git" ] || [ -f "${dir}/.gitignore" ]; then
+    touch "${dir}/.gitignore"
+    if ! awk -v line="/${sidecar}" '$0 == line { found=1 } END { exit !found }' "${dir}/.gitignore"; then
+      printf '/%s\n' "${sidecar}" >> "${dir}/.gitignore"
     fi
   fi
-  printf 'saved %s to %s/%s (mode 0600)\n' "$kind" "$dir" "$sidecar"
+  printf 'saved %s to %s/%s (mode 0600)\n' "${kind}" "${dir}" "${sidecar}"
 }
 
 remove_secret_sidecar() {
   kind=$1
   manifest=$2
-  dir=$(dirname "$manifest")
-  case "$kind" in
+  dir=$(dirname "${manifest}")
+  case "${kind}" in
     token) sidecar=.symbol-token ;;
     claim) sidecar=.symbol-claim ;;
     *) return 1 ;;
   esac
-  rm -f "$dir/$sidecar"
-  tmp=$(mktemp "$dir/.symbol.toml.XXXXXX") || exit 1
-  awk -v key="$kind" '$0 !~ "^[[:space:]]*" key "[[:space:]]*="' \
-    "$manifest" > "$tmp"
-  mv "$tmp" "$manifest"
+  rm -f "${dir}/${sidecar}"
+  tmp=$(mktemp "${dir}/.symbol.toml.XXXXXX") || exit 1
+  awk -v key="${kind}" '$0 !~ "^[[:space:]]*" key "[[:space:]]*="' \
+    "${manifest}" > "${tmp}"
+  mv "${tmp}" "${manifest}"
 }
 
 save_claim_recovery() {
   name=$1
   claim=$2
   state_root=${XDG_STATE_HOME:-${HOME}/.local/state}
-  directory=$state_root/symbol/claims
+  directory=${state_root}/symbol/claims
   old_umask=$(umask)
   umask 077
-  mkdir -p "$directory"
-  file=$directory/$name
-  printf '%s\n' "$claim" > "$file"
-  chmod 600 "$file"
-  umask "$old_umask"
-  printf 'saved creator claim to %s (mode 0600)\n' "$file"
+  mkdir -p "${directory}"
+  file=${directory}/${name}
+  printf '%s\n' "${claim}" > "${file}"
+  chmod 600 "${file}"
+  umask "${old_umask}"
+  printf 'saved creator claim to %s (mode 0600)\n' "${file}"
+}
+
+save_management_recovery() {
+  name=$1
+  token=$2
+  state_root=${XDG_STATE_HOME:-${HOME}/.local/state}
+  directory=${state_root}/symbol/tokens
+  old_umask=$(umask)
+  umask 077
+  mkdir -p "${directory}"
+  file=${directory}/${name}
+  printf '%s\n' "${token}" > "${file}"
+  chmod 600 "${file}"
+  umask "${old_umask}"
+  printf 'saved management token to %s (mode 0600)\n' "${file}"
 }
 
 persist_pending_claim() {
   key=$1
   claim=$2
   state_root=${XDG_STATE_HOME:-${HOME}/.local/state}
-  directory=$state_root/symbol/claims
+  directory=${state_root}/symbol/claims
   old_umask=$(umask)
   umask 077
-  mkdir -p "$directory"
-  PENDING_CLAIM_FILE=$directory/pending-$key
-  printf '%s\n' "$claim" > "$PENDING_CLAIM_FILE"
-  chmod 600 "$PENDING_CLAIM_FILE"
-  umask "$old_umask"
+  mkdir -p "${directory}"
+  PENDING_CLAIM_DIR=${directory}/pending-${key}
+  mkdir -p "${PENDING_CLAIM_DIR}"
+  printf '%s\n' "${claim}" > "${PENDING_CLAIM_DIR}/claim"
+  chmod 600 "${PENDING_CLAIM_DIR}/claim"
+  umask "${old_umask}"
+}
+
+persist_pending_request() {
+  pending_method=$1
+  pending_host=$2
+  pending_source=$3
+  pending_destination=$4
+  pending_managed=$5
+  pending_body=${6:-}
+  pending_content_type=${7:-}
+  pending_unpack=${8:-0}
+  pending_url=${9:-}
+  [ -n "${PENDING_CLAIM_DIR:-}" ] || return 0
+  {
+    printf 'version=1\n'
+    printf 'method=%s\n' "${pending_method}"
+    printf 'host=%s\n' "${pending_host}"
+    printf 'source=%s\n' "${pending_source}"
+    printf 'destination=%s\n' "${pending_destination}"
+    printf 'managed=%s\n' "${pending_managed}"
+    printf 'content_type=%s\n' "${pending_content_type}"
+    printf 'unpack=%s\n' "${pending_unpack}"
+    printf 'url=%s\n' "${pending_url}"
+    printf 'idempotency=%s\n' "${idempotency_key}"
+  } > "${PENDING_CLAIM_DIR}/record"
+  if [ -n "${pending_body}" ]; then
+    cp "${pending_body}" "${PENDING_CLAIM_DIR}/body"
+  fi
 }
 
 finish_pending_claim() {
   name=$1
-  [ -n "${PENDING_CLAIM_FILE:-}" ] || return 0
-  destination=$(dirname "$PENDING_CLAIM_FILE")/$name
-  mv "$PENDING_CLAIM_FILE" "$destination"
-  PENDING_CLAIM_FILE=
-  printf 'saved creator claim to %s (mode 0600)\n' "$destination"
+  [ -n "${PENDING_CLAIM_DIR:-}" ] || return 0
+  destination=$(dirname "${PENDING_CLAIM_DIR}")/${name}
+  mv "${PENDING_CLAIM_DIR}/claim" "${destination}"
+  rm -rf "${PENDING_CLAIM_DIR}"
+  PENDING_CLAIM_DIR=
+  printf 'saved creator claim to %s (mode 0600)\n' "${destination}"
 }
 
 remove_claim_recovery() {
   name=$1
   state_root=${XDG_STATE_HOME:-${HOME}/.local/state}
-  rm -f "$state_root/symbol/claims/$name"
+  rm -f "${state_root}/symbol/claims/${name}"
+}
+
+claim_from_recovery() {
+  name=$1
+  state_root=${XDG_STATE_HOME:-${HOME}/.local/state}
+  file=${state_root}/symbol/claims/${name}
+  [ -f "${file}" ] || return 1
+  awk '{ print; exit }' "${file}"
+}
+
+pending_value() {
+  key=$1
+  record=$2
+  awk -v key="${key}" '
+    index($0, key "=") == 1 { print substr($0, length(key) + 2); exit }
+  ' "${record}"
+}
+
+recover_pending_operation() {
+  pending=$1
+  record=${pending}/record
+  [ -f "${record}" ] && [ -f "${pending}/claim" ] || return 1
+  method=$(pending_value method "${record}")
+  host=$(pending_value host "${record}")
+  source=$(pending_value source "${record}")
+  destination=$(pending_value destination "${record}")
+  managed=$(pending_value managed "${record}")
+  content_type=$(pending_value content_type "${record}")
+  unpack=$(pending_value unpack "${record}")
+  url=$(pending_value url "${record}")
+  idempotency_key=$(pending_value idempotency "${record}")
+  claim=$(awk '{ print; exit }' "${pending}/claim")
+  PENDING_CLAIM_DIR=${pending}
+
+  if [ -n "${destination}" ] && [ "${managed}" = 1 ] &&
+    curl -fsS "${host}/${destination}/symbol.toml" >/dev/null 2>&1; then
+    http_request MANAGE "${host}/${destination}" \
+      -H 'Management-Action: rotate' \
+      -H "Creator-Claim: ${claim}" \
+      -H "Idempotency-Key: ${idempotency_key}-recover" || return 1
+    management=$(header_value Management-Token)
+    [ -n "${management}" ] || return 1
+    save_management_recovery "${destination}" "${management}"
+    finish_pending_claim "${destination}"
+    printf 'recovered managed site %s/%s/\n' "${host}" "${destination}"
+    return 0
+  fi
+  if [ "${method}" = COPY ] && [ -n "${destination}" ] &&
+    curl -fsS "${host}/${destination}/symbol.toml" >/dev/null 2>&1; then
+    finish_pending_claim "${destination}"
+    printf 'recovered copied site %s/%s/\n' "${host}" "${destination}"
+    return 0
+  fi
+
+  set -- -H "Idempotency-Key: ${idempotency_key}" -H "Creator-Claim: ${claim}"
+  [ "${managed}" != 1 ] || set -- "$@" -H 'Management-Action: claim'
+  if [ "${method}" = PUT ]; then
+    [ -z "${content_type}" ] || set -- "$@" -H "Content-Type: ${content_type}"
+    [ "${unpack}" != 1 ] || set -- "$@" -H 'Unpack: 1'
+    if [ "${unpack}" != 1 ] && [ -n "${source}" ]; then
+      set -- "$@" -H "Content-Disposition: attachment; filename=\"$(basename "${source}")\""
+    fi
+    if [ "${url}" = "${host}/" ]; then
+      http_request PUT "${url}" "$@" -T - < "${pending}/body" || return 1
+    else
+      http_request PUT "${url}" "$@" -T "${pending}/body" || return 1
+    fi
+  elif [ "${method}" = COPY ]; then
+    [ -z "${destination}" ] || set -- "$@" -H "Destination: /${destination}"
+    http_request COPY "${url}" "$@" || return 1
+  else
+    return 1
+  fi
+  location=$(header_value Location)
+  if [ -n "${destination}" ]; then
+    recovered=${destination}
+  else
+    [ -n "${location}" ] || return 1
+    recovered=${location%/}
+    recovered=${recovered##*/}
+  fi
+  finish_pending_claim "${recovered}"
+  printf 'recovered %s/%s/\n' "${host}" "${recovered}"
+}
+
+recover_pending_operations() {
+  state_root=${XDG_STATE_HOME:-${HOME}/.local/state}
+  directory=${state_root}/symbol/claims
+  [ -d "${directory}" ] || {
+    printf 'no pending operations\n'
+    return
+  }
+  find "${directory}" -type d -name 'pending-*' -mtime +7 -exec rm -rf {} \; 2>/dev/null || true
+  found=0
+  for pending in "${directory}"/pending-*; do
+    [ -d "${pending}" ] || continue
+    found=1
+    recover_pending_operation "${pending}" ||
+      printf 'could not recover %s; pending state retained\n' "${pending}" >&2
+  done
+  [ "${found}" -eq 1 ] || printf 'no pending operations\n'
 }
 
 matching_manifest() {
   expected_host=$1
   expected_name=$2
   found=$(manifest_find 2>/dev/null || true)
-  [ -n "$found" ] || return 1
-  found_host=$(manifest_value host "$found" 2>/dev/null || true)
-  found_name=$(manifest_value name "$found" 2>/dev/null || true)
-  [ "${found_host%/}" = "${expected_host%/}" ] && [ "$found_name" = "$expected_name" ] || return 1
-  printf '%s\n' "$found"
+  [ -n "${found}" ] || return 1
+  found_host=$(manifest_value host "${found}" 2>/dev/null || true)
+  found_name=$(manifest_value name "${found}" 2>/dev/null || true)
+  [ "${found_host%/}" = "${expected_host%/}" ] && [ "${found_name}" = "${expected_name}" ] || return 1
+  printf '%s\n' "${found}"
 }
 
 save_response_secrets() {
@@ -993,15 +1140,15 @@ save_response_secrets() {
   name=$2
   management=$(header_value Management-Token)
   claim=$(header_value Creator-Claim)
-  [ -z "$management" ] || {
-    printf 'management token (shown once):\n  %s\n' "$management"
-    local_manifest=$(matching_manifest "$base" "$name" 2>/dev/null || true)
-    [ -z "$local_manifest" ] || write_secret_sidecar token "$management" "$local_manifest"
+  [ -z "${management}" ] || {
+    printf 'management token (shown once):\n  %s\n' "${management}"
+    local_manifest=$(matching_manifest "${base}" "${name}" 2>/dev/null || true)
+    [ -z "${local_manifest}" ] || write_secret_sidecar token "${management}" "${local_manifest}"
   }
-  [ -z "$claim" ] || {
-    printf 'creator claim (shown once):\n  %s\n' "$claim"
-    local_manifest=$(matching_manifest "$base" "$name" 2>/dev/null || true)
-    [ -z "$local_manifest" ] || write_secret_sidecar claim "$claim" "$local_manifest"
+  [ -z "${claim}" ] || {
+    printf 'creator claim (shown once):\n  %s\n' "${claim}"
+    local_manifest=$(matching_manifest "${base}" "${name}" 2>/dev/null || true)
+    [ -z "${local_manifest}" ] || write_secret_sidecar claim "${claim}" "${local_manifest}"
   }
 }
 
@@ -1014,168 +1161,199 @@ put_file_request() {
   managed=$6
   conditional=${7:-}
   generated=${8:-0}
-  validate_remote_path "$remote"
-  is_site_name "$site" || [ "$generated" -eq 1 ] ||
-    usage_error "invalid site name: $site"
+  validate_remote_path "${remote}"
+  is_site_name "${site}" || [ "${generated}" -eq 1 ] ||
+    usage_error "invalid site name: ${site}"
   auth=$(mktemp) || exit 1
-  auth_args_file "$auth"
+  auth_args_file "${auth}"
   idempotency_key=$(random_key)
-  set -- -H "Idempotency-Key: $idempotency_key"
-  while IFS= read -r arg; do set -- "$@" "$arg"; done < "$auth"
-  rm -f "$auth"
-  [ -z "$conditional" ] || set -- "$@" -H "If-Match: $conditional"
-  claim_manifest=$(matching_manifest "$base" "$site" 2>/dev/null || true)
-  if [ -z "$claim_manifest" ] && [ -d "$source" ] && [ -f "$source/symbol.toml" ]; then
-    candidate_host=$(manifest_value host "$source/symbol.toml" 2>/dev/null || true)
-    candidate_name=$(manifest_value name "$source/symbol.toml" 2>/dev/null || true)
-    if [ "${candidate_host%/}" = "${base%/}" ] && [ "$candidate_name" = "$site" ]; then
-      claim_manifest=$source/symbol.toml
+  set -- -H "Idempotency-Key: ${idempotency_key}"
+  while IFS= read -r arg; do set -- "$@" "${arg}"; done < "${auth}"
+  rm -f "${auth}"
+  [ -z "${conditional}" ] || set -- "$@" -H "If-Match: ${conditional}"
+  claim_manifest=$(matching_manifest "${base}" "${site}" 2>/dev/null || true)
+  if [ -z "${claim_manifest}" ] && [ -d "${source}" ] && [ -f "${source}/symbol.toml" ]; then
+    candidate_host=$(manifest_value host "${source}/symbol.toml" 2>/dev/null || true)
+    candidate_name=$(manifest_value name "${source}/symbol.toml" 2>/dev/null || true)
+    if [ "${candidate_host%/}" = "${base%/}" ] && [ "${candidate_name}" = "${site}" ]; then
+      claim_manifest=${source}/symbol.toml
     fi
   fi
   claim=
   claim_generated=0
-  if [ -n "$claim_manifest" ] && manifest_value claim "$claim_manifest" >/dev/null 2>&1; then
-    claim=$(claim_from_manifest "$claim_manifest")
+  if [ -n "${claim_manifest}" ] && manifest_value claim "${claim_manifest}" >/dev/null 2>&1; then
+    claim=$(claim_from_manifest "${claim_manifest}")
   fi
-  if [ -z "$claim" ]; then
+  if [ -z "${claim}" ]; then
     claim="sym_claim_$(random_key)$(random_key)"
     claim_generated=1
-    [ -z "$claim_manifest" ] || write_secret_sidecar claim "$claim" "$claim_manifest"
+    [ -z "${claim_manifest}" ] || write_secret_sidecar claim "${claim}" "${claim_manifest}"
   fi
-  PENDING_CLAIM_FILE=
-  [ -n "$claim_manifest" ] ||
-    persist_pending_claim "$idempotency_key" "$claim"
-  set -- "$@" -H "Creator-Claim: $claim"
-  if [ "$managed" -eq 1 ]; then
+  PENDING_CLAIM_DIR=
+  persist_pending_claim "${idempotency_key}" "${claim}"
+  set -- "$@" -H "Creator-Claim: ${claim}"
+  if [ "${managed}" -eq 1 ]; then
     set -- "$@" -H 'Management-Action: claim'
   fi
-  if [ "$generated" -eq 1 ] && [ -n "$remote" ]; then
+  request_unpack=${unpack}
+  if [ "${generated}" -eq 1 ] && [ -n "${remote}" ]; then
     upload_stage=$(mktemp -d) || exit 1
-    mkdir -p "$upload_stage/$(dirname "$remote")"
-    cp "$source" "$upload_stage/$remote"
+    mkdir -p "${upload_stage}/$(dirname "${remote}")"
+    cp "${source}" "${upload_stage}/${remote}"
     ARCHIVE_FILE=$(mktemp) || exit 1
-    tar -czf "$ARCHIVE_FILE" -C "$upload_stage" .
-    rm -rf "$upload_stage"
-    source=$ARCHIVE_FILE
+    tar -czf "${ARCHIVE_FILE}" -C "${upload_stage}" .
+    rm -rf "${upload_stage}"
+    source=${ARCHIVE_FILE}
+    ctype=application/gzip
+    request_unpack=1
     set -- "$@" -H 'Content-Type: application/gzip' -H 'Unpack: 1'
-  elif [ -d "$source" ]; then
-    make_archive_from_directory "$source"
-    source=$ARCHIVE_FILE
+  elif [ -d "${source}" ]; then
+    make_archive_from_directory "${source}"
+    source=${ARCHIVE_FILE}
+    ctype=application/gzip
+    request_unpack=1
     set -- "$@" -H 'Content-Type: application/gzip' -H 'Unpack: 1'
   else
-    [ -f "$source" ] || die "not a file or directory: $source"
-    if [ -n "$remote" ]; then
-      ctype=$(content_type "$remote")
-      set -- "$@" -H "Content-Disposition: attachment; filename=\"$(basename "$remote")\""
+    [ -f "${source}" ] || die "not a file or directory: ${source}"
+    if [ -n "${remote}" ]; then
+      ctype=$(content_type "${remote}")
+      set -- "$@" -H "Content-Disposition: attachment; filename=\"$(basename "${remote}")\""
     else
-      ctype=$(content_type "$source")
+      ctype=$(content_type "${source}")
     fi
-    set -- "$@" -H "Content-Type: $ctype"
-    [ "$unpack" -eq 0 ] || set -- "$@" -H 'Unpack: 1'
+    set -- "$@" -H "Content-Type: ${ctype}"
+    [ "${unpack}" -eq 0 ] || set -- "$@" -H 'Unpack: 1'
   fi
-  if [ "$generated" -eq 1 ]; then
+  if [ "${generated}" -eq 1 ]; then
     url="${base}/"
-  elif [ -n "$remote" ]; then
-    encoded=$(urlencode_path "$remote")
+  elif [ -n "${remote}" ]; then
+    encoded=$(urlencode_path "${remote}")
     url="${base}/${site}/${encoded}"
   else
     url="${base}/${site}"
   fi
+  persist_pending_request PUT "${base}" "${remote}" "${site}" "${managed}" \
+    "${source}" "${ctype}" "${request_unpack}" "${url}"
   put_attempt() {
-    if [ "$generated" -eq 1 ]; then
-      http_request PUT "$url" "$@" -T - < "$source"
+    if [ "${generated}" -eq 1 ]; then
+      http_request PUT "${url}" "$@" -T - < "${source}"
     else
-      http_request PUT "$url" "$@" -T "$source"
+      http_request PUT "${url}" "$@" -T "${source}"
     fi
   }
+  response_was_lost=0
+  managed_response_lost=0
   if ! put_attempt "$@"; then
-    if [ -z "${HTTP_STATUS:-}" ] || [ "$HTTP_STATUS" = 000 ]; then
-      put_attempt "$@" || {
-        if [ -n "${HTTP_STATUS:-}" ] && [ "$HTTP_STATUS" != 000 ]; then
-          rm -f "${PENDING_CLAIM_FILE:-}"
-          PENDING_CLAIM_FILE=
-          if [ "$claim_generated" -eq 1 ] && [ -n "$claim_manifest" ]; then
-            remove_secret_sidecar claim "$claim_manifest"
+    if [ -z "${HTTP_STATUS:-}" ] || [ "${HTTP_STATUS}" = 000 ]; then
+      response_was_lost=1
+      if ! put_attempt "$@"; then
+        if [ "${managed}" -eq 1 ] && [ -n "${site}" ] &&
+          [ "${HTTP_STATUS:-}" = 409 ] &&
+          curl -fsS "${base}/${site}/symbol.toml" >/dev/null 2>&1; then
+          HTTP_STATUS=200
+          managed_response_lost=1
+        else
+          if [ -n "${HTTP_STATUS:-}" ] && [ "${HTTP_STATUS}" != 000 ]; then
+            rm -rf "${PENDING_CLAIM_DIR:-}"
+            PENDING_CLAIM_DIR=
+            if [ "${claim_generated}" -eq 1 ] && [ -n "${claim_manifest}" ]; then
+              remove_secret_sidecar claim "${claim_manifest}"
+            fi
           fi
+          [ -z "${ARCHIVE_FILE:-}" ] || rm -f "${ARCHIVE_FILE}"
+          return 1
         fi
-        [ -z "${ARCHIVE_FILE:-}" ] || rm -f "$ARCHIVE_FILE"
-        return 1
-      }
-    else
-      rm -f "${PENDING_CLAIM_FILE:-}"
-      PENDING_CLAIM_FILE=
-      if [ "$claim_generated" -eq 1 ] && [ -n "$claim_manifest" ]; then
-        remove_secret_sidecar claim "$claim_manifest"
       fi
-      [ -z "${ARCHIVE_FILE:-}" ] || rm -f "$ARCHIVE_FILE"
+    else
+      rm -rf "${PENDING_CLAIM_DIR:-}"
+      PENDING_CLAIM_DIR=
+      if [ "${claim_generated}" -eq 1 ] && [ -n "${claim_manifest}" ]; then
+        remove_secret_sidecar claim "${claim_manifest}"
+      fi
+      [ -z "${ARCHIVE_FILE:-}" ] || rm -f "${ARCHIVE_FILE}"
       return 1
     fi
   fi
-  [ -z "${ARCHIVE_FILE:-}" ] || rm -f "$ARCHIVE_FILE"
+  [ -z "${ARCHIVE_FILE:-}" ] || rm -f "${ARCHIVE_FILE}"
   ARCHIVE_FILE=
   location=$(header_value Location)
-  final_name=$site
-  if [ "$generated" -eq 1 ]; then
-    [ -n "$location" ] || die "server omitted Location for generated site"
+  final_name=${site}
+  if [ "${generated}" -eq 1 ]; then
+    [ -n "${location}" ] || die "server omitted Location for generated site"
     final_name=${location%/}
     final_name=${final_name##*/}
   fi
-  if awk 'index($0, "changed: false") { found=1 } END { exit !found }' "$HTTP_BODY"; then
-    printf 'already up to date %s/%s/\n' "$base" "$final_name"
-  elif [ "$HTTP_STATUS" = 201 ]; then
-    printf 'created %s/%s/\n' "$base" "$final_name"
-  elif [ "$HTTP_STATUS" = 200 ]; then
-    printf 'updated %s/%s/\n' "$base" "$final_name"
+  if [ "${managed_response_lost}" -eq 1 ]; then
+    printf 'created %s/%s/; response was lost, run: symbol recover\n' "${base}" "${site}"
+  elif awk 'index($0, "changed: false") { found=1 } END { exit !found }' "${HTTP_BODY}"; then
+    printf 'already up to date %s/%s/\n' "${base}" "${final_name}"
+  elif [ "${HTTP_STATUS}" = 201 ]; then
+    printf 'created %s/%s/\n' "${base}" "${final_name}"
+  elif [ "${HTTP_STATUS}" = 200 ]; then
+    printf 'updated %s/%s/\n' "${base}" "${final_name}"
   fi
-  print_mutation_result "$final_name" 1
-  save_response_secrets "$base" "$final_name"
-  if [ "$HTTP_STATUS" = 201 ] && [ -z "$claim_manifest" ]; then
-    finish_pending_claim "$final_name"
-  elif [ "$HTTP_STATUS" != 201 ]; then
-    rm -f "${PENDING_CLAIM_FILE:-}"
-    PENDING_CLAIM_FILE=
-    if [ "$claim_generated" -eq 1 ] && [ -n "$claim_manifest" ]; then
-      remove_secret_sidecar claim "$claim_manifest"
+  if [ "${managed_response_lost}" -eq 0 ]; then
+    print_mutation_result "${final_name}" 1
+    save_response_secrets "${base}" "${final_name}"
+  fi
+  if [ "${HTTP_STATUS}" = 201 ] && [ -z "${claim_manifest}" ]; then
+    finish_pending_claim "${final_name}"
+  elif [ "${HTTP_STATUS}" = 201 ]; then
+    rm -rf "${PENDING_CLAIM_DIR:-}"
+    PENDING_CLAIM_DIR=
+  elif [ "${managed_response_lost}" -eq 1 ]; then
+    :
+  elif [ "${response_was_lost}" -eq 1 ] && [ "${HTTP_STATUS}" = 200 ]; then
+    if [ -z "${claim_manifest}" ]; then
+      finish_pending_claim "${final_name}"
+    else
+      rm -rf "${PENDING_CLAIM_DIR:-}"
+      PENDING_CLAIM_DIR=
+    fi
+  elif [ "${HTTP_STATUS}" != 201 ]; then
+    rm -rf "${PENDING_CLAIM_DIR:-}"
+    PENDING_CLAIM_DIR=
+    if [ "${claim_generated}" -eq 1 ] && [ -n "${claim_manifest}" ]; then
+      remove_secret_sidecar claim "${claim_manifest}"
     fi
   fi
   management=$(header_value Management-Token)
-  if [ -n "$management" ] && [ -n "$claim_manifest" ]; then
-    write_secret_sidecar token "$management" "$claim_manifest"
+  if [ -n "${management}" ] && [ -n "${claim_manifest}" ]; then
+    write_secret_sidecar token "${management}" "${claim_manifest}"
   fi
-  local_manifest=$(matching_manifest "$base" "$final_name" 2>/dev/null || true)
-  [ -z "$local_manifest" ] ||
-    refresh_local_manifest "$local_manifest" "$base" "$final_name"
-  PUT_NAME=$final_name
+  local_manifest=$(matching_manifest "${base}" "${final_name}" 2>/dev/null || true)
+  [ -z "${local_manifest}" ] ||
+    refresh_local_manifest "${local_manifest}" "${base}" "${final_name}"
 }
 
 refresh_local_manifest() {
   manifest=$1
   base=$2
   name=$3
-  dir=$(dirname "$manifest")
+  dir=$(dirname "${manifest}")
   work=$(mktemp -d) || exit 1
-  preserved=$work/preserved
-  awk '/^[[:space:]]*(token|claim)[[:space:]]*=/{print}' "$manifest" > "$preserved"
-  fresh=$work/symbol.toml
-  curl -sS -f "${base}/${name}/symbol.toml" -o "$fresh" || {
-    rm -rf "$work"
+  preserved=${work}/preserved
+  awk '/^[[:space:]]*(token|claim)[[:space:]]*=/{print}' "${manifest}" > "${preserved}"
+  fresh=${work}/symbol.toml
+  curl -sS -f "${base}/${name}/symbol.toml" -o "${fresh}" || {
+    rm -rf "${work}"
     die "publish succeeded, but could not refresh local symbol.toml"
   }
-  if [ -s "$preserved" ]; then
-    merged=$work/merged
+  if [ -s "${preserved}" ]; then
+    merged=${work}/merged
     awk 'BEGIN{done=0} /^[[:space:]]*\[/ && !done {while((getline l < p)>0) print l; done=1} {print}
-      END{if(!done) while((getline l < p)>0) print l}' p="$preserved" "$fresh" > "$merged"
-    mv "$merged" "$fresh"
+      END{if(!done) while((getline l < p)>0) print l}' p="${preserved}" "${fresh}" > "${merged}"
+    mv "${merged}" "${fresh}"
   fi
-  tmp=$(mktemp "$dir/.symbol.toml.XXXXXX") || exit 1
-  cp "$fresh" "$tmp"
-  mv "$tmp" "$manifest"
-  rm -rf "$work"
+  tmp=$(mktemp "${dir}/.symbol.toml.XXXXXX") || exit 1
+  cp "${fresh}" "${tmp}"
+  mv "${tmp}" "${manifest}"
+  rm -rf "${work}"
 }
 
 stdin_to_temp() {
   STDIN_FILE=$(mktemp) || exit 1
-  cat > "$STDIN_FILE"
+  cat > "${STDIN_FILE}"
 }
 
 copy_or_move_request() {
@@ -1183,68 +1361,70 @@ copy_or_move_request() {
   source=$2
   destination=$3
   managed=$4
-  is_site_name "$source" || usage_error "invalid source site: $source"
-  [ -z "$destination" ] || is_site_name "$destination" ||
-    usage_error "invalid destination site: $destination"
+  is_site_name "${source}" || usage_error "invalid source site: ${source}"
+  [ -z "${destination}" ] || is_site_name "${destination}" ||
+    usage_error "invalid destination site: ${destination}"
   auth=$(mktemp) || exit 1
-  auth_args_file "$auth"
+  auth_args_file "${auth}"
   set --
-  while IFS= read -r arg; do set -- "$@" "$arg"; done < "$auth"
-  rm -f "$auth"
-  [ -z "$destination" ] || set -- "$@" -H "Destination: /$destination"
-  PENDING_CLAIM_FILE=
-  if [ "$method" = COPY ]; then
+  while IFS= read -r arg; do set -- "$@" "${arg}"; done < "${auth}"
+  rm -f "${auth}"
+  [ -z "${destination}" ] || set -- "$@" -H "Destination: /${destination}"
+  PENDING_CLAIM_DIR=
+  if [ "${method}" = COPY ]; then
     idempotency_key=$(random_key)
-    set -- "$@" -H "Idempotency-Key: $idempotency_key"
+    set -- "$@" -H "Idempotency-Key: ${idempotency_key}"
     claim="sym_claim_$(random_key)$(random_key)"
-    persist_pending_claim "$idempotency_key" "$claim"
-    set -- "$@" -H "Creator-Claim: $claim"
-    if [ "$managed" -eq 1 ]; then
+    persist_pending_claim "${idempotency_key}" "${claim}"
+    set -- "$@" -H "Creator-Claim: ${claim}"
+    if [ "${managed}" -eq 1 ]; then
       set -- "$@" -H 'Management-Action: claim'
     fi
+    persist_pending_request COPY "${HOST}" "${source}" "${destination}" "${managed}" "" "" 0 \
+      "${HOST}/${source}"
   fi
   recovered_location=
-  if ! http_request "$method" "${HOST}/${source}" "$@"; then
-    if [ "$method" = COPY ] &&
-      { [ -z "${HTTP_STATUS:-}" ] || [ "$HTTP_STATUS" = 000 ]; }; then
-      if [ -n "$destination" ]; then
+  if ! http_request "${method}" "${HOST}/${source}" "$@"; then
+    if [ "${method}" = COPY ] &&
+      { [ -z "${HTTP_STATUS:-}" ] || [ "${HTTP_STATUS}" = 000 ]; }; then
+      if [ -n "${destination}" ]; then
         if curl -fsS "${HOST}/${destination}/symbol.toml" >/dev/null 2>&1; then
           recovered_location="${HOST}/${destination}/"
         else
           return 1
         fi
       else
-        http_request "$method" "${HOST}/${source}" "$@" || return 1
+        http_request "${method}" "${HOST}/${source}" "$@" || return 1
       fi
     else
-      rm -f "${PENDING_CLAIM_FILE:-}"
-      PENDING_CLAIM_FILE=
+      rm -rf "${PENDING_CLAIM_DIR:-}"
+      PENDING_CLAIM_DIR=
       return 1
     fi
   fi
   location=${recovered_location:-$(header_value Location)}
-  [ -n "$location" ] || die "server omitted Location"
+  [ -n "${location}" ] || die "server omitted Location"
   RESULT_NAME=${location%/}
   RESULT_NAME=${RESULT_NAME##*/}
-  if [ -n "$recovered_location" ]; then
+  if [ -n "${recovered_location}" ]; then
     RESULT_MANAGEMENT_TOKEN=
     RESULT_CLAIM_TOKEN=
   else
     RESULT_MANAGEMENT_TOKEN=$(header_value Management-Token)
     RESULT_CLAIM_TOKEN=$(header_value Creator-Claim)
   fi
-  if [ "$method" = COPY ] && [ -n "$claim" ]; then
-    RESULT_CLAIM_TOKEN=$claim
-    finish_pending_claim "$RESULT_NAME"
+  if [ "${method}" = COPY ] && [ -n "${claim}" ]; then
+    RESULT_CLAIM_TOKEN=${claim}
+    finish_pending_claim "${RESULT_NAME}"
   fi
-  if [ "$method" = COPY ]; then
-    printf 'copied %s/%s/ -> %s\n' "$HOST" "$source" "$location"
+  if [ "${method}" = COPY ]; then
+    printf 'copied %s/%s/ -> %s\n' "${HOST}" "${source}" "${location}"
   else
-    printf 'moved %s/%s/ -> %s\n' "$HOST" "$source" "$location"
+    printf 'moved %s/%s/ -> %s\n' "${HOST}" "${source}" "${location}"
   fi
-  if [ -z "$recovered_location" ]; then
-    print_mutation_result "$RESULT_NAME" 1
-    save_response_secrets "$HOST" "$RESULT_NAME"
+  if [ -z "${recovered_location}" ]; then
+    print_mutation_result "${RESULT_NAME}" 1
+    save_response_secrets "${HOST}" "${RESULT_NAME}"
   else
     printf 'response was lost; creator claim retained for recovery\n' >&2
   fi
@@ -1252,32 +1432,33 @@ copy_or_move_request() {
 
 clone_site() {
   name=$1
-  destination=${2:-$name}
-  is_site_name "$name" || usage_error "invalid site name: $name"
-  [ "$destination" != "-" ] || usage_error "clone destination cannot be -; use get $name -"
-  if [ -e "$destination" ]; then
-    [ -d "$destination" ] && [ -z "$(ls -A "$destination")" ] ||
-      die "clone destination exists and is not empty: $destination"
+  destination=${2:-${name}}
+  is_site_name "${name}" || usage_error "invalid site name: ${name}"
+  [ "${destination}" != "-" ] || usage_error "clone destination cannot be -; use get ${name} -"
+  if [ -e "${destination}" ]; then
+    [ -d "${destination}" ] && [ -z "$(ls -A "${destination}")" ] ||
+      die "clone destination exists and is not empty: ${destination}"
   fi
   work=$(mktemp -d) || exit 1
-  archive=$work/site.tar.gz
-  extract=$work/extract
-  mkdir "$extract"
-  if ! archive_transfer GET "$HOST" "$name" "$archive"; then
-    rm -rf "$work"
+  archive=${work}/site.tar.gz
+  extract=${work}/extract
+  mkdir "${extract}"
+  if ! archive_transfer GET "${HOST}" "${name}" "${archive}"; then
+    rm -rf "${work}"
     return 1
   fi
-  if ! tar -xzf "$archive" -C "$extract"; then
-    rm -rf "$work"
-    die "could not extract archive"
+  if ! tar -xzf "${archive}" -C "${extract}"; then
+    rm -rf "${work}"
+    printf 'error: could not extract archive\n' >&2
+    return 1
   fi
-  if [ -e "$destination" ]; then
-    cp -R "$extract"/. "$destination"/
+  if [ -e "${destination}" ]; then
+    cp -R "${extract}"/. "${destination}"/
   else
-    mv "$extract" "$destination"
+    mv "${extract}" "${destination}"
   fi
-  rm -rf "$work"
-  printf 'cloned %s/%s/ -> %s\n' "$HOST" "$name" "$destination"
+  rm -rf "${work}"
+  printf 'cloned %s/%s/ -> %s\n' "${HOST}" "${name}" "${destination}"
 }
 
 expire_help() {
@@ -1319,7 +1500,7 @@ EOF
 
 json_string() {
   key=$1
-  awk -v key="$key" '
+  awk -v key="${key}" '
     {
       text = text $0
     }
@@ -1338,6 +1519,38 @@ json_string() {
         gsub(/[[:space:]]/, "", values[1])
         print values[1]
       }
+    }
+  '
+}
+
+json_limited_by() {
+  awk '
+    {
+      text = text $0
+    }
+    END {
+      token = "\"limited_by\":"
+      start = index(text, token)
+      if (!start) exit
+      object = substr(text, start + length(token))
+      sub(/^[[:space:]]*/, "", object)
+      if (substr(object, 1, 4) == "null") exit
+      kind = field(object, "kind")
+      path = field(object, "path")
+      if (path == "null" || path == "") print kind
+      else print kind " " path
+    }
+    function field(object, key, token, value) {
+      token = "\"" key "\":"
+      value = substr(object, index(object, token) + length(token))
+      sub(/^[[:space:]]*/, "", value)
+      if (substr(value, 1, 1) == "\"") {
+        value = substr(value, 2)
+        sub(/".*$/, "", value)
+      } else {
+        sub(/[,}].*$/, "", value)
+      }
+      return value
     }
   '
 }
@@ -1420,7 +1633,7 @@ print_inherited_expiry_caps() {
       }
       return value
     }
-  ' "$HTTP_BODY"
+  ' "${HTTP_BODY}"
 }
 
 print_expiry_site_report() {
@@ -1505,75 +1718,75 @@ print_expiry_site_report() {
       else expires = expires " (in " human(remaining) ")"
       printf "%-28s %-9s %-22s %s\n", target, mode, expires, limited
     }
-  ' "$HTTP_BODY"
+  ' "${HTTP_BODY}"
 }
 
 print_expire_report() {
-  if awk 'index($0, "\"entries\":[") { found=1 } END { exit !found }' "$HTTP_BODY"; then
+  if awk 'index($0, "\"entries\":[") { found=1 } END { exit !found }' "${HTTP_BODY}"; then
     print_expiry_site_report
     return
   fi
-  report_site=$(json_string site < "$HTTP_BODY" 2>/dev/null || true)
-  report_path=$(json_string path < "$HTTP_BODY" 2>/dev/null || true)
-  expires=$(json_string effective_expires_at < "$HTTP_BODY" 2>/dev/null || true)
-  remaining=$(json_string remaining_seconds < "$HTTP_BODY" 2>/dev/null || true)
-  mode=$(json_string mode < "$HTTP_BODY" 2>/dev/null || true)
-  size=$(json_string size < "$HTTP_BODY" 2>/dev/null || true)
-  refreshed=$(json_string refreshed_at < "$HTTP_BODY" 2>/dev/null || true)
-  own_expires=$(json_string expires_at < "$HTTP_BODY" 2>/dev/null || true)
-  retention=$(json_string retention_seconds < "$HTTP_BODY" 2>/dev/null || true)
-  min_age=$(json_string min_age_seconds < "$HTTP_BODY" 2>/dev/null || true)
-  max_age=$(json_string max_age_seconds < "$HTTP_BODY" 2>/dev/null || true)
-  max_size=$(json_string max_size_bytes < "$HTTP_BODY" 2>/dev/null || true)
-  power=$(json_string power < "$HTTP_BODY" 2>/dev/null || true)
-  if [ -z "$expires" ] || [ "$expires" = null ]; then
+  report_site=$(json_string site < "${HTTP_BODY}" 2>/dev/null || true)
+  report_path=$(json_string path < "${HTTP_BODY}" 2>/dev/null || true)
+  expires=$(json_string effective_expires_at < "${HTTP_BODY}" 2>/dev/null || true)
+  remaining=$(json_string remaining_seconds < "${HTTP_BODY}" 2>/dev/null || true)
+  mode=$(json_string mode < "${HTTP_BODY}" 2>/dev/null || true)
+  size=$(json_string size < "${HTTP_BODY}" 2>/dev/null || true)
+  refreshed=$(json_string refreshed_at < "${HTTP_BODY}" 2>/dev/null || true)
+  own_expires=$(json_string expires_at < "${HTTP_BODY}" 2>/dev/null || true)
+  retention=$(json_string retention_seconds < "${HTTP_BODY}" 2>/dev/null || true)
+  min_age=$(json_string min_age_seconds < "${HTTP_BODY}" 2>/dev/null || true)
+  max_age=$(json_string max_age_seconds < "${HTTP_BODY}" 2>/dev/null || true)
+  max_size=$(json_string max_size_bytes < "${HTTP_BODY}" 2>/dev/null || true)
+  power=$(json_string power < "${HTTP_BODY}" 2>/dev/null || true)
+  if [ -z "${expires}" ] || [ "${expires}" = null ]; then
     printf 'expiration disabled\n'
     return
   fi
   size_h=$(human_bytes "${size:-0}")
   remaining_h=$(human_duration "${remaining:-0}")
   retention_h=
-  [ -z "$retention" ] || [ "$retention" = null ] ||
-    retention_h=$(human_duration "$retention")
+  [ -z "${retention}" ] || [ "${retention}" = null ] ||
+    retention_h=$(human_duration "${retention}")
   min_h=
-  [ -z "$min_age" ] || [ "$min_age" = null ] ||
-    min_h=$(human_duration "$min_age")
+  [ -z "${min_age}" ] || [ "${min_age}" = null ] ||
+    min_h=$(human_duration "${min_age}")
   max_h=
-  [ -z "$max_age" ] || [ "$max_age" = null ] ||
-    max_h=$(human_duration "$max_age")
+  [ -z "${max_age}" ] || [ "${max_age}" = null ] ||
+    max_h=$(human_duration "${max_age}")
   max_size_h=
-  [ -z "$max_size" ] || [ "$max_size" = null ] ||
-    max_size_h=$(human_bytes "$max_size")
-  if [ -n "$report_site" ] && [ "$report_site" != null ]; then
-    if [ -n "$report_path" ] && [ "$report_path" != null ]; then
-      printf 'effective lifetime: %s/%s\n' "$report_site" "$report_path"
+  [ -z "${max_size}" ] || [ "${max_size}" = null ] ||
+    max_size_h=$(human_bytes "${max_size}")
+  if [ -n "${report_site}" ] && [ "${report_site}" != null ]; then
+    if [ -n "${report_path}" ] && [ "${report_path}" != null ]; then
+      printf 'effective lifetime: %s/%s\n' "${report_site}" "${report_path}"
     else
-      printf 'effective lifetime: %s/\n' "$report_site"
+      printf 'effective lifetime: %s/\n' "${report_site}"
     fi
   else
     printf 'effective lifetime\n'
   fi
-  [ -z "$size" ] || printf 'size:              %s\n' "$size_h"
-  if [ -n "$mode" ] && [ "$mode" != null ]; then
-    if [ "$mode" = decay ] && [ -n "$min_age" ] && [ -n "$max_age" ]; then
+  [ -z "${size}" ] || printf 'size:              %s\n' "${size_h}"
+  if [ -n "${mode}" ] && [ "${mode}" != null ]; then
+    if [ "${mode}" = decay ] && [ -n "${min_age}" ] && [ -n "${max_age}" ]; then
       printf 'policy:            decay (%s..%s @ %s ^%s)\n' \
-        "$min_h" "$max_h" "${max_size_h:-unknown}" "${power:-unknown}"
+        "${min_h}" "${max_h}" "${max_size_h:-unknown}" "${power:-unknown}"
     else
-      printf 'policy:            %s\n' "$mode"
+      printf 'policy:            %s\n' "${mode}"
     fi
   fi
-  [ -z "$retention" ] || [ "$retention" = null ] ||
-    printf 'policy retention:  %s\n' "$retention_h"
-  [ -z "$refreshed" ] || [ "$refreshed" = null ] ||
-    printf 'refreshed:         %s\n' "$refreshed"
-  [ -z "$own_expires" ] || [ "$own_expires" = null ] ||
-    printf 'own expiry:        %s\n' "$own_expires"
-  printf 'effective expiry:  %s (in %s)\n' "$expires" "$remaining_h"
+  [ -z "${retention}" ] || [ "${retention}" = null ] ||
+    printf 'policy retention:  %s\n' "${retention_h}"
+  [ -z "${refreshed}" ] || [ "${refreshed}" = null ] ||
+    printf 'refreshed:         %s\n' "${refreshed}"
+  [ -z "${own_expires}" ] || [ "${own_expires}" = null ] ||
+    printf 'own expiry:        %s\n' "${own_expires}"
+  printf 'effective expiry:  %s (in %s)\n' "${expires}" "${remaining_h}"
   print_inherited_expiry_caps
-  if [ "$mode" = decay ]; then
+  if [ "${mode}" = decay ]; then
     awk -v size="${size:-0}" -v maximum="${max_size:-0}" \
       -v min="${min_h:-min}" -v max="${max_h:-max}" \
-      -v current="$size_h" -v maximum_label="${max_size_h:-unknown}" '
+      -v current="${size_h}" -v maximum_label="${max_size_h:-unknown}" '
       BEGIN {
         width=37
         position=maximum > 0 ? int(size / maximum * (width - 1)) : 0
@@ -1591,12 +1804,12 @@ print_expire_report() {
     '
   fi
   elapsed=0
-  if [ -n "$retention" ] && [ "$retention" != null ] && [ -n "$remaining" ]; then
+  if [ -n "${retention}" ] && [ "${retention}" != null ] && [ -n "${remaining}" ]; then
     elapsed=$((retention > remaining ? retention - remaining : 0))
   fi
-  elapsed_h=$(human_duration "$elapsed")
+  elapsed_h=$(human_duration "${elapsed}")
   awk -v remaining="${remaining:-0}" -v retention="${retention:-0}" \
-    -v elapsed_label="$elapsed_h" -v remaining_label="$remaining_h" '
+    -v elapsed_label="${elapsed_h}" -v remaining_label="${remaining_h}" '
     BEGIN {
       width=37
       elapsed=retention > remaining ? retention-remaining : 0
@@ -1615,7 +1828,7 @@ print_expire_report() {
 duration_valid() {
   case "$1" in
     *[!0-9smhdw]*|'') return 1 ;;
-    *s|*m|*h|*d|*w) number=${1%?}; case "$number" in ''|*[!0-9]*|0) return 1 ;; esac ;;
+    *s|*m|*h|*d|*w) number=${1%?}; case "${number}" in ''|*[!0-9]*|0) return 1 ;; esac ;;
     *) return 1 ;;
   esac
 }
@@ -1672,29 +1885,29 @@ local_file_map() {
     hash_mode=remote
   fi
   (
-    cd "$root"
+    cd "${root}"
     find . -type f ! -path './.git/*' ! -name symbol.toml \
       ! -name .symbol-token ! -name .symbol-claim -print | LC_ALL=C sort
   ) | while IFS= read -r path; do
     relative=${path#./}
-    if [ "$hash_mode" = remote ]; then
-      hash=$(awk -F '\t' -v wanted="$relative" '$1 == wanted { print $2; exit }' "$baseline")
-      if [ -z "$hash" ]; then
-        hash="new:$relative"
+    if [ "${hash_mode}" = remote ]; then
+      hash=$(awk -F '\t' -v wanted="${relative}" '$1 == wanted { print $2; exit }' "${baseline}")
+      if [ -z "${hash}" ]; then
+        hash="new:${relative}"
       else
         remote=$(mktemp) || exit 1
-        encoded=$(urlencode_path "$relative")
-        curl -fsS "${base}/${site}/${encoded}" -o "$remote" ||
-          die "could not compare local file with upstream: $relative"
-        if ! cmp -s "$root/$relative" "$remote"; then
-          hash="changed:$relative"
+        encoded=$(urlencode_path "${relative}")
+        curl -fsS "${base}/${site}/${encoded}" -o "${remote}" ||
+          die "could not compare local file with upstream: ${relative}"
+        if ! cmp -s "${root}/${relative}" "${remote}"; then
+          hash="changed:${relative}"
         fi
-        rm -f "$remote"
+        rm -f "${remote}"
       fi
     else
-      hash=$(blake3_file "$root/$relative")
+      hash=$(blake3_file "${root}/${relative}")
     fi
-    printf '%s\t%s\n' "$relative" "$hash"
+    printf '%s\t%s\n' "${relative}" "${hash}"
   done
 }
 
@@ -1723,121 +1936,130 @@ upstream_file_map() {
 sync_project() {
   check=$1
   manifest_target
-  baseline_tree=$(manifest_value tree_hash "$MANIFEST") ||
+  baseline_tree=$(manifest_value tree_hash "${MANIFEST}") ||
     die "symbol.toml has no sync tree_hash baseline; clone the site again"
-  baseline_revision=$(manifest_value content_revision "$MANIFEST") ||
+  baseline_revision=$(manifest_value content_revision "${MANIFEST}") ||
     die "symbol.toml has no content_revision baseline; clone the site again"
   work=$(mktemp -d) || exit 1
-  baseline=$work/baseline
-  localmap=$work/local
-  upstream=$work/upstream
-  changed=$work/changed
-  manifest_files "$MANIFEST" | LC_ALL=C sort > "$baseline"
-  local_file_map "$MANIFEST_DIR" "$baseline" "$MANIFEST_HOST" "$MANIFEST_NAME" > "$localmap"
+  baseline=${work}/baseline
+  localmap=${work}/local
+  upstream=${work}/upstream
+  changed=${work}/changed
+  manifest_files "${MANIFEST}" | LC_ALL=C sort > "${baseline}"
+  local_file_map "${MANIFEST_DIR}" "${baseline}" "${MANIFEST_HOST}" "${MANIFEST_NAME}" > "${localmap}"
   if ! http_request GET "${MANIFEST_HOST}/${MANIFEST_NAME}/FILES" -H 'Accept: application/json'; then
-    rm -rf "$work"
+    rm -rf "${work}"
     return 1
   fi
-  upstream_tree=$(json_string tree_hash < "$HTTP_BODY")
-  upstream_revision=$(json_string content_revision < "$HTTP_BODY")
-  upstream_file_map "$HTTP_BODY" > "$upstream"
-  if [ "$upstream_tree" != "$baseline_tree" ] || ! cmp -s "$baseline" "$upstream"; then
+  upstream_tree=$(json_string tree_hash < "${HTTP_BODY}")
+  upstream_revision=$(json_string content_revision < "${HTTP_BODY}")
+  upstream_file_map "${HTTP_BODY}" > "${upstream}"
+  if [ "${upstream_tree}" != "${baseline_tree}" ] || ! cmp -s "${baseline}" "${upstream}"; then
     printf 'error: upstream changed since this checkout\n\n' >&2
-    printf 'checkout base: revision %s  %s\n' "$baseline_revision" "$baseline_tree" >&2
-    printf 'upstream now:  revision %s  %s\n' "$upstream_revision" "$upstream_tree" >&2
+    printf 'checkout base: revision %s  %s\n' "${baseline_revision}" "${baseline_tree}" >&2
+    printf 'upstream now:  revision %s  %s\n' "${upstream_revision}" "${upstream_tree}" >&2
     printf '\nlocal changes:\n' >&2
     awk -F '\t' '
       NR==FNR { base[$1]=$2; next }
       { local[$1]=$2; if (!($1 in base)) print "  + " $1; else if (base[$1] != $2) print "  M " $1 }
       END { for (path in base) if (!(path in local)) print "  - " path }
-    ' "$baseline" "$localmap" | LC_ALL=C sort -k2,2 >&2
+    ' "${baseline}" "${localmap}" | LC_ALL=C sort -k2,2 >&2
     printf '\nupstream changes:\n' >&2
     awk -F '\t' '
       NR==FNR { base[$1]=$2; next }
       { remote[$1]=$2; if (!($1 in base)) print "  + " $1; else if (base[$1] != $2) print "  M " $1 }
       END { for (path in base) if (!(path in remote)) print "  - " path }
-    ' "$baseline" "$upstream" | LC_ALL=C sort -k2,2 >&2
-    printf 'refusing to modify %s/%s/\n' "$MANIFEST_HOST" "$MANIFEST_NAME" >&2
+    ' "${baseline}" "${upstream}" | LC_ALL=C sort -k2,2 >&2
+    printf 'refusing to modify %s/%s/\n' "${MANIFEST_HOST}" "${MANIFEST_NAME}" >&2
     printf 'resolve manually with:\n' >&2
-    printf '  symbol clone %s ../%s-upstream\n' "$MANIFEST_NAME" "$MANIFEST_NAME" >&2
-    printf '  diff -ru . ../%s-upstream\n' "$MANIFEST_NAME" >&2
+    printf '  symbol clone %s ../%s-upstream\n' "${MANIFEST_NAME}" "${MANIFEST_NAME}" >&2
+    printf '  diff -ru . ../%s-upstream\n' "${MANIFEST_NAME}" >&2
     printf '  symbol put ...\n  symbol rm ...\n' >&2
-    rm -rf "$work"
+    rm -rf "${work}"
     return 1
   fi
   awk -F '\t' '
     NR==FNR { base[$1]=$2; next }
     { local[$1]=$2; if (!($1 in base)) print "+\t" $1; else if (base[$1] != $2) print "M\t" $1 }
     END { for (path in base) if (!(path in local)) print "-\t" path }
-  ' "$baseline" "$localmap" | LC_ALL=C sort -k2,2 > "$changed"
-  printf 'upstream: unchanged @ revision %s\n\n' "$upstream_revision"
-  additions=$(awk -F '\t' '$1=="+" || $1=="M" {n++} END {print n+0}' "$changed")
-  added=$(awk -F '\t' '$1=="+" {n++} END {print n+0}' "$changed")
-  modified=$(awk -F '\t' '$1=="M" {n++} END {print n+0}' "$changed")
-  if [ "$additions" -gt 0 ]; then
-    [ "$check" -eq 0 ] && printf 'local changes:\n' || printf 'would sync:\n'
-    awk -F '\t' '$1=="+" || $1=="M" {printf "  %s %s\n",$1,$2}' "$changed"
+  ' "${baseline}" "${localmap}" | LC_ALL=C sort -k2,2 > "${changed}"
+  printf 'upstream: unchanged @ revision %s\n\n' "${upstream_revision}"
+  additions=$(awk -F '\t' '$1=="+" || $1=="M" {n++} END {print n+0}' "${changed}")
+  added=$(awk -F '\t' '$1=="+" {n++} END {print n+0}' "${changed}")
+  modified=$(awk -F '\t' '$1=="M" {n++} END {print n+0}' "${changed}")
+  if [ "${additions}" -gt 0 ]; then
+    [ "${check}" -eq 0 ] && printf 'local changes:\n' || printf 'would sync:\n'
+    awk -F '\t' '$1=="+" || $1=="M" {printf "  %s %s\n",$1,$2}' "${changed}"
   fi
-  deletions=$(awk -F '\t' '$1=="-" {n++} END {print n+0}' "$changed")
-  if [ "$deletions" -gt 0 ]; then
+  deletions=$(awk -F '\t' '$1=="-" {n++} END {print n+0}' "${changed}")
+  if [ "${deletions}" -gt 0 ]; then
     printf '\n'
-    [ "$check" -eq 0 ] && printf 'local deletions ignored:\n' || printf 'would ignore local deletion:\n'
-    awk -F '\t' -v name="$MANIFEST_NAME" \
-      '$1=="-" {printf "  - %s  (use: symbol rm %s %s)\n",$2,name,$2}' "$changed"
+    [ "${check}" -eq 0 ] && printf 'local deletions ignored:\n' || printf 'would ignore local deletion:\n'
+    awk -F '\t' -v name="${MANIFEST_NAME}" \
+      '$1=="-" {printf "  - %s  (use: symbol rm %s %s)\n",$2,name,$2}' "${changed}"
   fi
-  if [ "$check" -eq 1 ]; then
+  if [ "${check}" -eq 1 ]; then
     printf '\nno changes made\n'
-    rm -rf "$work"
+    rm -rf "${work}"
     return
   fi
-  if [ "$additions" -eq 0 ]; then
+  if [ "${additions}" -eq 0 ]; then
     printf '\nnothing to sync\n'
-    rm -rf "$work"
+    rm -rf "${work}"
     return
   fi
-  stage=$work/stage
-  mkdir "$stage"
-  awk -F '\t' '$1=="+" || $1=="M" {print $2}' "$changed" |
+  stage=${work}/stage
+  mkdir "${stage}"
+  awk -F '\t' '$1=="+" || $1=="M" {print $2}' "${changed}" |
   while IFS= read -r path; do
-    mkdir -p "$stage/$(dirname "$path")"
-    cp "$MANIFEST_DIR/$path" "$stage/$path"
+    mkdir -p "${stage}/$(dirname "${path}")"
+    cp "${MANIFEST_DIR}/${path}" "${stage}/${path}"
   done
-  archive=$work/changed.tar.gz
-  tar -czf "$archive" -C "$stage" .
+  archive=${work}/changed.tar.gz
+  tar -czf "${archive}" -C "${stage}" .
   printf '\nsyncing %s files (%s added, %s modified)...\n' \
-    "$additions" "$added" "$modified"
+    "${additions}" "${added}" "${modified}"
   auth=$(mktemp) || exit 1
-  auth_args_file "$auth"
+  auth_args_file "${auth}"
   set -- -H 'Content-Type: application/gzip' -H 'Unpack: 1' \
-    -H "If-Match: $baseline_tree" -H "Idempotency-Key: $(random_key)"
-  while IFS= read -r arg; do set -- "$@" "$arg"; done < "$auth"
-  rm -f "$auth"
-  if ! http_request PUT "${MANIFEST_HOST}/${MANIFEST_NAME}" "$@" -T "$archive"; then
-    if [ "$HTTP_STATUS" = 412 ]; then
+    -H "If-Match: ${baseline_tree}" -H "Idempotency-Key: $(random_key)"
+  while IFS= read -r arg; do set -- "$@" "${arg}"; done < "${auth}"
+  rm -f "${auth}"
+  if ! http_request PUT "${MANIFEST_HOST}/${MANIFEST_NAME}" "$@" -T "${archive}"; then
+    if [ "${HTTP_STATUS}" = 412 ]; then
       printf 'error: upstream changed during sync; nothing was written\n' >&2
     fi
-    rm -rf "$work"
+    rm -rf "${work}"
     return 1
   fi
-  print_mutation_result "$MANIFEST_NAME"
-  preserved=$work/preserved
-  awk '/^[[:space:]]*(token|claim)[[:space:]]*=/{print}' "$MANIFEST" > "$preserved"
-  fresh=$work/symbol.toml
-  curl -sS -f "${MANIFEST_HOST}/${MANIFEST_NAME}/symbol.toml" -o "$fresh" ||
+  print_mutation_result "${MANIFEST_NAME}"
+  preserved=${work}/preserved
+  awk '/^[[:space:]]*(token|claim)[[:space:]]*=/{print}' "${MANIFEST}" > "${preserved}"
+  fresh=${work}/symbol.toml
+  curl -sS -f "${MANIFEST_HOST}/${MANIFEST_NAME}/symbol.toml" -o "${fresh}" ||
     die "sync succeeded, but could not refresh local symbol.toml"
-  if [ -s "$preserved" ]; then
-    merged=$work/merged
+  if [ -s "${preserved}" ]; then
+    merged=${work}/merged
     awk 'BEGIN{done=0} /^[[:space:]]*\[/ && !done {while((getline l < p)>0) print l; done=1} {print}
-      END{if(!done) while((getline l < p)>0) print l}' p="$preserved" "$fresh" > "$merged"
-    mv "$merged" "$fresh"
+      END{if(!done) while((getline l < p)>0) print l}' p="${preserved}" "${fresh}" > "${merged}"
+    mv "${merged}" "${fresh}"
   fi
-  mv "$fresh" "$MANIFEST"
+  mv "${fresh}" "${MANIFEST}"
   printf 'synced %s/%s/ (%s added, %s modified)\n' \
-    "$MANIFEST_HOST" "$MANIFEST_NAME" "$added" "$modified"
-  rm -rf "$work"
+    "${MANIFEST_HOST}" "${MANIFEST_NAME}" "${added}" "${modified}"
+  rm -rf "${work}"
 }
 
-case "$cmd" in
+if [ "${cmd}" != recover ]; then
+  pending_root=${XDG_STATE_HOME:-${HOME}/.local/state}/symbol/claims
+  for pending in "${pending_root}"/pending-*; do
+    [ -d "${pending}" ] || continue
+    printf 'pending Symbol operation found; run: symbol recover\n' >&2
+    break
+  done
+fi
+
+case "${cmd}" in
   put)
     unpack=0
     managed=0
@@ -1849,7 +2071,7 @@ case "$cmd" in
         -f)
           [ "$#" -ge 2 ] || usage_error "-f requires a remote path"
           forced=$2
-          [ "$forced" != "-" ] || usage_error "remote file path cannot be -"
+          [ "${forced}" != "-" ] || usage_error "remote file path cannot be -"
           shift 2
           ;;
         --) shift; break ;;
@@ -1862,92 +2084,92 @@ case "$cmd" in
     piped=0
     explicit_stdin=0
     [ "$#" -eq 0 ] || [ "$1" != "-" ] || explicit_stdin=1
-    if [ ! -t 0 ] || [ "$explicit_stdin" -eq 1 ]; then
+    if [ ! -t 0 ] || [ "${explicit_stdin}" -eq 1 ]; then
       stdin_to_temp
-      if [ "$explicit_stdin" -eq 1 ] || [ -s "$STDIN_FILE" ]; then
+      if [ "${explicit_stdin}" -eq 1 ] || [ -s "${STDIN_FILE}" ]; then
         piped=1
       else
-        rm -f "$STDIN_FILE"
+        rm -f "${STDIN_FILE}"
         STDIN_FILE=
       fi
     fi
-    if [ "$piped" -eq 1 ]; then
-      if [ "$explicit_stdin" -eq 1 ]; then shift; fi
-      if [ -n "$forced" ]; then
-        remote=$forced
+    if [ "${piped}" -eq 1 ]; then
+      if [ "${explicit_stdin}" -eq 1 ]; then shift; fi
+      if [ -n "${forced}" ]; then
+        remote=${forced}
         if [ "$#" -eq 1 ]; then
           site=$1
-          is_site_name "$site" || usage_error "invalid site name: $site"
-          base=$HOST
+          is_site_name "${site}" || usage_error "invalid site name: ${site}"
+          base=${HOST}
           generated=0
         elif [ "$#" -eq 0 ]; then
           local_manifest=$(manifest_find 2>/dev/null || true)
-          if [ -n "$local_manifest" ]; then
-            MANIFEST=$local_manifest
-            MANIFEST_DIR=$(dirname "$MANIFEST")
-            MANIFEST_HOST=$(manifest_value host "$MANIFEST")
-            MANIFEST_NAME=$(manifest_value name "$MANIFEST")
-            base=$MANIFEST_HOST; site=$MANIFEST_NAME; generated=0
+          if [ -n "${local_manifest}" ]; then
+            MANIFEST=${local_manifest}
+            MANIFEST_DIR=$(dirname "${MANIFEST}")
+            MANIFEST_HOST=$(manifest_value host "${MANIFEST}")
+            MANIFEST_NAME=$(manifest_value name "${MANIFEST}")
+            base=${MANIFEST_HOST}; site=${MANIFEST_NAME}; generated=0
           else
-            base=$HOST; site=; generated=1
+            base=${HOST}; site=; generated=1
           fi
         else
           usage_error "piped put -f accepts at most a site name"
         fi
       elif [ "$#" -eq 0 ]; then
-        base=$HOST; site=; remote=index.html; generated=1
+        base=${HOST}; site=; remote=index.html; generated=1
       elif [ "$#" -eq 1 ]; then
         case "$1" in
           *.*)
             remote=$1
             local_manifest=$(manifest_find 2>/dev/null || true)
-            if [ -n "$local_manifest" ]; then
-              MANIFEST=$local_manifest
-              MANIFEST_HOST=$(manifest_value host "$MANIFEST")
-              MANIFEST_NAME=$(manifest_value name "$MANIFEST")
-              base=$MANIFEST_HOST; site=$MANIFEST_NAME; generated=0
+            if [ -n "${local_manifest}" ]; then
+              MANIFEST=${local_manifest}
+              MANIFEST_HOST=$(manifest_value host "${MANIFEST}")
+              MANIFEST_NAME=$(manifest_value name "${MANIFEST}")
+              base=${MANIFEST_HOST}; site=${MANIFEST_NAME}; generated=0
             else
-              base=$HOST; site=; generated=1
+              base=${HOST}; site=; generated=1
             fi
             ;;
           *)
             is_site_name "$1" || usage_error "invalid site name: $1"
-            base=$HOST; site=$1; remote=index.html; generated=0
+            base=${HOST}; site=$1; remote=index.html; generated=0
             ;;
         esac
       elif [ "$#" -eq 2 ]; then
-        site=$1; remote=$2; base=$HOST; generated=0
-        is_site_name "$site" || usage_error "invalid site name: $site"
-        [ "$remote" != "-" ] || usage_error "remote file path cannot be -"
+        site=$1; remote=$2; base=${HOST}; generated=0
+        is_site_name "${site}" || usage_error "invalid site name: ${site}"
+        [ "${remote}" != "-" ] || usage_error "remote file path cannot be -"
       else
         usage_error "piped put accepts at most NAME DEST"
       fi
-      put_file_request "$base" "$site" "$STDIN_FILE" "$remote" 0 "$managed" "" "$generated"
-      rm -f "$STDIN_FILE"
+      put_file_request "${base}" "${site}" "${STDIN_FILE}" "${remote}" 0 "${managed}" "" "${generated}"
+      rm -f "${STDIN_FILE}"
     elif [ "$#" -eq 0 ]; then
-      [ -z "$forced" ] || usage_error "-f requires piped input"
+      [ -z "${forced}" ] || usage_error "-f requires piped input"
       manifest_target
-      put_file_request "$MANIFEST_HOST" "$MANIFEST_NAME" "$MANIFEST_DIR" "" 1 "$managed"
+      put_file_request "${MANIFEST_HOST}" "${MANIFEST_NAME}" "${MANIFEST_DIR}" "" 1 "${managed}"
     elif [ "$#" -eq 1 ]; then
-      [ -z "$forced" ] || usage_error "-f requires piped input"
-      put_file_request "$HOST" "" "$1" "" "$unpack" "$managed" "" 1
+      [ -z "${forced}" ] || usage_error "-f requires piped input"
+      put_file_request "${HOST}" "" "$1" "" "${unpack}" "${managed}" "" 1
     elif [ "$#" -eq 2 ]; then
-      [ -z "$forced" ] || usage_error "-f requires piped input"
+      [ -z "${forced}" ] || usage_error "-f requires piped input"
       site=$1; source=$2
-      is_site_name "$site" || usage_error "invalid site name: $site"
-      if [ -d "$source" ] || [ "$unpack" -eq 1 ]; then
+      is_site_name "${site}" || usage_error "invalid site name: ${site}"
+      if [ -d "${source}" ] || [ "${unpack}" -eq 1 ]; then
         remote=
       else
-        remote=$(basename "$source")
-        case "$source" in *.html|*.htm) remote=index.html ;; esac
+        remote=$(basename "${source}")
+        case "${source}" in *.html|*.htm) remote=index.html ;; esac
       fi
-      put_file_request "$HOST" "$site" "$source" "$remote" "$unpack" "$managed"
+      put_file_request "${HOST}" "${site}" "${source}" "${remote}" "${unpack}" "${managed}"
     else
-      [ -z "$forced" ] || usage_error "-f requires piped input"
+      [ -z "${forced}" ] || usage_error "-f requires piped input"
       site=$1; source=$2; remote=$3
-      is_site_name "$site" || usage_error "invalid site name: $site"
-      [ "$remote" != "-" ] || usage_error "remote file path cannot be -"
-      put_file_request "$HOST" "$site" "$source" "$remote" "$unpack" "$managed"
+      is_site_name "${site}" || usage_error "invalid site name: ${site}"
+      [ "${remote}" != "-" ] || usage_error "remote file path cannot be -"
+      put_file_request "${HOST}" "${site}" "${source}" "${remote}" "${unpack}" "${managed}"
     fi
     ;;
   ls)
@@ -1962,14 +2184,14 @@ case "$cmd" in
     done
     [ "$#" -le 1 ] || usage_error "ls accepts at most one site name"
     if [ "$#" -eq 0 ]; then
-      if [ "$links" -eq 1 ]; then
-        request GET /FILES | print_links "$HOST" 0
+      if [ "${links}" -eq 1 ]; then
+        request GET /FILES | print_links "${HOST}" 0
       else
         request GET /FILES
       fi
     else
       name=$1
-      if [ "$links" -eq 1 ]; then
+      if [ "${links}" -eq 1 ]; then
         request GET "/${name}/FILES" | print_links "${HOST}/${name}" 1
       else
         request GET "/${name}/FILES"
@@ -1980,17 +2202,17 @@ case "$cmd" in
     [ "$#" -ge 1 ] && [ "$#" -le 2 ] || usage_error "usage: symbol get NAME [ARCHIVE]"
     name=$1
     dest=${2:-${name}.tar.gz}
-    is_site_name "$name" || usage_error "invalid site name: $name"
-    archive_transfer GET "$HOST" "$name" "$dest"
-    [ "$dest" = "-" ] || printf 'downloaded %s\n' "$dest"
+    is_site_name "${name}" || usage_error "invalid site name: ${name}"
+    archive_transfer GET "${HOST}" "${name}" "${dest}"
+    [ "${dest}" = "-" ] || printf 'downloaded %s\n' "${dest}"
     ;;
   pop)
     [ "$#" -ge 1 ] && [ "$#" -le 2 ] || usage_error "usage: symbol pop NAME [ARCHIVE]"
     name=$1
     dest=${2:-${name}.tar.gz}
-    is_site_name "$name" || usage_error "invalid site name: $name"
-    archive_transfer DELETE "$HOST" "$name" "$dest"
-    [ "$dest" = "-" ] || printf 'popped %s\n' "$dest"
+    is_site_name "${name}" || usage_error "invalid site name: ${name}"
+    archive_transfer DELETE "${HOST}" "${name}" "${dest}"
+    [ "${dest}" = "-" ] || printf 'popped %s\n' "${dest}"
     ;;
   clone)
     [ "$#" -ge 1 ] && [ "$#" -le 2 ] || usage_error "usage: symbol clone NAME [DIR]"
@@ -2000,30 +2222,30 @@ case "$cmd" in
     managed=0
     case "${1:-}" in --managed) managed=1; shift ;; esac
     [ "$#" -ge 1 ] && [ "$#" -le 2 ] || usage_error "usage: symbol copy [--managed] SRC [DST]"
-    copy_or_move_request COPY "$1" "${2:-}" "$managed"
+    copy_or_move_request COPY "$1" "${2:-}" "${managed}"
     ;;
   remix)
     managed=0
     case "${1:-}" in --managed) managed=1; shift ;; esac
     [ "$#" -ge 1 ] && [ "$#" -le 2 ] || usage_error "usage: symbol remix [--managed] SRC [DST]"
     remix_destination=${2:-}
-    if [ -n "$remix_destination" ] && [ -e "$remix_destination" ]; then
-      [ -d "$remix_destination" ] && [ -z "$(ls -A "$remix_destination")" ] ||
-        die "remix destination exists and is not empty: $remix_destination"
+    if [ -n "${remix_destination}" ] && [ -e "${remix_destination}" ]; then
+      [ -d "${remix_destination}" ] && [ -z "$(ls -A "${remix_destination}")" ] ||
+        die "remix destination exists and is not empty: ${remix_destination}"
     fi
-    copy_or_move_request COPY "$1" "$remix_destination" "$managed"
-    copied=$RESULT_NAME
-    if ! clone_site "$copied" "$copied"; then
+    copy_or_move_request COPY "$1" "${remix_destination}" "${managed}"
+    copied=${RESULT_NAME}
+    if ! clone_site "${copied}" "${copied}"; then
       printf 'server copy remains at %s/%s/\ncleanup with: symbol rm %s\n' \
-        "$HOST" "$copied" "$copied" >&2
+        "${HOST}" "${copied}" "${copied}" >&2
       exit 1
     fi
     if [ -n "${RESULT_MANAGEMENT_TOKEN:-}" ]; then
-      write_secret_sidecar token "$RESULT_MANAGEMENT_TOKEN" "$copied/symbol.toml"
+      write_secret_sidecar token "${RESULT_MANAGEMENT_TOKEN}" "${copied}/symbol.toml"
     fi
     if [ -n "${RESULT_CLAIM_TOKEN:-}" ]; then
-      write_secret_sidecar claim "$RESULT_CLAIM_TOKEN" "$copied/symbol.toml"
-      remove_claim_recovery "$copied"
+      write_secret_sidecar claim "${RESULT_CLAIM_TOKEN}" "${copied}/symbol.toml"
+      remove_claim_recovery "${copied}"
     fi
     ;;
   move)
@@ -2034,7 +2256,7 @@ case "$cmd" in
     check=0
     case "${1:-}" in --check) check=1; shift ;; esac
     [ "$#" -eq 0 ] || usage_error "usage: symbol sync [--check]"
-    sync_project "$check"
+    sync_project "${check}"
     ;;
   undo)
     stack=0
@@ -2042,13 +2264,13 @@ case "$cmd" in
     [ "$#" -le 2 ] || usage_error "usage: symbol undo [--stack] [NAME [TOKEN]]"
     if [ "$#" -eq 0 ]; then
       manifest_target
-      base=$MANIFEST_HOST; name=$MANIFEST_NAME; token=
+      base=${MANIFEST_HOST}; name=${MANIFEST_NAME}; token=
     else
-      base=$HOST; name=$1; token=${2:-}
+      base=${HOST}; name=$1; token=${2:-}
     fi
-    is_site_name "$name" || usage_error "invalid site name: $name"
-    if [ "$stack" -eq 1 ]; then
-      [ -z "$token" ] || usage_error "--stack does not accept a token"
+    is_site_name "${name}" || usage_error "invalid site name: ${name}"
+    if [ "${stack}" -eq 1 ]; then
+      [ -z "${token}" ] || usage_error "--stack does not accept a token"
       request GET "/${name}/UNDO" | awk '
         BEGIN { print "TOKEN      WOULD UNDO                         EXPIRES" }
         function human(seconds, days, hours, minutes, text) {
@@ -2082,13 +2304,13 @@ case "$cmd" in
       '
     else
       auth=$(mktemp) || exit 1
-      auth_args_file "$auth"
+      auth_args_file "${auth}"
       set --
-      while IFS= read -r arg; do set -- "$@" "$arg"; done < "$auth"
-      rm -f "$auth"
-      [ -z "$token" ] || set -- "$@" -H "Undo-Token: $token"
+      while IFS= read -r arg; do set -- "$@" "${arg}"; done < "${auth}"
+      rm -f "${auth}"
+      [ -z "${token}" ] || set -- "$@" -H "Undo-Token: ${token}"
       http_request UNDO "${base}/${name}" "$@" || exit 1
-      cat "$HTTP_BODY"
+      cat "${HTTP_BODY}"
     fi
     ;;
   expire)
@@ -2098,18 +2320,18 @@ case "$cmd" in
     fi
     case "$1" in --show|--info|--graph) expire_help; exit 0 ;; esac
     name=$1; shift
-    is_site_name "$name" || usage_error "invalid site name: $name"
+    is_site_name "${name}" || usage_error "invalid site name: ${name}"
     path=
     case "${1:-}" in ''|--*) ;; *) path=$1; shift ;; esac
     mode=default
     min_age=; max_age=; max_size=; power=
     while [ "$#" -gt 0 ]; do
       case "$1" in
-        --decay) [ "$mode" = default ] || usage_error "expiration modes are mutually exclusive"; mode=decay; shift ;;
-        --in) [ "$mode" = default ] || usage_error "expiration modes are mutually exclusive"; [ "$#" -ge 2 ] || usage_error "--in requires DURATION"; duration_valid "$2" || usage_error "invalid duration: $2"; mode=relative; in_value=$2; shift 2 ;;
-        --at) [ "$mode" = default ] || usage_error "expiration modes are mutually exclusive"; [ "$#" -ge 2 ] || usage_error "--at requires TIMESTAMP"; case "$2" in ????-??-??T??:??:??Z|????-??-??T??:??:??[+-]??:??) ;; *) usage_error "absolute time must be RFC 3339 with an offset" ;; esac; mode=absolute; at_value=$2; shift 2 ;;
-        --never) [ "$mode" = default ] || usage_error "expiration modes are mutually exclusive"; mode=never; shift ;;
-        --show|--info|--graph) [ "$mode" = default ] || usage_error "expiration modes are mutually exclusive"; mode=show; shift ;;
+        --decay) [ "${mode}" = default ] || usage_error "expiration modes are mutually exclusive"; mode=decay; shift ;;
+        --in) [ "${mode}" = default ] || usage_error "expiration modes are mutually exclusive"; [ "$#" -ge 2 ] || usage_error "--in requires DURATION"; duration_valid "$2" || usage_error "invalid duration: $2"; mode=relative; in_value=$2; shift 2 ;;
+        --at) [ "${mode}" = default ] || usage_error "expiration modes are mutually exclusive"; [ "$#" -ge 2 ] || usage_error "--at requires TIMESTAMP"; case "$2" in ????-??-??T??:??:??Z|????-??-??T??:??:??[+-]??:??) ;; *) usage_error "absolute time must be RFC 3339 with an offset" ;; esac; mode=absolute; at_value=$2; shift 2 ;;
+        --never) [ "${mode}" = default ] || usage_error "expiration modes are mutually exclusive"; mode=never; shift ;;
+        --show|--info|--graph) [ "${mode}" = default ] || usage_error "expiration modes are mutually exclusive"; mode=show; shift ;;
         --min-age) [ "$#" -ge 2 ] || usage_error "--min-age requires DURATION"; duration_valid "$2" || usage_error "invalid duration: $2"; min_age=$2; shift 2 ;;
         --max-age) [ "$#" -ge 2 ] || usage_error "--max-age requires DURATION"; duration_valid "$2" || usage_error "invalid duration: $2"; max_age=$2; shift 2 ;;
         --max-size) [ "$#" -ge 2 ] || usage_error "--max-size requires SIZE"; size_valid "$2" || usage_error "invalid size: $2"; max_size=$2; shift 2 ;;
@@ -2117,36 +2339,46 @@ case "$cmd" in
         *) usage_error "unknown expire option: $1" ;;
       esac
     done
-    [ "$mode" = decay ] || {
-      [ -z "$min_age$max_age$max_size$power" ] ||
+    [ "${mode}" = decay ] || {
+      [ -z "${min_age}${max_age}${max_size}${power}" ] ||
         usage_error "decay constants require --decay"
     }
     target="/${name}"
-    [ -z "$path" ] || target="$target/$(urlencode_path "$path")"
-    if [ "$mode" = show ]; then
+    [ -z "${path}" ] || target="${target}/$(urlencode_path "${path}")"
+    if [ "${mode}" = show ]; then
       http_request GET "${HOST}${target}/EXPIRES" -H 'Accept: application/json' || exit 1
       print_expire_report
     else
       auth=$(mktemp) || exit 1
-      auth_args_file "$auth"
+      auth_args_file "${auth}"
       set --
-      while IFS= read -r arg; do set -- "$@" "$arg"; done < "$auth"
-      rm -f "$auth"
-      case "$mode" in
+      while IFS= read -r arg; do set -- "$@" "${arg}"; done < "${auth}"
+      rm -f "${auth}"
+      case "${mode}" in
         decay) set -- "$@" -H 'Expiry-Mode: decay' ;;
-        relative) set -- "$@" -H 'Expiry-Mode: relative' -H "Expiry-In: $in_value" ;;
-        absolute) set -- "$@" -H 'Expiry-Mode: absolute' -H "Expiry-At: $at_value" ;;
+        relative) set -- "$@" -H 'Expiry-Mode: relative' -H "Expiry-In: ${in_value}" ;;
+        absolute) set -- "$@" -H 'Expiry-Mode: absolute' -H "Expiry-At: ${at_value}" ;;
         never) set -- "$@" -H 'Expiry-Mode: never' ;;
       esac
-      [ -z "$min_age" ] || set -- "$@" -H "Expiry-Min-Age: $min_age"
-      [ -z "$max_age" ] || set -- "$@" -H "Expiry-Max-Age: $max_age"
-      [ -z "$max_size" ] || set -- "$@" -H "Expiry-Max-Size: $max_size"
-      [ -z "$power" ] || set -- "$@" -H "Expiry-Power: $power"
+      [ -z "${min_age}" ] || set -- "$@" -H "Expiry-Min-Age: ${min_age}"
+      [ -z "${max_age}" ] || set -- "$@" -H "Expiry-Max-Age: ${max_age}"
+      [ -z "${max_size}" ] || set -- "$@" -H "Expiry-Max-Size: ${max_size}"
+      [ -z "${power}" ] || set -- "$@" -H "Expiry-Power: ${power}"
       http_request EXPIRE "${HOST}${target}" "$@" || exit 1
-      print_mutation_result "$name" 1
-      [ "$mode" != never ] ||
-        printf 'own expiration disabled for %s%s\n' "$HOST" "$target"
-      [ -s "$HTTP_BODY" ] && print_expire_report
+      print_mutation_result "${name}" 1
+      if [ "${mode}" = never ]; then
+        effective=$(json_string effective_expires_at < "${HTTP_BODY}" 2>/dev/null || true)
+        remaining=$(json_string remaining_seconds < "${HTTP_BODY}" 2>/dev/null || true)
+        limiting=$(json_limited_by < "${HTTP_BODY}" 2>/dev/null || true)
+        if [ -n "${effective}" ] && [ "${effective}" != null ]; then
+          printf 'effective expiry remains %s (in %s, limited by %s)\n' \
+            "${effective}" "$(human_duration "${remaining:-0}")" "${limiting:-ancestor policy}"
+        else
+          printf 'expiration disabled for %s%s\n' "${HOST}" "${target}"
+        fi
+      elif [ -s "${HTTP_BODY}" ]; then
+        print_expire_report
+      fi
     fi
     ;;
   manage)
@@ -2173,42 +2405,55 @@ EOF
     fi
     [ "$#" -eq 2 ] || usage_error "usage: symbol manage NAME --claim|--status|--rotate|--release"
     name=$1; action=$2
-    is_site_name "$name" || usage_error "invalid site name: $name"
-    case "$action" in
+    is_site_name "${name}" || usage_error "invalid site name: ${name}"
+    case "${action}" in
       --claim) action=claim ;;
       --status) action=status ;;
       --rotate) action=rotate ;;
       --release) action=release ;;
-      *) usage_error "unknown management action: $action" ;;
+      *) usage_error "unknown management action: ${action}" ;;
     esac
     auth=$(mktemp) || exit 1
-    auth_args_file "$auth"
-    set -- -H "Management-Action: $action"
-    while IFS= read -r arg; do set -- "$@" "$arg"; done < "$auth"
-    rm -f "$auth"
-    if [ "$action" = claim ]; then
-      local_manifest=$(matching_manifest "$HOST" "$name" 2>/dev/null || true)
-      if [ -n "$local_manifest" ]; then
-        claim=$(claim_from_manifest "$local_manifest" 2>/dev/null || true)
-        [ -z "$claim" ] || set -- "$@" -H "Creator-Claim: $claim"
+    auth_args_file "${auth}"
+    set -- -H "Management-Action: ${action}"
+    while IFS= read -r arg; do set -- "$@" "${arg}"; done < "${auth}"
+    rm -f "${auth}"
+    if [ "${action}" = claim ]; then
+      local_manifest=$(matching_manifest "${HOST}" "${name}" 2>/dev/null || true)
+      claim=
+      if [ -n "${local_manifest}" ]; then
+        claim=$(claim_from_manifest "${local_manifest}" 2>/dev/null || true)
       fi
+      [ -n "${claim}" ] || claim=$(claim_from_recovery "${name}" 2>/dev/null || true)
+      [ -z "${claim}" ] || set -- "$@" -H "Creator-Claim: ${claim}"
       set -- "$@" -H "Idempotency-Key: $(random_key)"
-    elif [ "$action" = rotate ]; then
+    elif [ "${action}" = rotate ]; then
       set -- "$@" -H "Idempotency-Key: $(random_key)"
     fi
     http_request MANAGE "${HOST}/${name}" "$@" || exit 1
-    cat "$HTTP_BODY"
-    save_response_secrets "$HOST" "$name"
-    if [ "$action" = release ]; then
-      local_manifest=$(matching_manifest "$HOST" "$name" 2>/dev/null || true)
-      if [ -n "$local_manifest" ]; then
-        dir=$(dirname "$local_manifest")
-        rm -f "$dir/.symbol-token"
-        tmp=$(mktemp "$dir/.symbol.toml.XXXXXX") || exit 1
-        awk '!/^[[:space:]]*token[[:space:]]*=/' "$local_manifest" > "$tmp"
-        mv "$tmp" "$local_manifest"
+    cat "${HTTP_BODY}"
+    save_response_secrets "${HOST}" "${name}"
+    if [ "${action}" = claim ] || [ "${action}" = rotate ]; then
+      management=$(header_value Management-Token)
+      local_manifest=$(matching_manifest "${HOST}" "${name}" 2>/dev/null || true)
+      if [ -n "${management}" ] && [ -z "${local_manifest}" ]; then
+        save_management_recovery "${name}" "${management}"
       fi
     fi
+    if [ "${action}" = release ]; then
+      local_manifest=$(matching_manifest "${HOST}" "${name}" 2>/dev/null || true)
+      if [ -n "${local_manifest}" ]; then
+        dir=$(dirname "${local_manifest}")
+        rm -f "${dir}/.symbol-token"
+        tmp=$(mktemp "${dir}/.symbol.toml.XXXXXX") || exit 1
+        awk '!/^[[:space:]]*token[[:space:]]*=/' "${local_manifest}" > "${tmp}"
+        mv "${tmp}" "${local_manifest}"
+      fi
+    fi
+    ;;
+  recover)
+    [ "$#" -eq 0 ] || usage_error "recover accepts no arguments"
+    recover_pending_operations
     ;;
   rm)
     [ "$#" -ge 1 ] && [ "$#" -le 2 ] || usage_error "usage: symbol rm NAME [PATH]"
@@ -2216,49 +2461,49 @@ EOF
     remote_path=${2:-}
     remove_site=0
     [ "$#" -ne 1 ] || remove_site=1
-    is_site_name "$name" || usage_error "invalid site name: $name"
+    is_site_name "${name}" || usage_error "invalid site name: ${name}"
     auth=$(mktemp) || exit 1
-    auth_args_file "$auth"
+    auth_args_file "${auth}"
     set --
-    while IFS= read -r arg; do set -- "$@" "$arg"; done < "$auth"
-    rm -f "$auth"
-    if [ "$remove_site" -eq 1 ]; then
+    while IFS= read -r arg; do set -- "$@" "${arg}"; done < "${auth}"
+    rm -f "${auth}"
+    if [ "${remove_site}" -eq 1 ]; then
       http_request DELETE "${HOST}/${name}" "$@" || exit 1
-      printf 'deleted %s\n' "$name"
-      print_mutation_result "$name" 1
+      printf 'deleted %s\n' "${name}"
+      print_mutation_result "${name}" 1
     else
-      encoded=$(urlencode_path "$remote_path")
+      encoded=$(urlencode_path "${remote_path}")
       http_request DELETE "${HOST}/${name}/${encoded}" "$@" || exit 1
-      print_mutation_result "$name"
+      print_mutation_result "${name}"
     fi
     ;;
   url)
     [ "$#" -eq 1 ] || usage_error "usage: symbol url NAME"
     is_site_name "$1" || usage_error "invalid site name: $1"
-    printf '%s/%s/\n' "$HOST" "$1"
+    printf '%s/%s/\n' "${HOST}" "$1"
     ;;
   update)
     [ "$#" -eq 0 ] || usage_error "update accepts no arguments"
     self=$(client_path)
-    dest=$(dirname "$self")
+    dest=$(dirname "${self}")
     hashfile="${dest}/.symbol.blake3"
     have=
-    if [ -f "$hashfile" ]; then
-      have=$(tr -d ' \t\r\n' < "$hashfile")
+    if [ -f "${hashfile}" ]; then
+      have=$(tr -d ' \t\r\n' < "${hashfile}")
     fi
     tmp=$(mktemp)
-    curl -fsSL "${HOST}/symbol.sh" -o "$tmp"
-    chmod +x "$tmp"
-    stats=$(diff_stats "$self" "$tmp")
-    mv "$tmp" "$self"
+    curl -fsSL "${HOST}/symbol.sh" -o "${tmp}"
+    chmod +x "${tmp}"
+    stats=$(diff_stats "${self}" "${tmp}")
+    mv "${tmp}" "${self}"
     remote=$(curl -fsSL "${HOST}/symbol.sh/HASH" | tr -d ' \t\r\n')
-    printf '%s\n' "$remote" > "$hashfile"
+    printf '%s\n' "${remote}" > "${hashfile}"
     rm -f "${dest}/.symbol.hash"
-    if [ -n "$remote" ] && [ "$remote" = "$have" ] && [ -z "$stats" ]; then
+    if [ -n "${remote}" ] && [ "${remote}" = "${have}" ] && [ -z "${stats}" ]; then
       echo "already up to date"
     else
       echo "updated ${self}"
-      if [ -n "$stats" ]; then
+      if [ -n "${stats}" ]; then
         echo "  ${stats}"
       fi
     fi
@@ -2266,7 +2511,7 @@ EOF
   stats)
     [ "$#" -eq 0 ] || usage_error "stats accepts no arguments"
     stats_json=$(request GET /STATS)
-    printf '%s\n' "$stats_json" | print_stats
+    printf '%s\n' "${stats_json}" | print_stats
     ;;
   help)
     usage
