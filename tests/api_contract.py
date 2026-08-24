@@ -12,34 +12,46 @@ contract = json.loads(
     subprocess.check_output([root / "target/debug/symbol", "contract"], text=True)
 )
 
+
+def documented_section(name):
+    marker = f"<!-- contract:{name} -->"
+    marker_at = api.find(marker)
+    if marker_at < 0:
+        return None
+    heading_at = api.find("### ", marker_at)
+    if heading_at < 0:
+        return None
+    next_contract = api.find("\n<!-- contract:", heading_at + 4)
+    return api[heading_at : next_contract if next_contract >= 0 else len(api)]
+
+
+common = api[: api.find("## Route inventory")]
+errors = api[api.find("## Status and error mapping") :]
 failures = []
+names = set()
 for endpoint in contract:
-    methods = endpoint["methods"]
-    path = endpoint["path"].split(" | ", 1)[0]
-    if path not in api:
-        failures.append(f"undocumented path: {path}")
-    for method in methods:
-        if method not in {"HEAD"} and f"`{method} " not in api:
-            failures.append(f"undocumented method: {method}")
+    name = endpoint["name"]
+    if name in names:
+        failures.append(f"duplicate contract name: {name}")
+    names.add(name)
+    section = documented_section(name)
+    if section is None:
+        failures.append(f"missing API section marker for contract: {name}")
+        continue
+    method = endpoint["method"]
+    if f"`{method} " not in section:
+        failures.append(f"{name}: method {method} absent from matching section")
     for header in endpoint["request_headers"] + endpoint["response_headers"]:
         if (
-            f"`{header}`" not in api
-            and f"`{header}:" not in api
-            and header not in {
-            "Content-Type",
-            "Content-Length",
-            "Cache-Control",
-            "ETag",
-            "Expires",
-            "Location",
-            }
+            header not in section
+            and f"`{header}`" not in common
+            and f"{header}:" not in common
         ):
-            failures.append(f"undocumented header: {header}")
-    for status in endpoint["success_statuses"]:
-        if f"`{status}" not in api:
-            failures.append(
-                f"undocumented success status {status} for {endpoint['name']}"
-            )
+            failures.append(f"{name}: undocumented header {header}")
+    local_status_text = section + errors
+    for status in endpoint["success_statuses"] + endpoint["error_statuses"]:
+        if not re.search(rf"(?:`|HTTP/1\.1 ){status}\b", local_status_text):
+            failures.append(f"{name}: undocumented status {status}")
 
 json_blocks = re.findall(r"```json\s*\n(.*?)\n```", api, re.DOTALL)
 for index, block in enumerate(json_blocks, 1):
@@ -47,6 +59,16 @@ for index, block in enumerate(json_blocks, 1):
         json.loads(block)
     except json.JSONDecodeError as error:
         failures.append(f"invalid JSON block {index}: {error}")
+
+http_blocks = re.findall(r"```http\s*\n(.*?)\n```", api, re.DOTALL)
+for index, block in enumerate(http_blocks, 1):
+    first = block.splitlines()[0]
+    if not (
+        re.match(r"^[A-Z]+ \S+ HTTP/1\.1$", first)
+        or re.match(r"^HTTP/1\.1 [1-5][0-9][0-9]\b", first)
+        or re.match(r"^[A-Za-z0-9-]+:", first)
+    ):
+        failures.append(f"invalid raw HTTP example {index}: {first}")
 
 shell_blocks = re.findall(r"```sh\s*\n(.*?)\n```", api, re.DOTALL)
 curl_examples = []
@@ -69,6 +91,7 @@ if failures:
     sys.exit(1)
 
 print(
-    f"API contract: {len(contract)} generated route groups, "
-    f"{len(json_blocks)} JSON examples, {len(curl_examples)} curl examples"
+    f"API contract: {len(contract)} method-specific endpoints, "
+    f"{len(json_blocks)} JSON, {len(http_blocks)} HTTP, "
+    f"{len(curl_examples)} curl examples"
 )

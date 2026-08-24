@@ -7,6 +7,10 @@ cd "$(dirname "$0")"
 cargo build --release --locked
 sudo -n nix build path:. --cores "${NIX_CORES:-8}" --max-jobs "${NIX_MAX_JOBS:-4}"
 
+if [ -n "${SYMBOL_SOAK_SECONDS:-}" ]; then
+  sh tests/concurrency_soak.sh
+fi
+
 if [ "${SYMBOL_DEPLOY_CHECK:-0}" = 1 ]; then
   ./ops/restart.sh
   curl -fsS http://127.0.0.1:4340/STATS |

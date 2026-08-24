@@ -38,6 +38,7 @@ symbol rm hello              # remove without backup
 symbol undo --stack hello    # changes that can be undone
 symbol expire                # expiry help and retention graph
 symbol manage hello --status # show write protection
+symbol recover               # resume interrupted creations
 symbol update                # reinstall this client
 ```
 
@@ -52,6 +53,13 @@ recent retained mutation. managed sites use `symbol manage NAME --claim`,
 `symbol.toml`.
 the server redacts recognizable Symbol tokens from inspectable uploads, but
 encrypted or otherwise opaque content cannot be guaranteed safe.
+
+`symbol.toml` records the site name, host, revision, tree hash, and file
+baseline. sync sends that tree hash as `If-Match`; upstream drift returns
+`412` without writing. expiry supports `--in`, `--at`, `--decay`, and
+`--never`. generated PUT/COPY requests use idempotency keys for safe retry.
+copy and move return `409` when their destination exists; use the printed
+`symbol undo` command to reverse a retained mutation.
 
 ## curl
 

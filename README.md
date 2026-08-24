@@ -51,8 +51,13 @@ CLI flags have equivalent environment variables:
 - `SYMBOL_EXPIRY_POWER` (default `3`)
 - `SYMBOL_TRUSTED_PROXY_PRINCIPAL_HEADER` and comma-separated
   `SYMBOL_TRUSTED_PROXY`; these must be configured together
+- `SYMBOL_AUDIT_TRUSTED_PROXY` separately allows those proxy peers to supply
+  the left-most `X-Forwarded-For` address as non-authoritative audit context
 - `SYMBOL_MTLS_PRINCIPAL_HEADER` or `SYMBOL_TAILSCALE_USER_HEADER` may replace
   the generic principal header; configure only one identity header
+- `SYMBOL_TAILSCALE_WHOIS_COMMAND` selects direct Tailscale user resolution
+  through a configured `tailscale` executable and is mutually exclusive with
+  identity headers
 
 Archive upload, extracted-size, and file-count limits are independently
 configurable with the defaults above.
@@ -145,3 +150,12 @@ SYMBOL_DEPLOY_CHECK=1 ./release-check
 That installs/restarts the service and verifies STATS JSON and the public
 homepage. A plain `release-check` intentionally does not mutate a running
 deployment.
+
+Long-running concurrency is a separate, opt-in release gate:
+
+```sh
+SYMBOL_SOAK_SECONDS=300 SYMBOL_SOAK_WORKERS=16 ./release-check
+```
+
+This runs concurrent PUT/GET/FILES traffic against an isolated server before
+any optional production deployment check.

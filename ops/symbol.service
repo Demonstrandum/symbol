@@ -22,12 +22,14 @@ Environment=SYMBOL_EXPIRY_MIN_AGE=30d
 Environment=SYMBOL_EXPIRY_MAX_AGE=365d
 Environment=SYMBOL_EXPIRY_MAX_SIZE=512MiB
 Environment=SYMBOL_EXPIRY_POWER=3
+Environment=SYMBOL_AUDIT_TRUSTED_PROXY=127.0.0.1
 # Choose at most one authenticated creator identity header and trust only the
 # reverse-proxy peer IPs that overwrite it:
 # Environment=SYMBOL_TRUSTED_PROXY=127.0.0.1
 # Environment=SYMBOL_TRUSTED_PROXY_PRINCIPAL_HEADER=X-Authenticated-User
 # Environment=SYMBOL_MTLS_PRINCIPAL_HEADER=X-Client-Cert-SHA256
 # Environment=SYMBOL_TAILSCALE_USER_HEADER=Tailscale-User-Login
+# Environment=SYMBOL_TAILSCALE_WHOIS_COMMAND=/usr/bin/tailscale
 
 [Install]
 WantedBy=multi-user.target

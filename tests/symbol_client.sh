@@ -290,6 +290,14 @@ else
   not_ok 'repeatedly dropped PUT persists typed pending state'
 fi
 
+mkdir -p "${XDG_STATE_HOME}/symbol/claims/pending-stale"
+printf stale > "${XDG_STATE_HOME}/symbol/claims/pending-stale/claim"
+touch -t 202001010000 "${XDG_STATE_HOME}/symbol/claims/pending-stale"
+"${CLIENT}" recover >/dev/null
+[ ! -e "${XDG_STATE_HOME}/symbol/claims/pending-stale" ] &&
+  ok 'recover prunes abandoned pending state after seven days' ||
+  not_ok 'recover prunes abandoned pending state after seven days'
+
 rm -f "${MOCK_CURL_STATE}/committed-COPY" "${MOCK_CURL_STATE}/missing-pending-COPY"
 if MOCK_DROP_ALWAYS_METHOD=COPY "${CLIENT}" copy hello >/dev/null 2>&1; then
   not_ok 'repeatedly dropped COPY should leave pending recovery'

@@ -1,4 +1,7 @@
 http://symbol, http://symbol.tailbce956.ts.net {
+	log {
+		output discard
+	}
 	reverse_proxy 127.0.0.1:4340
 	encode gzip
 }

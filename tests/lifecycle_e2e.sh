@@ -178,6 +178,14 @@ restarted_put_name=$(printf '%s\n' "${recovery}" |
   fail "new client process recovers committed PUT after repeated loss"
 ok "new client process recovers committed PUT after repeated loss"
 
+printf '<h1>named drop</h1>\n' >"${ROOT}/work/named-drop.html"
+rm -f "${DROP_STATE}/PUT" "${DROP_STATE}/missing-pending-PUT"
+DROP_METHOD=PUT "${CLIENT}" put e2e-named-drop "${ROOT}/work/named-drop.html" >/dev/null
+[ -s "${XDG_STATE_HOME}/symbol/claims/e2e-named-drop" ] &&
+  [ "$(curl -fsS "${BASE}/e2e-named-drop/index.html")" = '<h1>named drop</h1>' ] ||
+  fail "named first-create response loss preserves creator claim"
+ok "named first-create response loss preserves creator claim"
+
 printf '<h1>main</h1>\n' >"${ROOT}/work/index.html"
 printf 'body{}\n' >"${ROOT}/work/style.css"
 "${CLIENT}" put e2e-main "${ROOT}/work/index.html" >/dev/null
@@ -453,11 +461,13 @@ ok "pop dash keeps binary stdout clean"
 "${CLIENT}" rm "${restarted_put_name}" >/dev/null
 "${CLIENT}" rm "${restarted_copy_name}" >/dev/null
 "${CLIENT}" rm e2e-drop-explicit >/dev/null
+"${CLIENT}" rm e2e-named-drop >/dev/null
 
 left=$(curl -fsS -H 'Accept: application/json' "${BASE}/FILES")
 for name in e2e-main e2e-moved e2e-remix e2e-secure "${explicit_name}" "${implicit_name}" \
   "${dropped_put_name}" "${dropped_copy_name}" "${restarted_put_name}" \
-  "${restarted_copy_name}" e2e-drop-explicit e2e-managed-loss e2e-claim; do
+  "${restarted_copy_name}" e2e-drop-explicit e2e-named-drop e2e-managed-loss \
+  e2e-claim; do
   contains "${left}" "\"name\":\"${name}\"" && fail "cleanup removes all test sites"
 done
 ok "cleanup removes all test sites"

@@ -67,10 +67,14 @@ A caller may instead send `Creator-Claim: sym_claim_...`. To create a managed
 site in the same request, send `Management-Action: claim`; a new management
 token is returned in `Management-Token`. Creator identity may come from one
 configured trusted-proxy account header, mTLS certificate-fingerprint header,
-or Tailscale user header. Identity headers are accepted only from peer IPs in
-`SYMBOL_TRUSTED_PROXY`; caller-supplied internal principal headers are always
-stripped. Management audit rows retain that socket peer IP as non-authoritative
-context.
+Tailscale user header, or direct `tailscale whois --json` resolver configured
+with `SYMBOL_TAILSCALE_WHOIS_COMMAND`. Identity headers are accepted only from
+peer IPs in `SYMBOL_TRUSTED_PROXY`; caller-supplied internal principal headers
+are always stripped. Management audit rows retain that socket peer IP as
+non-authoritative context. Peers listed separately in
+`SYMBOL_AUDIT_TRUSTED_PROXY` may supply the left-most valid
+`X-Forwarded-For` address for audit context; untrusted peers cannot override
+their socket address.
 
 ## Common mutation request headers
 
@@ -95,12 +99,25 @@ context.
   Persist one-time credentials from the original response; use the retained
   creator identity/claim recovery flow if that response was lost.
 
+The shell client writes a mode-0600 typed pending-operation record before
+retry-sensitive PUT/COPY requests. `symbol recover` replays surviving
+idempotency state in a new process, maps generated destinations, and promotes
+the pending claim to the final site record. Pending records older than seven
+days are removed.
+
 `Management-Action: claim`
 : On creation, creates the site as managed and returns a one-time management
   token. Other management action values on creation return `400`.
 
 `Creator-Claim`
 : Canonical creator claim used for later claim/rotation recovery.
+
+`Content-Disposition`
+: Supplies the logical filename for a root PUT.
+
+`Unpack`
+: `1`, `true`, `yes`, or an empty value extracts a supported archive and
+  merges its retained files.
 
 ## Common mutation response headers
 
@@ -122,8 +139,18 @@ Creator-Claim: sym_claim_...
 omitted when zero. Secret-returning responses use `Cache-Control: no-store`.
 `Undo-Expires` is the RFC 3339 deadline for the matching undo token.
 
+## Common read headers
+
+`Accept` selects HTML, plain text, or JSON where documented.
+`If-None-Match` enables ETag revalidation. `Range` and `If-Range` select one
+byte range for stored files and immutable blobs.
+
+Successful file responses may include `Content-Length`, `Content-Range`,
+`Accept-Ranges`, `ETag`, `Cache-Control`, and `Expires`.
+
 ## Route inventory
 
+<!-- contract:docs -->
 ### `GET /`
 
 Renders this service's public guide as HTML or plain text. `Accept` explicitly
@@ -139,6 +166,7 @@ Headers: strong body `ETag`, `Cache-Control: no-cache`,
 Canonical client: `symbol help` is local client help; there is no client command
 that fetches this page.
 
+<!-- contract:unnamed put -->
 ### `PUT /`
 
 Publishes to a generated name, normally four lowercase alphanumeric
@@ -174,6 +202,7 @@ ok k7qm https://symbol.example/k7qm/ (1 files, changed: true)
 
 Canonical client: `symbol put FILE`, or piped `symbol put`.
 
+<!-- contract:docs hash -->
 ### `GET /HASH`
 
 Returns the lowercase Blake3 hash of the rendered plain documentation body.
@@ -182,6 +211,7 @@ This endpoint itself does not implement conditional caching and returns
 
 Success: `200`.
 
+<!-- contract:installer -->
 ### `GET /install.sh`
 
 Returns the installer with the configured public URL substituted.
@@ -191,6 +221,7 @@ Success: `200`; conditional `If-None-Match`: `304`.
 Headers: `Content-Type: text/x-shellscript; charset=utf-8`, body `ETag`,
 `Cache-Control: no-cache`.
 
+<!-- contract:installer hash -->
 ### `GET /install.sh/HASH`
 
 Returns the lowercase Blake3 hash of the compile-time installer template, not
@@ -198,6 +229,7 @@ the URL-substituted response.
 
 Success: `200`.
 
+<!-- contract:client -->
 ### `GET /symbol.sh`
 
 Returns the shell client with the configured public URL substituted.
@@ -208,6 +240,7 @@ Headers match `/install.sh`.
 
 Canonical client: `symbol update` downloads this route.
 
+<!-- contract:client hash -->
 ### `GET /symbol.sh/HASH`
 
 Returns the lowercase Blake3 hash of the compile-time client template, used by
@@ -215,6 +248,7 @@ the installer and update check.
 
 Success: `200`.
 
+<!-- contract:stats -->
 ### `GET /STATS` and `GET /STATS/`
 
 Returns storage and in-process serving metrics. Generated `symbol.toml` files
@@ -269,6 +303,7 @@ percentiles, mean, IQR, standard deviation, and `saved_fraction` are numbers.
 
 Canonical client: `symbol stats`.
 
+<!-- contract:site listing -->
 ### `GET /FILES` and `GET /FILES/`
 
 Lists all sites. HTML/plain negotiation follows `/`; exact
@@ -294,12 +329,14 @@ Headers: body `ETag`, `Cache-Control: no-cache`,
 
 Canonical client: `symbol ls` / `symbol ls -l`.
 
+<!-- contract:site redirect -->
 ### `GET /{name}`
 
 For an existing site, returns `307 Temporary Redirect` to `/{name}/`.
 If `{name}` ends in `.tar.gz`, `.tar`, or `.zip`, it is instead interpreted as
 an archive download name, as described below. Missing sites return `404`.
 
+<!-- contract:site index -->
 ### `GET /{name}/`
 
 Serves `index.html`, then `index.htm`, when present. Otherwise renders the
@@ -315,6 +352,9 @@ When an effective expiry exists, responses also include HTTP `Expires`,
 `Cache-Control: no-cache`, and `Expiry-Mode` only when the requested target has
 its own policy.
 
+<!-- contract:site file -->
+<!-- contract:file hash -->
+<!-- contract:expiry target -->
 ### `GET /{name}/{path...}`
 
 Serves a file or directory as above, except these control suffixes:
@@ -349,6 +389,7 @@ A successful range returns `206`, `Content-Range`, and the selected
 `Content-Length`. Files above 1 MiB and all ranges stream from disk; smaller
 complete files may use the 64 MiB/16,384-entry in-process blob cache.
 
+<!-- contract:archive get -->
 ### `GET /{name}.tar.gz`, `GET /{name}.tar`, `GET /{name}.zip`
 
 Streams a generated archive without changing the site.
@@ -362,6 +403,7 @@ Headers: format-specific `Content-Type`, `Content-Length`,
 Canonical client: `symbol get NAME [ARCHIVE]`; `symbol clone NAME [DIR]`
 downloads tar.gz and extracts it.
 
+<!-- contract:files inventory -->
 ### `GET /{name}/FILES` and `GET /{name}/FILES/`
 
 Lists the root. Exact `Accept: application/json` selects the sync inventory,
@@ -389,6 +431,7 @@ listing schema below.
 
 Canonical client: `symbol ls NAME`; `symbol sync` uses inventory JSON.
 
+<!-- contract:files subtree -->
 ### `GET /{name}/FILES/{path...}`
 
 Lists a directory. A missing trailing slash on a directory returns `307`; a
@@ -409,6 +452,7 @@ file redirects with `307` to its content URL. JSON listing schema:
 `kind` is `directory` or `file`. `files` is omitted on file entries. Success,
 caching, and content negotiation match `/FILES`.
 
+<!-- contract:site put -->
 ### `PUT /{name}` and `PUT /{name}/`
 
 Creates or merges into a named site. Uploaded paths replace same-path files;
@@ -457,6 +501,7 @@ ok hello https://symbol.example/hello/ (3 files, changed: true)
 Canonical client: `symbol put NAME SOURCE`; bare `symbol put` uses the nearest
 manifest target.
 
+<!-- contract:file put -->
 ### `PUT /{name}/{path...}`
 
 Creates or replaces one file at the exact path. It does not honor `Unpack` and
@@ -497,6 +542,7 @@ Large binary files are not scanned. A supported archive uploaded without
 rejected with `400` if a token is found. Sanitization is therefore a narrow
 token leak barrier, not general secret detection.
 
+<!-- contract:file delete -->
 ### `DELETE /{name}/{path...}`
 
 Deletes one file or a directory subtree and its descendant expiry policies.
@@ -506,13 +552,16 @@ return `404`.
 
 Canonical client: `symbol rm NAME PATH`.
 
+<!-- contract:site pop -->
+<!-- contract:archive pop -->
 ### `DELETE /{name}` and `DELETE /{name}/`
 
 Removes a site and streams a tar.gz snapshot in the response. The route also
 recognizes `.tar.gz`, `.tar`, and `.zip` suffixes, selecting that response
 archive format.
 
-Success: `200`, archive headers, and undo headers.
+Success: `200` with `Content-Type`, `Content-Length`,
+`Content-Disposition`, `Undo-Token`, and `Undo-Expires`.
 
 ```sh
 curl -D headers.txt -o hello.tar.gz -X DELETE \
@@ -523,6 +572,7 @@ Canonical client: `symbol pop NAME [ARCHIVE]`. `symbol rm NAME` also calls this
 route but discards the archive body, prints `deleted NAME`, and retains the undo
 hint. Use `pop` when the archive is wanted and `rm` for deletion-only output.
 
+<!-- contract:site copy -->
 ### `COPY /{name}` and `COPY /{name}/`
 
 Copies a site, excluding and regenerating `symbol.toml`.
@@ -546,6 +596,7 @@ an undo entry that removes it.
 Canonical client: `symbol copy [--managed] SRC [DST]`; `symbol remix` adds a
 local clone.
 
+<!-- contract:site move -->
 ### `MOVE /{name}` and `MOVE /{name}/`
 
 Renames a site. `Destination` is required and the destination must not exist.
@@ -559,6 +610,7 @@ moved https://symbol.example/old/ -> https://symbol.example/new/
 
 Canonical client: `symbol move SRC DST`.
 
+<!-- contract:undo stack -->
 ### `GET /{name}/UNDO` and `GET /{name}/UNDO/`
 
 Returns unconsumed, unexpired undo records newest first.
@@ -586,6 +638,7 @@ Success: `200`, `Cache-Control: no-cache`.
 
 Canonical client: `symbol undo --stack NAME`.
 
+<!-- contract:site undo -->
 ### `UNDO /{name}` and `UNDO /{name}/`
 
 Restores the newest undo record associated with the current or former site
@@ -606,6 +659,7 @@ remains managed.
 
 Canonical client: `symbol undo [NAME [TOKEN]]`.
 
+<!-- contract:expiry inventory -->
 ### `GET /{name}/EXPIRES`, `GET /{name}/EXPIRES/`, and
 `GET /{name}/{path...}/EXPIRES`
 
@@ -652,6 +706,8 @@ are null. Absolute policy `retention_seconds` is null.
 
 Canonical client: `symbol expire NAME [PATH] --show`.
 
+<!-- contract:site expire -->
+<!-- contract:file expire -->
 ### `EXPIRE /{name}[/{path...}]`
 
 Sets or removes the exact target's policy and returns the report schema above.
@@ -692,6 +748,7 @@ for four hours.
 
 Canonical client: `symbol expire NAME [PATH] [POLICY]`.
 
+<!-- contract:site management -->
 ### `MANAGE /{name}` and `MANAGE /{name}/`
 
 Requires one `Management-Action` value:
@@ -807,6 +864,7 @@ There is no versioned error JSON schema.
 - Management and one-time-secret responses: `no-store`.
 - Content with effective expiry forces `no-cache` and includes `Expires`.
 
+<!-- contract:immutable blob -->
 ### `GET /.blob/{name}/{hash}`
 
 Serves raw blob bytes only if the named site currently references that exact

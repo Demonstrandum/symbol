@@ -13,6 +13,7 @@ mod name;
 mod page;
 mod pathutil;
 mod sanitize;
+mod schema;
 mod secrets;
 mod store;
 mod upload;
@@ -20,7 +21,7 @@ mod upload;
 use std::collections::HashMap;
 use std::io::{self, SeekFrom};
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
@@ -42,7 +43,7 @@ use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio_util::io::ReaderStream;
-use tower_http::trace::TraceLayer;
+use tower_http::trace::{DefaultOnRequest, DefaultOnResponse, TraceLayer};
 
 const DEFAULT_MAX_ARCHIVE_UPLOAD: u64 = 50 * 1024 * 1024;
 const DEFAULT_MAX_ARCHIVE_EXTRACTED: u64 = 80 * 1024 * 1024;
@@ -101,8 +102,12 @@ struct Args {
     mtls_principal_header: Option<HeaderName>,
     #[arg(long, env = "SYMBOL_TAILSCALE_USER_HEADER")]
     tailscale_user_header: Option<HeaderName>,
+    #[arg(long, env = "SYMBOL_TAILSCALE_WHOIS_COMMAND")]
+    tailscale_whois_command: Option<PathBuf>,
     #[arg(long, env = "SYMBOL_TRUSTED_PROXY", value_delimiter = ',')]
     trusted_proxy: Vec<IpAddr>,
+    #[arg(long, env = "SYMBOL_AUDIT_TRUSTED_PROXY", value_delimiter = ',')]
+    audit_trusted_proxy: Vec<IpAddr>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -137,6 +142,7 @@ struct App {
     max_archive_upload: u64,
     public_url: Arc<str>,
     identity_provider: IdentityProvider,
+    audit_trusted_proxy: Arc<[IpAddr]>,
 }
 
 #[derive(Clone)]
@@ -154,12 +160,21 @@ enum IdentityProvider {
         principal_header: HeaderName,
         peers: Arc<[IpAddr]>,
     },
+    TailscaleLocal {
+        command: Arc<FsPath>,
+    },
 }
 
 const INTERNAL_CREATOR_HEADER: &str = "x-symbol-internal-creator-principal";
 
 #[derive(Clone, Copy)]
 struct AuditIp(Option<IpAddr>);
+
+#[derive(Clone)]
+struct RequestIdentityConfig {
+    provider: IdentityProvider,
+    audit_trusted_proxy: Arc<[IpAddr]>,
+}
 
 struct TemporaryUpload {
     path: PathBuf,
@@ -246,6 +261,7 @@ impl App {
             max_archive_upload,
             public_url: public_url.into(),
             identity_provider,
+            audit_trusted_proxy: Arc::from([]),
         }
     }
 
@@ -281,6 +297,15 @@ fn configured_identity_provider(args: &mut Args) -> IdentityProvider {
         configured.len() <= 1,
         "configure only one creator identity provider"
     );
+    if let Some(command) = args.tailscale_whois_command.take() {
+        assert!(
+            configured.is_empty(),
+            "Tailscale LocalAPI and identity headers are mutually exclusive"
+        );
+        return IdentityProvider::TailscaleLocal {
+            command: Arc::from(command),
+        };
+    }
     let peers: Arc<[IpAddr]> = std::mem::take(&mut args.trusted_proxy).into();
     match configured.as_slice() {
         [] if peers.is_empty() => IdentityProvider::Receipt,
@@ -368,13 +393,14 @@ async fn main() {
         return;
     }
     let identity_provider = configured_identity_provider(&mut args);
-    let state = App::with_options(
+    let mut state = App::with_options(
         store,
         args.max_file_size,
         args.max_archive_upload,
         public_url,
         identity_provider,
     );
+    state.audit_trusted_proxy = std::mem::take(&mut args.audit_trusted_proxy).into();
     tokio::spawn(expiry_worker(state.clone()));
     let app = router(state);
     let listener = TcpListener::bind(&args.bind)
@@ -391,7 +417,10 @@ async fn main() {
 }
 
 fn router(app: App) -> Router {
-    let identity_provider = app.identity_provider.clone();
+    let identity_config = RequestIdentityConfig {
+        provider: app.identity_provider.clone(),
+        audit_trusted_proxy: Arc::clone(&app.audit_trusted_proxy),
+    };
     Router::new()
         .route(contract::ROOT, get(docs).put(put_site_unnamed))
         .route(contract::HASH, get(docs_hash))
@@ -432,9 +461,14 @@ fn router(app: App) -> Router {
                 .delete(delete_site)
                 .fallback(lifecycle_method),
         )
-        .layer(TraceLayer::new_for_http().make_span_with(make_http_span))
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(make_http_span)
+                .on_request(DefaultOnRequest::new().level(tracing::Level::INFO))
+                .on_response(DefaultOnResponse::new().level(tracing::Level::INFO)),
+        )
         .layer(middleware::from_fn_with_state(
-            identity_provider,
+            identity_config,
             resolve_creator,
         ))
         .with_state(app)
@@ -449,7 +483,7 @@ fn make_http_span(request: &Request<Body>) -> tracing::Span {
 }
 
 async fn resolve_creator(
-    State(provider): State<IdentityProvider>,
+    State(config): State<RequestIdentityConfig>,
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
@@ -458,9 +492,31 @@ async fn resolve_creator(
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|peer| peer.0.ip());
-    request.extensions_mut().insert(AuditIp(peer));
-    let configured = match &provider {
-        IdentityProvider::Receipt => None,
+    let audit_ip = peer.and_then(|direct| {
+        if config.audit_trusted_proxy.contains(&direct) {
+            request
+                .headers()
+                .get("x-forwarded-for")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.split(',').next())
+                .and_then(|value| value.trim().parse::<IpAddr>().ok())
+                .or(Some(direct))
+        } else {
+            Some(direct)
+        }
+    });
+    request.extensions_mut().insert(AuditIp(audit_ip));
+    if let IdentityProvider::TailscaleLocal { command } = &config.provider
+        && let Some(ip) = audit_ip
+        && let Some(principal) = tailscale_principal(command, ip).await
+        && let Ok(internal) = HeaderValue::from_str(&format!("tailscale:{principal}"))
+    {
+        request
+            .headers_mut()
+            .insert(INTERNAL_CREATOR_HEADER, internal);
+    }
+    let configured = match &config.provider {
+        IdentityProvider::Receipt | IdentityProvider::TailscaleLocal { .. } => None,
         IdentityProvider::TrustedProxy {
             principal_header,
             peers,
@@ -488,6 +544,23 @@ async fn resolve_creator(
             .insert(INTERNAL_CREATOR_HEADER, internal);
     }
     next.run(request).await
+}
+
+async fn tailscale_principal(command: &FsPath, ip: IpAddr) -> Option<String> {
+    let output = tokio::process::Command::new(command)
+        .args(["whois", "--json", &ip.to_string()])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    value
+        .pointer("/UserProfile/LoginName")
+        .and_then(serde_json::Value::as_str)
+        .filter(|principal| !principal.is_empty())
+        .map(str::to_string)
 }
 
 async fn shutdown() {
@@ -2413,10 +2486,48 @@ mod tests {
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
     use bytes::Bytes as ByteChunk;
+    use diesel::prelude::*;
+    use diesel::sqlite::SqliteConnection;
     use tower::ServiceExt as _;
 
     fn test_app(store: Store) -> App {
         App::new(store)
+    }
+
+    fn assert_contract_status(name: &str, status: StatusCode) {
+        let endpoint = contract::ENDPOINTS
+            .iter()
+            .find(|endpoint| endpoint.name == name)
+            .unwrap_or_else(|| panic!("missing contract {name}"));
+        let code = status.as_u16();
+        assert!(
+            endpoint.success_statuses.contains(&code) || endpoint.error_statuses.contains(&code),
+            "{name} does not declare observed status {code}"
+        );
+    }
+
+    #[derive(Clone)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedWriter(Arc::clone(&self.0))
+        }
     }
 
     #[test]
@@ -2441,6 +2552,139 @@ mod tests {
         ] {
             assert!(fields.field(secret).is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn typed_contract_matches_observed_lifecycle_dispatch() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::new(root.path().to_path_buf()).unwrap();
+        store.put_file("hello", "index.html", b"hello").unwrap();
+        let app = router(test_app(store));
+
+        let get = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/hello")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_contract_status("site redirect", get.status());
+
+        let put = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/hello/style.css")
+                    .body(Body::from("body{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_contract_status("file put", put.status());
+
+        let copy = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::from_bytes(b"COPY").unwrap())
+                    .uri("/hello")
+                    .header("destination", "/copy")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_contract_status("site copy", copy.status());
+
+        let moved = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::from_bytes(b"MOVE").unwrap())
+                    .uri("/copy")
+                    .header("destination", "/moved")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_contract_status("site move", moved.status());
+
+        let expire = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::from_bytes(b"EXPIRE").unwrap())
+                    .uri("/hello")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_contract_status("site expire", expire.status());
+
+        let inventory = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/hello/EXPIRES")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_contract_status("expiry inventory", inventory.status());
+
+        let management = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::from_bytes(b"MANAGE").unwrap())
+                    .uri("/hello")
+                    .header("management-action", "status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_contract_status("site management", management.status());
+    }
+
+    #[test]
+    fn emitted_application_logs_never_contain_request_or_response_secrets() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(CapturedLogs(Arc::clone(&captured)))
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let claim = "sym_claim_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let management =
+            "sym_mgmt_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let request = Request::builder()
+            .method("PUT")
+            .uri("/logged/index.html")
+            .header("management-action", "claim")
+            .header("creator-claim", claim)
+            .header("idempotency-key", "never-log-this-key")
+            .body(Body::empty())
+            .unwrap();
+        tracing::dispatcher::with_default(&dispatch, || {
+            let span = make_http_span(&request);
+            tracing::info!(parent: &span, "started processing request");
+            tracing::info!(parent: &span, status = 201, "finished processing request");
+        });
+        let logs = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        for secret in [claim, "never-log-this-key", management] {
+            assert!(!logs.contains(secret));
+        }
+        assert!(logs.contains("started processing request"), "{logs}");
+        assert!(logs.contains("finished processing request"), "{logs}");
     }
 
     #[tokio::test]
@@ -3638,14 +3882,13 @@ mod tests {
         let claimed = app.clone().oneshot(claim).await.unwrap();
         assert_eq!(claimed.status(), StatusCode::OK);
         assert!(claimed.headers().contains_key("management-token"));
-        let audit_ip: Option<String> = rusqlite::Connection::open(root.path().join("symbol.db"))
-            .unwrap()
-            .query_row(
-                "SELECT source_ip FROM management_audit
-                 WHERE site_name = 'principal' ORDER BY id DESC LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
+        let mut db =
+            SqliteConnection::establish(&root.path().join("symbol.db").to_string_lossy()).unwrap();
+        let audit_ip = crate::schema::management_audit::table
+            .filter(crate::schema::management_audit::site_name.eq("principal"))
+            .select(crate::schema::management_audit::source_ip)
+            .order(crate::schema::management_audit::id.desc())
+            .first::<Option<String>>(&mut db)
             .unwrap();
         assert_eq!(audit_ip.as_deref(), Some("127.0.0.1"));
 
@@ -3705,6 +3948,107 @@ mod tests {
             let response = app.oneshot(request).await.unwrap();
             assert_eq!(response.status(), StatusCode::CREATED);
             assert!(!response.headers().contains_key("creator-claim"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tailscale_local_identity_is_resolved_through_configured_whois_command() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let command = root.path().join("tailscale-whois");
+        std::fs::write(
+            &command,
+            "#!/bin/sh\nprintf '%s\\n' '{\"UserProfile\":{\"LoginName\":\"user@example.test\"}}'\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&command).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&command, permissions).unwrap();
+        let store = Store::new(root.path().join("data")).unwrap();
+        let app = router(App::with_options(
+            store,
+            DEFAULT_MAX_FILE_SIZE,
+            DEFAULT_MAX_ARCHIVE_UPLOAD,
+            "http://symbol".into(),
+            IdentityProvider::TailscaleLocal {
+                command: Arc::from(command),
+            },
+        ));
+        let mut request = Request::builder()
+            .method("PUT")
+            .uri("/tailscale-local/index.html")
+            .body(Body::from("content"))
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([100, 64, 0, 7], 12345))));
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert!(!response.headers().contains_key("creator-claim"));
+    }
+
+    #[tokio::test]
+    async fn audit_ip_uses_forwarded_client_only_from_a_separately_trusted_proxy() {
+        for (site, peer, forwarded, trusted, expected) in [
+            (
+                "trusted-audit",
+                [127, 0, 0, 1],
+                "203.0.113.9",
+                true,
+                "203.0.113.9",
+            ),
+            (
+                "spoofed-audit",
+                [10, 0, 0, 8],
+                "203.0.113.10",
+                false,
+                "10.0.0.8",
+            ),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let store = Store::new(root.path().to_path_buf()).unwrap();
+            let mut state = test_app(store);
+            if trusted {
+                state.audit_trusted_proxy = Arc::from([IpAddr::from([127, 0, 0, 1])]);
+            }
+            let app = router(state);
+            let created = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!("/{site}/index.html"))
+                        .body(Body::from("content"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let claim = created.headers()["creator-claim"].clone();
+            let mut request = Request::builder()
+                .method(Method::from_bytes(b"MANAGE").unwrap())
+                .uri(format!("/{site}"))
+                .header("management-action", "claim")
+                .header("creator-claim", claim)
+                .header("x-forwarded-for", forwarded)
+                .body(Body::empty())
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(ConnectInfo(SocketAddr::from((peer, 12345))));
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut db =
+                SqliteConnection::establish(&root.path().join("symbol.db").to_string_lossy())
+                    .unwrap();
+            let source_ip = crate::schema::management_audit::table
+                .filter(crate::schema::management_audit::site_name.eq(site))
+                .select(crate::schema::management_audit::source_ip)
+                .order(crate::schema::management_audit::id.desc())
+                .first::<Option<String>>(&mut db)
+                .unwrap();
+            assert_eq!(source_ip.as_deref(), Some(expected));
         }
     }
 }

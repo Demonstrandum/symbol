@@ -8,9 +8,15 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
+use diesel::connection::{AnsiTransactionManager, SimpleConnection, TransactionManager};
+use diesel::dsl::{count_star, min};
+use diesel::prelude::*;
+use diesel::sql_types::{BigInt, Text};
+use diesel::sqlite::SqliteConnection;
+use diesel::upsert::excluded;
+use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use flate2::Compression;
 use flate2::write::GzEncoder;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 use crate::blob_store::BlobFiles;
 use crate::expiry::{
@@ -21,6 +27,11 @@ use crate::expiry::{
 use crate::name::{NameError, generate_id, parse_site_name};
 use crate::pathutil::{PathError, is_junk, is_noise_path, looks_like_apple_fork, safe_rel_path};
 use crate::sanitize::{self, TokenCounts};
+use crate::schema::{
+    blobs, expiry_policies, files, idempotency_records, management_audit, management_idempotency,
+    management_tombstones, metadata, path_aggregates, sites, undo_expiry_policies, undo_files,
+    undo_names, undo_operations, undo_sites,
+};
 use crate::secrets::{ClaimToken, ClaimTokenHash, ManagementToken, ManagementTokenHash};
 #[cfg(test)]
 use crate::upload::write_payload;
@@ -29,32 +40,7 @@ use crate::upload::{Kind, UploadError, write_payload_file};
 #[cfg(test)]
 use std::io::Cursor;
 
-const SCHEMA: &str = "
-PRAGMA foreign_keys = ON;
-CREATE TABLE IF NOT EXISTS sites (
-    id INTEGER PRIMARY KEY,
-    name TEXT NOT NULL UNIQUE,
-    updated INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS blobs (
-    hash TEXT PRIMARY KEY,
-    bytes BLOB NOT NULL DEFAULT X'',
-    size INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS files (
-    site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
-    path TEXT NOT NULL,
-    hash TEXT NOT NULL REFERENCES blobs(hash),
-    size INTEGER NOT NULL,
-    PRIMARY KEY (site_id, path)
-);
-CREATE INDEX IF NOT EXISTS files_hash ON files(hash);
-CREATE INDEX IF NOT EXISTS files_site_prefix ON files(site_id, path);
-CREATE TABLE IF NOT EXISTS metadata (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-";
+const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 const LATEST_SCHEMA_VERSION: i64 = 6;
 const UNDO_RETENTION_MILLIS: i64 = 4 * 60 * 60 * 1000;
 const UNDO_LIMIT_PER_SITE: i64 = 10;
@@ -81,11 +67,12 @@ pub struct Store {
 
 struct Inner {
     root: PathBuf,
-    writer: Mutex<Connection>,
+    writer: Mutex<SqliteConnection>,
     readers: ReaderPool,
     blobs: BlobCache,
     blob_files: BlobFiles,
     metrics: Arc<Metrics>,
+    temp_generation: AtomicU64,
     public_url: String,
     clock: Arc<dyn Clock>,
     expiry_defaults: DecayPolicy,
@@ -104,7 +91,7 @@ impl Clock for SystemClock {
 }
 
 struct ReaderPool {
-    available: Mutex<Vec<Connection>>,
+    available: Mutex<Vec<SqliteConnection>>,
     ready: Condvar,
     size: usize,
     metrics: Arc<Metrics>,
@@ -112,8 +99,103 @@ struct ReaderPool {
 
 struct Reader<'a> {
     pool: &'a ReaderPool,
-    connection: Option<Connection>,
+    connection: Option<SqliteConnection>,
     acquired: Instant,
+}
+
+struct DbTransaction<'a> {
+    connection: &'a mut SqliteConnection,
+    finished: bool,
+}
+
+#[derive(Queryable, Selectable)]
+#[diesel(table_name = sites)]
+struct ManagementSiteRow {
+    id: i64,
+    creator_kind: Option<i64>,
+    creator_hash: Option<Vec<u8>>,
+    claim_hash: Option<Vec<u8>>,
+    management_hash: Option<Vec<u8>>,
+    management_status: i64,
+}
+
+#[derive(Insertable)]
+#[diesel(table_name = sites)]
+struct NewSite<'a> {
+    name: &'a str,
+    updated: i64,
+    public_url: &'a str,
+    content_revision: i64,
+    tree_hash: &'a str,
+    creator_kind: Option<i64>,
+    creator_hash: Option<Vec<u8>>,
+    claim_hash: Option<Vec<u8>>,
+    management_hash: Option<Vec<u8>>,
+    management_status: i64,
+}
+
+#[derive(Queryable, Selectable, Insertable)]
+#[diesel(table_name = files)]
+struct FileRow {
+    site_id: i64,
+    path: String,
+    hash: String,
+    size: i64,
+}
+
+#[derive(Insertable)]
+#[diesel(table_name = files)]
+struct NewFile<'a> {
+    site_id: i64,
+    path: &'a str,
+    hash: &'a str,
+    size: i64,
+}
+
+#[derive(Queryable, Selectable)]
+#[diesel(table_name = expiry_policies)]
+struct ExpiryPolicyRow {
+    path: String,
+    target_kind: i64,
+    mode: i64,
+    duration_seconds: Option<i64>,
+    deadline: Option<i64>,
+    min_age_seconds: Option<i64>,
+    max_age_seconds: Option<i64>,
+    max_size_bytes: Option<i64>,
+    power: Option<f64>,
+    refreshed: Option<i64>,
+    own_deadline: Option<i64>,
+    size_bytes: i64,
+}
+
+#[derive(Queryable, Selectable)]
+#[diesel(table_name = undo_expiry_policies)]
+struct UndoExpiryPolicyRow {
+    path: String,
+    target_kind: i64,
+    mode: i64,
+    duration_seconds: Option<i64>,
+    deadline: Option<i64>,
+    min_age_seconds: Option<i64>,
+    max_age_seconds: Option<i64>,
+    max_size_bytes: Option<i64>,
+    power: Option<f64>,
+    refreshed: Option<i64>,
+    own_deadline: i64,
+    size_bytes: i64,
+}
+
+#[derive(QueryableByName)]
+struct SchemaVersion {
+    #[diesel(sql_type = BigInt)]
+    user_version: i64,
+}
+
+#[derive(QueryableByName)]
+struct IntegrityCheck {
+    #[diesel(sql_type = Text)]
+    integrity_check: String,
 }
 
 struct BlobCache {
@@ -430,6 +512,8 @@ pub enum StoreError {
     NotFound,
     #[error("error: undo token is stale; latest token is {0}")]
     StaleUndo(String),
+    #[error("error: unsupported undo kind {0}")]
+    UnsupportedUndoKind(i64),
     #[error("error: destination site already exists")]
     DestinationConflict,
     #[error("error: idempotency key was already used for a different request")]
@@ -439,6 +523,7 @@ pub enum StoreError {
     #[error("error: upstream changed; nothing was written")]
     PreconditionFailed { revision: u64, tree_hash: String },
     #[error("error: reserved path already exists: {0}")]
+    #[allow(dead_code)]
     ReservedCollision(String),
     #[error("error: management token required")]
     Unauthorized,
@@ -449,7 +534,11 @@ pub enum StoreError {
     #[error("error: {0}")]
     Expiry(#[from] ExpiryError),
     #[error("error: sqlite: {0}")]
-    Sqlite(#[from] rusqlite::Error),
+    Sqlite(#[from] diesel::result::Error),
+    #[error("error: sqlite connection: {0}")]
+    Connection(#[from] diesel::ConnectionError),
+    #[error("error: database migration: {0}")]
+    Migration(#[from] Box<dyn std::error::Error + Send + Sync>),
     #[error("error: operating system random source failed")]
     Random(#[from] getrandom::Error),
     #[error("error: {0}")]
@@ -457,14 +546,12 @@ pub enum StoreError {
 }
 
 impl ReaderPool {
-    fn open(path: &Path, count: usize, metrics: Arc<Metrics>) -> Result<Self, rusqlite::Error> {
+    fn open(path: &Path, count: usize, metrics: Arc<Metrics>) -> Result<Self, StoreError> {
         let mut available = Vec::with_capacity(count);
         for _ in 0..count {
-            let connection = Connection::open_with_flags(
-                path,
-                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            )?;
-            connection.busy_timeout(std::time::Duration::from_secs(5))?;
+            let database_url = format!("file:{}?mode=ro", path.display());
+            let mut connection = SqliteConnection::establish(&database_url)?;
+            connection.batch_execute("PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON;")?;
             available.push(connection);
         }
         Ok(Self {
@@ -503,10 +590,56 @@ impl ReaderPool {
 }
 
 impl std::ops::Deref for Reader<'_> {
-    type Target = Connection;
+    type Target = SqliteConnection;
 
     fn deref(&self) -> &Self::Target {
         self.connection.as_ref().unwrap()
+    }
+}
+
+impl std::ops::DerefMut for Reader<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.connection.as_mut().unwrap()
+    }
+}
+
+impl DbTransaction<'_> {
+    fn begin(
+        connection: &mut SqliteConnection,
+    ) -> Result<DbTransaction<'_>, diesel::result::Error> {
+        AnsiTransactionManager::begin_transaction(connection)?;
+        Ok(DbTransaction {
+            connection,
+            finished: false,
+        })
+    }
+
+    fn commit(mut self) -> Result<(), diesel::result::Error> {
+        AnsiTransactionManager::commit_transaction(self.connection)?;
+        self.finished = true;
+        Ok(())
+    }
+}
+
+impl std::ops::Deref for DbTransaction<'_> {
+    type Target = SqliteConnection;
+
+    fn deref(&self) -> &Self::Target {
+        self.connection
+    }
+}
+
+impl std::ops::DerefMut for DbTransaction<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.connection
+    }
+}
+
+impl Drop for DbTransaction<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = AnsiTransactionManager::rollback_transaction(self.connection);
+        }
     }
 }
 
@@ -686,11 +819,13 @@ impl Store {
         }
         fs::create_dir_all(&tmp)?;
         let path = root.join("symbol.db");
-        let mut db = Connection::open(&path)?;
-        db.busy_timeout(std::time::Duration::from_secs(5))?;
-        db.pragma_update(None, "journal_mode", "WAL")?;
-        db.pragma_update(None, "synchronous", "NORMAL")?;
-        db.pragma_update(None, "foreign_keys", "ON")?;
+        let mut db = SqliteConnection::establish(&path.to_string_lossy())?;
+        db.batch_execute(
+            "PRAGMA busy_timeout = 5000;
+             PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             PRAGMA foreign_keys = ON;",
+        )?;
         run_migrations(&mut db)?;
         let reader_count = std::thread::available_parallelism()
             .map_or(4, std::num::NonZeroUsize::get)
@@ -709,6 +844,7 @@ impl Store {
                 ),
                 blob_files,
                 metrics,
+                temp_generation: AtomicU64::new(0),
                 public_url,
                 clock,
                 expiry_defaults,
@@ -750,22 +886,27 @@ impl Store {
     }
 
     pub fn stats(&self) -> Result<Stats, StoreError> {
-        let db = self.inner.readers.get();
-        let sites = db.query_row("SELECT COUNT(*) FROM sites", [], |row| {
-            row.get::<_, i64>(0).map(i64::cast_unsigned)
-        })?;
-        let file_values = load_sizes(
-            &db,
-            "SELECT size FROM files WHERE path <> 'symbol.toml' ORDER BY size",
-        )?;
-        let blob_values = load_sizes(
-            &db,
-            "SELECT blobs.size
-             FROM blobs JOIN files ON files.hash = blobs.hash
-             WHERE files.path <> 'symbol.toml'
-             GROUP BY blobs.hash, blobs.size
-             ORDER BY blobs.size",
-        )?;
+        let mut db = self.inner.readers.get();
+        let site_count = sites::table.select(count_star()).first::<i64>(&mut *db)?;
+        let sites = site_count.cast_unsigned();
+        let file_values = files::table
+            .filter(files::path.ne(MANIFEST_PATH))
+            .select(files::size)
+            .order(files::size)
+            .load::<i64>(&mut *db)?
+            .into_iter()
+            .map(i64::cast_unsigned)
+            .collect::<Vec<_>>();
+        let blob_values = blobs::table
+            .inner_join(files::table.on(files::hash.eq(blobs::hash)))
+            .filter(files::path.ne(MANIFEST_PATH))
+            .group_by((blobs::hash, blobs::size))
+            .select(blobs::size)
+            .order(blobs::size)
+            .load::<i64>(&mut *db)?
+            .into_iter()
+            .map(i64::cast_unsigned)
+            .collect::<Vec<_>>();
         let files = u64::try_from(file_values.len()).expect("file count fits in u64");
         let blobs = u64::try_from(blob_values.len()).expect("blob count fits in u64");
         let logical_bytes = file_values.iter().sum();
@@ -792,23 +933,23 @@ impl Store {
     }
 
     pub fn list_sites(&self) -> Result<SiteList, StoreError> {
-        let db = self.inner.readers.get();
-        let mut stmt = db.prepare(
-            "SELECT sites.name, COUNT(files.path), COALESCE(SUM(files.size), 0)
-             FROM sites LEFT JOIN files ON files.site_id = sites.id
-             GROUP BY sites.id, sites.name
-             ORDER BY sites.name",
-        )?;
-        let entries = stmt
-            .query_map([], |row| {
-                Ok(SiteEnt {
-                    name: row.get(0)?,
-                    files: row.get::<_, i64>(1)?.cast_unsigned(),
-                    bytes: row.get::<_, i64>(2)?.cast_unsigned(),
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(stmt);
+        let mut db = self.inner.readers.get();
+        let site_rows = sites::table
+            .select((sites::id, sites::name))
+            .order(sites::name)
+            .load::<(i64, String)>(&mut *db)?;
+        let mut entries = Vec::with_capacity(site_rows.len());
+        for (site_id, name) in site_rows {
+            let sizes = files::table
+                .filter(files::site_id.eq(site_id))
+                .select(files::size)
+                .load::<i64>(&mut *db)?;
+            entries.push(SiteEnt {
+                name,
+                files: u64::try_from(sizes.len()).expect("file count fits in u64"),
+                bytes: sizes.into_iter().map(i64::cast_unsigned).sum(),
+            });
+        }
         let files = entries.iter().map(|entry| entry.files).sum();
         let bytes = entries.iter().map(|entry| entry.bytes).sum();
         Ok(SiteList {
@@ -821,17 +962,16 @@ impl Store {
     #[cfg(test)]
     pub fn list_files(&self, name: &str) -> Result<Vec<String>, StoreError> {
         let name = parse_site_name(name)?;
-        let db = self.inner.readers.get();
-        if !site_exists_locked(&db, name)? {
+        let mut db = self.inner.readers.get();
+        if !site_exists_locked(&mut db, name)? {
             return Err(StoreError::NotFound);
         }
-        let mut stmt = db.prepare(
-            "SELECT path FROM files WHERE site_id = (SELECT id FROM sites WHERE name = ?1) ORDER BY path",
-        )?;
-        let paths = stmt
-            .query_map(params![name], |row| row.get(0))?
-            .collect::<Result<Vec<String>, _>>()?;
-        drop(stmt);
+        let site_id = site_id_locked(&mut db, name)?;
+        let paths = files::table
+            .filter(files::site_id.eq(site_id))
+            .select(files::path)
+            .order(files::path)
+            .load::<String>(&mut *db)?;
         Ok(paths)
     }
 
@@ -841,37 +981,38 @@ impl Store {
         if !rel.is_empty() && is_noise_path(Path::new(&rel)) {
             return Err(StoreError::NotFound);
         }
-        let db = self.inner.readers.get();
-        match node_locked(&db, name, &rel)? {
+        let mut db = self.inner.readers.get();
+        match node_locked(&mut db, name, &rel)? {
             NodeKind::Dir => {}
             NodeKind::File { .. } | NodeKind::Missing => return Err(StoreError::NotFound),
         }
         let files = if rel.is_empty() {
-            load_root_files(&db, name)?
+            load_root_files(&mut db, name)?
         } else {
-            load_descendant_files(&db, name, &rel)?
+            load_descendant_files(&mut db, name, &rel)?
         };
         Ok(dirents(&files, &rel))
     }
 
     pub fn site_inventory(&self, name: &str) -> Result<SiteInventory, StoreError> {
         let name = parse_site_name(name)?;
-        let db = self.inner.readers.get();
-        let (revision, tree_hash) = site_revision_locked(&db, name)?;
-        let mut stmt = db.prepare(
-            "SELECT path, hash, size FROM files
-             WHERE site_id = (SELECT id FROM sites WHERE name = ?1) AND path <> ?2
-             ORDER BY path",
-        )?;
-        let files = stmt
-            .query_map(params![name, MANIFEST_PATH], |row| {
-                Ok(InventoryFile {
-                    path: row.get(0)?,
-                    hash: format!("blake3:{}", row.get::<_, String>(1)?),
-                    size: row.get::<_, i64>(2)?.cast_unsigned(),
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut db = self.inner.readers.get();
+        let (revision, tree_hash) = site_revision_locked(&mut db, name)?;
+        let site_id = site_id_locked(&mut db, name)?;
+        let rows = files::table
+            .filter(files::site_id.eq(site_id))
+            .filter(files::path.ne(MANIFEST_PATH))
+            .select((files::path, files::hash, files::size))
+            .order(files::path)
+            .load::<(String, String, i64)>(&mut *db)?;
+        let files = rows
+            .into_iter()
+            .map(|(path, hash, size)| InventoryFile {
+                path,
+                hash: format!("blake3:{hash}"),
+                size: size.cast_unsigned(),
+            })
+            .collect();
         Ok(SiteInventory {
             site: name.to_string(),
             content_revision: revision,
@@ -884,8 +1025,8 @@ impl Store {
         let Ok(name) = parse_site_name(name) else {
             return false;
         };
-        let db = self.inner.readers.get();
-        site_exists_locked(&db, name).unwrap_or(false)
+        let mut db = self.inner.readers.get();
+        site_exists_locked(&mut db, name).unwrap_or(false)
     }
 
     pub fn authorize_mutation(
@@ -894,23 +1035,21 @@ impl Store {
         token: Option<&ManagementToken>,
     ) -> Result<(), StoreError> {
         let name = parse_site_name(name)?;
-        let db = self.inner.readers.get();
-        authorize_locked(&db, name, token)
+        let mut db = self.inner.readers.get();
+        authorize_locked(&mut db, name, token)
     }
 
     pub fn management_status(&self, name: &str) -> Result<ManagementStatus, StoreError> {
         let name = parse_site_name(name)?;
-        let db = self.inner.readers.get();
-        db.query_row(
-            "SELECT management_status FROM sites WHERE name = ?1",
-            [name],
-            |row| {
-                Ok(ManagementStatus {
-                    managed: row.get(0)?,
-                })
-            },
-        )
-        .map_err(map_sql)
+        let mut db = self.inner.readers.get();
+        let managed = sites::table
+            .filter(sites::name.eq(name))
+            .select(sites::management_status)
+            .first::<i64>(&mut *db)
+            .map_err(map_sql)?;
+        Ok(ManagementStatus {
+            managed: managed != 0,
+        })
     }
 
     pub fn claim_management(
@@ -923,25 +1062,19 @@ impl Store {
         let name = parse_site_name(name)?;
         let now = self.now_millis();
         let mut db = self.inner.writer.lock().unwrap();
-        let tx = db.transaction()?;
-        prune_management_idempotency(&tx, now)?;
+        let mut tx = DbTransaction::begin(&mut db)?;
+        prune_management_idempotency(&mut tx, now)?;
         let fingerprint = format!("claim:{name}");
-        let (site_id, managed, creator_kind, creator_hash, claim_hash) = tx
-            .query_row(
-                "SELECT id, management_status, creator_kind, creator_hash, claim_hash
-                 FROM sites WHERE name = ?1",
-                [name],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, bool>(1)?,
-                        row.get::<_, Option<i64>>(2)?,
-                        row.get::<_, Option<Vec<u8>>>(3)?,
-                        row.get::<_, Option<Vec<u8>>>(4)?,
-                    ))
-                },
-            )
+        let site = sites::table
+            .filter(sites::name.eq(name))
+            .select(ManagementSiteRow::as_select())
+            .first::<ManagementSiteRow>(&mut *tx)
             .map_err(map_sql)?;
+        let site_id = site.id;
+        let managed = site.management_status != 0;
+        let creator_kind = site.creator_kind;
+        let creator_hash = site.creator_hash;
+        let claim_hash = site.claim_hash;
         let creator_matches = creator.is_some_and(|candidate| {
             creator_kind == Some(candidate.kind as i64)
                 && creator_hash.as_deref() == Some(candidate.hash.as_slice())
@@ -955,7 +1088,7 @@ impl Store {
         if !creator_matches && !claim_matches {
             return Err(StoreError::Forbidden);
         }
-        if management_replay(&tx, request.idempotency, &fingerprint)? {
+        if management_replay(&mut tx, request.idempotency, &fingerprint)? {
             return Ok(ManagementMutation {
                 status: ManagementStatus { managed: true },
                 token: None,
@@ -966,13 +1099,15 @@ impl Store {
             return Err(StoreError::AlreadyManaged);
         }
         let token = ManagementToken::generate()?;
-        tx.execute(
-            "UPDATE sites SET management_hash = ?1, management_status = 1 WHERE id = ?2",
-            params![token.hash().as_bytes().as_slice(), site_id],
-        )?;
-        record_management(&tx, name, 1, now, request.audit_ip)?;
-        store_management_idempotency(&tx, request.idempotency, &fingerprint, now)?;
-        regenerate_site(&tx, &self.inner.blob_files, site_id, now)?;
+        diesel::update(sites::table.find(site_id))
+            .set((
+                sites::management_hash.eq(Some(token.hash().as_bytes().as_slice())),
+                sites::management_status.eq(1_i64),
+            ))
+            .execute(&mut *tx)?;
+        record_management(&mut tx, name, 1, now, request.audit_ip)?;
+        store_management_idempotency(&mut tx, request.idempotency, &fingerprint, now)?;
+        regenerate_site(&mut tx, &self.inner.blob_files, site_id, now)?;
         tx.commit()?;
         drop(db);
         Ok(ManagementMutation {
@@ -993,27 +1128,20 @@ impl Store {
         let name = parse_site_name(name)?;
         let now = self.now_millis();
         let mut db = self.inner.writer.lock().unwrap();
-        let tx = db.transaction()?;
-        prune_management_idempotency(&tx, now)?;
+        let mut tx = DbTransaction::begin(&mut db)?;
+        prune_management_idempotency(&mut tx, now)?;
         let fingerprint = format!("rotate:{name}");
-        let (site_id, managed, expected_hash, creator_kind, creator_hash, claim_hash) = tx
-            .query_row(
-                "SELECT id, management_status, management_hash,
-                        creator_kind, creator_hash, claim_hash
-                 FROM sites WHERE name = ?1",
-                [name],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, bool>(1)?,
-                        row.get::<_, Option<Vec<u8>>>(2)?,
-                        row.get::<_, Option<i64>>(3)?,
-                        row.get::<_, Option<Vec<u8>>>(4)?,
-                        row.get::<_, Option<Vec<u8>>>(5)?,
-                    ))
-                },
-            )
+        let site = sites::table
+            .filter(sites::name.eq(name))
+            .select(ManagementSiteRow::as_select())
+            .first::<ManagementSiteRow>(&mut *tx)
             .map_err(map_sql)?;
+        let site_id = site.id;
+        let managed = site.management_status != 0;
+        let expected_hash = site.management_hash;
+        let creator_kind = site.creator_kind;
+        let creator_hash = site.creator_hash;
+        let claim_hash = site.claim_hash;
         if !managed {
             return Err(StoreError::Forbidden);
         }
@@ -1036,7 +1164,7 @@ impl Store {
         if !bearer_matches && !creator_matches && !claim_matches {
             return Err(StoreError::Unauthorized);
         }
-        if management_replay(&tx, request.idempotency, &fingerprint)? {
+        if management_replay(&mut tx, request.idempotency, &fingerprint)? {
             return Ok(ManagementMutation {
                 status: ManagementStatus { managed: true },
                 token: None,
@@ -1044,12 +1172,11 @@ impl Store {
             });
         }
         let token = ManagementToken::generate()?;
-        tx.execute(
-            "UPDATE sites SET management_hash = ?1 WHERE id = ?2",
-            params![token.hash().as_bytes().as_slice(), site_id],
-        )?;
-        record_management(&tx, name, 2, now, request.audit_ip)?;
-        store_management_idempotency(&tx, request.idempotency, &fingerprint, now)?;
+        diesel::update(sites::table.find(site_id))
+            .set(sites::management_hash.eq(Some(token.hash().as_bytes().as_slice())))
+            .execute(&mut *tx)?;
+        record_management(&mut tx, name, 2, now, request.audit_ip)?;
+        store_management_idempotency(&mut tx, request.idempotency, &fingerprint, now)?;
         tx.commit()?;
         drop(db);
         Ok(ManagementMutation {
@@ -1068,20 +1195,18 @@ impl Store {
         let name = parse_site_name(name)?;
         let now = self.now_millis();
         let mut db = self.inner.writer.lock().unwrap();
-        let tx = db.transaction()?;
-        authorize_locked(&tx, name, bearer)?;
-        let site_id: i64 = tx
-            .query_row("SELECT id FROM sites WHERE name = ?1", [name], |row| {
-                row.get(0)
-            })
-            .map_err(map_sql)?;
-        tx.execute(
-            "UPDATE sites SET management_hash = NULL, management_status = 0 WHERE id = ?1",
-            [site_id],
-        )?;
-        tx.execute("DELETE FROM management_tombstones WHERE name = ?1", [name])?;
-        record_management(&tx, name, 3, now, audit_ip)?;
-        regenerate_site(&tx, &self.inner.blob_files, site_id, now)?;
+        let mut tx = DbTransaction::begin(&mut db)?;
+        authorize_locked(&mut tx, name, bearer)?;
+        let site_id = site_id_locked(&mut tx, name)?;
+        diesel::update(sites::table.find(site_id))
+            .set((
+                sites::management_hash.eq::<Option<Vec<u8>>>(None),
+                sites::management_status.eq(0_i64),
+            ))
+            .execute(&mut *tx)?;
+        diesel::delete(management_tombstones::table.find(name)).execute(&mut *tx)?;
+        record_management(&mut tx, name, 3, now, audit_ip)?;
+        regenerate_site(&mut tx, &self.inner.blob_files, site_id, now)?;
         tx.commit()?;
         drop(db);
         Ok(ManagementStatus { managed: false })
@@ -1092,23 +1217,24 @@ impl Store {
         let token = ManagementToken::generate()?;
         let now = self.now_millis();
         let mut db = self.inner.writer.lock().unwrap();
-        let tx = db.transaction()?;
-        let (site_id, managed): (i64, bool) = tx
-            .query_row(
-                "SELECT id, management_status FROM sites WHERE name = ?1",
-                [name],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
+        let mut tx = DbTransaction::begin(&mut db)?;
+        let (site_id, status) = sites::table
+            .filter(sites::name.eq(name))
+            .select((sites::id, sites::management_status))
+            .first::<(i64, i64)>(&mut *tx)
             .map_err(map_sql)?;
+        let managed = status != 0;
         if managed {
             return Err(StoreError::AlreadyManaged);
         }
-        tx.execute(
-            "UPDATE sites SET management_hash = ?1, management_status = 1 WHERE id = ?2",
-            params![token.hash().as_bytes().as_slice(), site_id],
-        )?;
-        record_management(&tx, name, 4, now, None)?;
-        regenerate_site(&tx, &self.inner.blob_files, site_id, now)?;
+        diesel::update(sites::table.find(site_id))
+            .set((
+                sites::management_hash.eq(Some(token.hash().as_bytes().as_slice())),
+                sites::management_status.eq(1_i64),
+            ))
+            .execute(&mut *tx)?;
+        record_management(&mut tx, name, 4, now, None)?;
+        regenerate_site(&mut tx, &self.inner.blob_files, site_id, now)?;
         tx.commit()?;
         drop(db);
         Ok(token)
@@ -1123,18 +1249,13 @@ impl Store {
         let token = ManagementToken::generate()?;
         let now = self.now_millis();
         let mut db = self.inner.writer.lock().unwrap();
-        let tx = db.transaction()?;
-        authorize_locked(&tx, name, Some(current))?;
-        let site_id: i64 = tx
-            .query_row("SELECT id FROM sites WHERE name = ?1", [name], |row| {
-                row.get(0)
-            })
-            .map_err(map_sql)?;
-        tx.execute(
-            "UPDATE sites SET management_hash = ?1 WHERE id = ?2",
-            params![token.hash().as_bytes().as_slice(), site_id],
-        )?;
-        record_management(&tx, name, 5, now, None)?;
+        let mut tx = DbTransaction::begin(&mut db)?;
+        authorize_locked(&mut tx, name, Some(current))?;
+        let site_id = site_id_locked(&mut tx, name)?;
+        diesel::update(sites::table.find(site_id))
+            .set(sites::management_hash.eq(Some(token.hash().as_bytes().as_slice())))
+            .execute(&mut *tx)?;
+        record_management(&mut tx, name, 5, now, None)?;
         tx.commit()?;
         drop(db);
         Ok(token)
@@ -1146,8 +1267,8 @@ impl Store {
         if !rel.is_empty() && is_noise_path(Path::new(&rel)) {
             return Err(StoreError::NotFound);
         }
-        let db = self.inner.readers.get();
-        let node = match node_locked(&db, name, &rel)? {
+        let mut db = self.inner.readers.get();
+        let node = match node_locked(&mut db, name, &rel)? {
             NodeKind::Missing => return Err(StoreError::NotFound),
             NodeKind::Dir => Node::Dir,
             NodeKind::File { hash } => Node::File { logical: rel, hash },
@@ -1168,8 +1289,11 @@ impl Store {
         if let Some(bytes) = self.inner.blobs.get(hash) {
             return Ok(bytes);
         }
-        let db = self.inner.readers.get();
-        db.query_row("SELECT 1 FROM blobs WHERE hash = ?1", [hash], |_| Ok(()))
+        let mut db = self.inner.readers.get();
+        blobs::table
+            .find(hash)
+            .select(blobs::hash)
+            .first::<String>(&mut *db)
             .map_err(map_sql)?;
         drop(db);
         let bytes = Bytes::from(self.inner.blob_files.read(hash)?);
@@ -1179,17 +1303,14 @@ impl Store {
 
     pub fn site_references_blob(&self, name: &str, hash: &str) -> Result<bool, StoreError> {
         let name = parse_site_name(name)?;
-        let db = self.inner.readers.get();
-        db.query_row(
-            "SELECT EXISTS(
-                SELECT 1
-                FROM files JOIN sites ON sites.id = files.site_id
-                WHERE sites.name = ?1 AND files.hash = ?2
-            )",
-            params![name, hash],
-            |row| row.get(0),
-        )
-        .map_err(StoreError::Sqlite)
+        let mut db = self.inner.readers.get();
+        let count = files::table
+            .inner_join(sites::table)
+            .filter(sites::name.eq(name))
+            .filter(files::hash.eq(hash))
+            .select(count_star())
+            .first::<i64>(&mut *db)?;
+        Ok(count != 0)
     }
 
     #[allow(clippy::large_types_passed_by_value)]
@@ -1330,13 +1451,13 @@ impl Store {
     pub fn pop_site(&self, name: &str) -> Result<Vec<u8>, StoreError> {
         let name = parse_site_name(name)?;
         let mut db = self.inner.writer.lock().unwrap();
-        let tx = db.transaction()?;
-        let archive = site_files(&tx, &self.inner.blob_files, name)?;
+        let mut tx = DbTransaction::begin(&mut db)?;
+        let archive = site_files(&mut tx, &self.inner.blob_files, name)?;
         let packed = pack_tar_gz(&archive.files)?;
-        snapshot_site(&tx, name, UndoKind::DeleteSite, self.now_millis())?;
-        retain_management_tombstone(&tx, name, self.now_millis())?;
-        tx.execute("DELETE FROM sites WHERE name = ?1", params![name])?;
-        let removed = gc_blobs(&tx, self.now_millis())?;
+        snapshot_site(&mut tx, name, UndoKind::DeleteSite, self.now_millis())?;
+        retain_management_tombstone(&mut tx, name, self.now_millis())?;
+        diesel::delete(sites::table.filter(sites::name.eq(name))).execute(&mut *tx)?;
+        let removed = gc_blobs(&mut tx, self.now_millis())?;
         tx.commit()?;
         drop(db);
         self.remove_blob_files(&removed);
@@ -1346,8 +1467,8 @@ impl Store {
     #[cfg(test)]
     pub fn pack_site(&self, name: &str, format: ArchiveFormat) -> Result<Vec<u8>, StoreError> {
         let name = parse_site_name(name)?;
-        let db = self.inner.readers.get();
-        let archive = site_files(&db, &self.inner.blob_files, name)?;
+        let mut db = self.inner.readers.get();
+        let archive = site_files(&mut db, &self.inner.blob_files, name)?;
         drop(db);
         match format {
             ArchiveFormat::Tar => pack_tar(&archive.files),
@@ -1364,8 +1485,8 @@ impl Store {
         output: &Path,
     ) -> Result<u64, StoreError> {
         let name = parse_site_name(name)?;
-        let db = self.inner.readers.get();
-        let entries = site_manifest(&db, name)?;
+        let mut db = self.inner.readers.get();
+        let entries = site_manifest(&mut db, name)?;
         drop(db);
         write_site_archive(&self.inner.blob_files, &entries, format, output)?;
         Ok(fs::metadata(output)?.len())
@@ -1380,15 +1501,15 @@ impl Store {
     ) -> Result<PopResult, StoreError> {
         let name = parse_site_name(name)?;
         let mut db = self.inner.writer.lock().unwrap();
-        let entries = site_manifest(&db, name)?;
+        let entries = site_manifest(&mut db, name)?;
         write_site_archive(&self.inner.blob_files, &entries, format, output)?;
-        let tx = db.transaction()?;
-        authorize_locked(&tx, name, authorization)?;
-        let undo = snapshot_site(&tx, name, UndoKind::DeleteSite, self.now_millis())?;
-        retain_management_tombstone(&tx, name, self.now_millis())?;
-        tx.execute("DELETE FROM sites WHERE name = ?1", params![name])?;
-        prune_undo_locked(&tx, self.now_millis())?;
-        let removed = gc_blobs(&tx, self.now_millis())?;
+        let mut tx = DbTransaction::begin(&mut db)?;
+        authorize_locked(&mut tx, name, authorization)?;
+        let undo = snapshot_site(&mut tx, name, UndoKind::DeleteSite, self.now_millis())?;
+        retain_management_tombstone(&mut tx, name, self.now_millis())?;
+        diesel::delete(sites::table.filter(sites::name.eq(name))).execute(&mut *tx)?;
+        prune_undo_locked(&mut tx, self.now_millis())?;
+        let removed = gc_blobs(&mut tx, self.now_millis())?;
         tx.commit()?;
         drop(db);
         self.remove_blob_files(&removed);
@@ -1429,9 +1550,9 @@ impl Store {
         let now = self.now_millis();
         let fingerprint = format!("copy:{source}");
         let mut db = self.inner.writer.lock().unwrap();
-        let tx = db.transaction()?;
-        prune_idempotency_locked(&tx, now)?;
-        if !site_exists_locked(&tx, source)? {
+        let mut tx = DbTransaction::begin(&mut db)?;
+        prune_idempotency_locked(&mut tx, now)?;
+        if !site_exists_locked(&mut tx, source)? {
             return Err(StoreError::NotFound);
         }
         if destination.is_none()
@@ -1439,7 +1560,7 @@ impl Store {
         {
             validate_idempotency_key(&idempotency.key)?;
             if let Some(replay) = idempotency_replay(
-                &tx,
+                &mut tx,
                 &idempotency.key,
                 &fingerprint,
                 IdempotencyKind::AutoCopy,
@@ -1448,64 +1569,84 @@ impl Store {
             }
         }
         let generated = destination.is_none();
-        let destination = destination.unwrap_or_else(|| {
-            generate_id(|candidate| site_exists_locked(&tx, candidate).unwrap_or(true))
-        });
-        if site_exists_locked(&tx, &destination)? {
+        let existing_names = sites::table
+            .select(sites::name)
+            .load::<String>(&mut *tx)?
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let destination = destination
+            .unwrap_or_else(|| generate_id(|candidate| existing_names.contains(candidate)));
+        if site_exists_locked(&mut tx, &destination)? {
             return Err(StoreError::DestinationConflict);
         }
-        let (source_id, public_url, revision): (i64, String, i64) = tx.query_row(
-            "SELECT id, public_url, content_revision FROM sites WHERE name = ?1",
-            [source],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )?;
+        let (source_id, public_url, revision) = sites::table
+            .filter(sites::name.eq(source))
+            .select((sites::id, sites::public_url, sites::content_revision))
+            .first::<(i64, String, i64)>(&mut *tx)?;
         let undo = snapshot_site_with_description(
-            &tx,
+            &mut tx,
             &destination,
             UndoKind::Copy,
             &format!("remove copied site {destination}"),
             now,
         )?;
-        tx.execute(
-            "INSERT INTO sites(
-                name, updated, public_url, content_revision, tree_hash,
-                creator_kind, creator_hash, claim_hash, management_hash, management_status
-             ) VALUES (?1, ?2, ?3, ?4, '', ?5, ?6, ?7, ?8, ?9)",
-            params![
-                destination,
-                now,
-                public_url,
-                revision,
-                creation.creator.map(|creator| creator.kind as i64),
-                creation.creator.map(|creator| creator.hash.to_vec()),
-                creation.claim_hash.map(|hash| hash.as_bytes().to_vec()),
-                creation
+        let destination_id = diesel::insert_into(sites::table)
+            .values(NewSite {
+                name: &destination,
+                updated: now,
+                public_url: &public_url,
+                content_revision: revision,
+                tree_hash: "",
+                creator_kind: creation.creator.map(|creator| creator.kind as i64),
+                creator_hash: creation.creator.map(|creator| creator.hash.to_vec()),
+                claim_hash: creation.claim_hash.map(|hash| hash.as_bytes().to_vec()),
+                management_hash: creation
                     .management_hash
                     .map(|hash| hash.as_bytes().to_vec()),
-                i64::from(creation.management_hash.is_some())
-            ],
-        )?;
-        let destination_id = tx.last_insert_rowid();
-        tx.execute(
-            "INSERT INTO files(site_id, path, hash, size)
-             SELECT ?1, path, hash, size FROM files
-             WHERE site_id = (SELECT id FROM sites WHERE name = ?2) AND path <> ?3",
-            params![destination_id, source, MANIFEST_PATH],
-        )?;
-        tx.execute(
-            "INSERT INTO path_aggregates(site_id, path, logical_bytes, file_count)
-             SELECT ?1, path, logical_bytes, file_count
-             FROM path_aggregates WHERE site_id = ?2",
-            params![destination_id, source_id],
-        )?;
-        copy_expiry_policies_locked(&tx, source_id, destination_id, now)?;
-        let files = tx.query_row(
-            "SELECT COUNT(*) FROM files WHERE site_id = ?1",
-            [destination_id],
-            |row| row.get::<_, i64>(0),
-        )?;
-        let tree_hash = regenerate_site(&tx, &self.inner.blob_files, destination_id, now)?;
-        prune_undo_locked(&tx, now)?;
+                management_status: i64::from(creation.management_hash.is_some()),
+            })
+            .returning(sites::id)
+            .get_result::<i64>(&mut *tx)?;
+        let copied_files = files::table
+            .filter(files::site_id.eq(source_id))
+            .filter(files::path.ne(MANIFEST_PATH))
+            .select((files::path, files::hash, files::size))
+            .load::<(String, String, i64)>(&mut *tx)?;
+        for (path, hash, size) in copied_files {
+            diesel::insert_into(files::table)
+                .values(NewFile {
+                    site_id: destination_id,
+                    path: &path,
+                    hash: &hash,
+                    size,
+                })
+                .execute(&mut *tx)?;
+        }
+        let aggregates = path_aggregates::table
+            .filter(path_aggregates::site_id.eq(source_id))
+            .select((
+                path_aggregates::path,
+                path_aggregates::logical_bytes,
+                path_aggregates::file_count,
+            ))
+            .load::<(String, i64, i64)>(&mut *tx)?;
+        for (path, logical_bytes, file_count) in aggregates {
+            diesel::insert_into(path_aggregates::table)
+                .values((
+                    path_aggregates::site_id.eq(destination_id),
+                    path_aggregates::path.eq(path),
+                    path_aggregates::logical_bytes.eq(logical_bytes),
+                    path_aggregates::file_count.eq(file_count),
+                ))
+                .execute(&mut *tx)?;
+        }
+        copy_expiry_policies_locked(&mut tx, source_id, destination_id, now)?;
+        let files = files::table
+            .filter(files::site_id.eq(destination_id))
+            .select(count_star())
+            .first::<i64>(&mut *tx)?;
+        let tree_hash = regenerate_site(&mut tx, &self.inner.blob_files, destination_id, now)?;
+        prune_undo_locked(&mut tx, now)?;
         let mutation = MutationResult {
             created: true,
             changed: true,
@@ -1522,7 +1663,7 @@ impl Store {
                 mutation: mutation.clone(),
             };
             store_idempotency(
-                &tx,
+                &mut tx,
                 &idempotency.key,
                 &fingerprint,
                 IdempotencyKind::AutoCopy,
@@ -1530,7 +1671,7 @@ impl Store {
                 now,
             )?;
         }
-        let removed = gc_blobs(&tx, now)?;
+        let removed = gc_blobs(&mut tx, now)?;
         tx.commit()?;
         drop(db);
         self.remove_blob_files(&removed);
@@ -1556,42 +1697,42 @@ impl Store {
         let destination = parse_site_name(destination)?;
         let now = self.now_millis();
         let mut db = self.inner.writer.lock().unwrap();
-        let tx = db.transaction()?;
-        authorize_locked(&tx, source, authorization)?;
-        if !site_exists_locked(&tx, source)? {
+        let mut tx = DbTransaction::begin(&mut db)?;
+        authorize_locked(&mut tx, source, authorization)?;
+        if !site_exists_locked(&mut tx, source)? {
             return Err(StoreError::NotFound);
         }
-        if site_exists_locked(&tx, destination)? {
+        if site_exists_locked(&mut tx, destination)? {
             return Err(StoreError::DestinationConflict);
         }
         let undo = snapshot_site_with_description(
-            &tx,
+            &mut tx,
             source,
             UndoKind::Move,
             &format!("move {destination} back to {source}"),
             now,
         )?;
-        tx.execute(
-            "INSERT INTO undo_names(token, name) VALUES (?1, ?2)",
-            params![undo.token, destination],
-        )?;
-        tx.execute(
-            "UPDATE sites SET name = ?1, updated = ?2 WHERE name = ?3",
-            params![destination, now, source],
-        )?;
-        let (site_id, revision): (i64, i64) = tx.query_row(
-            "SELECT id, content_revision FROM sites WHERE name = ?1",
-            [destination],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        let files = tx.query_row(
-            "SELECT COUNT(*) FROM files WHERE site_id = ?1 AND path <> ?2",
-            params![site_id, MANIFEST_PATH],
-            |row| row.get::<_, i64>(0),
-        )?;
-        let tree_hash = regenerate_site(&tx, &self.inner.blob_files, site_id, now)?;
-        prune_undo_locked(&tx, now)?;
-        let removed = gc_blobs(&tx, now)?;
+        diesel::insert_into(undo_names::table)
+            .values((
+                undo_names::token.eq(&undo.token),
+                undo_names::name.eq(destination),
+            ))
+            .execute(&mut *tx)?;
+        diesel::update(sites::table.filter(sites::name.eq(source)))
+            .set((sites::name.eq(destination), sites::updated.eq(now)))
+            .execute(&mut *tx)?;
+        let (site_id, revision) = sites::table
+            .filter(sites::name.eq(destination))
+            .select((sites::id, sites::content_revision))
+            .first::<(i64, i64)>(&mut *tx)?;
+        let files = files::table
+            .filter(files::site_id.eq(site_id))
+            .filter(files::path.ne(MANIFEST_PATH))
+            .select(count_star())
+            .first::<i64>(&mut *tx)?;
+        let tree_hash = regenerate_site(&mut tx, &self.inner.blob_files, site_id, now)?;
+        prune_undo_locked(&mut tx, now)?;
+        let removed = gc_blobs(&mut tx, now)?;
         tx.commit()?;
         drop(db);
         self.remove_blob_files(&removed);
@@ -1625,61 +1766,51 @@ impl Store {
         let rel = safe_rel_path(rel)?.to_string_lossy().replace('\\', "/");
         let (prefix_start, prefix_end) = descendant_bounds(&rel);
         let mut db = self.inner.writer.lock().unwrap();
-        let tx = db.transaction()?;
-        authorize_locked(&tx, name, authorization)?;
+        let mut tx = DbTransaction::begin(&mut db)?;
+        authorize_locked(&mut tx, name, authorization)?;
         reject_reserved_path(&rel)?;
-        let site_id: i64 = tx
-            .query_row(
-                "SELECT id FROM sites WHERE name = ?1",
-                params![name],
-                |row| row.get(0),
-            )
-            .map_err(map_sql)?;
+        let site_id = site_id_locked(&mut tx, name)?;
         let undo = snapshot_site_with_description(
-            &tx,
+            &mut tx,
             name,
             UndoKind::DeletePath,
             &format!("restore deleted {rel}"),
             self.now_millis(),
         )?;
-        let removed_files = {
-            let mut statement = tx.prepare(
-                "SELECT path, size FROM files
-                 WHERE site_id = ?1
-                   AND (path = ?2 OR (path >= ?3 AND path < ?4))",
-            )?;
-            statement
-                .query_map(params![site_id, rel, prefix_start, prefix_end], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-                })?
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        let deleted = tx.execute(
-            "DELETE FROM files
-             WHERE site_id = ?1
-               AND (path = ?2 OR (path >= ?3 AND path < ?4))",
-            params![site_id, rel, prefix_start, prefix_end],
-        )?;
+        let target = files::table.filter(files::site_id.eq(site_id)).filter(
+            files::path.eq(&rel).or(files::path
+                .ge(&prefix_start)
+                .and(files::path.lt(&prefix_end))),
+        );
+        let removed_files = target
+            .select((files::path, files::size))
+            .load::<(String, i64)>(&mut *tx)?;
+        let deleted = diesel::delete(target).execute(&mut *tx)?;
         if deleted == 0 {
             return Err(StoreError::NotFound);
         }
         for (path, size) in removed_files {
-            adjust_aggregates_locked(&tx, site_id, &path, -size, -1)?;
+            adjust_aggregates_locked(&mut tx, site_id, &path, -size, -1)?;
         }
-        tx.execute(
-            "DELETE FROM expiry_policies
-             WHERE site_id = ?1 AND (path = ?2 OR (path >= ?3 AND path < ?4))",
-            params![site_id, rel, prefix_start, prefix_end],
-        )?;
-        tx.execute(
-            "UPDATE sites SET content_revision = content_revision + 1 WHERE id = ?1",
-            [site_id],
-        )?;
-        refresh_expiry_for_changes_locked(&tx, site_id, &[&rel], self.now_millis())?;
-        regenerate_site(&tx, &self.inner.blob_files, site_id, self.now_millis())?;
-        prune_undo_locked(&tx, self.now_millis())?;
-        let removed = gc_blobs(&tx, self.now_millis())?;
-        let (revision, tree_hash) = site_revision_locked(&tx, name).unwrap_or((0, String::new()));
+        diesel::delete(
+            expiry_policies::table
+                .filter(expiry_policies::site_id.eq(site_id))
+                .filter(
+                    expiry_policies::path.eq(&rel).or(expiry_policies::path
+                        .ge(&prefix_start)
+                        .and(expiry_policies::path.lt(&prefix_end))),
+                ),
+        )
+        .execute(&mut *tx)?;
+        diesel::update(sites::table.find(site_id))
+            .set(sites::content_revision.eq(sites::content_revision + 1))
+            .execute(&mut *tx)?;
+        refresh_expiry_for_changes_locked(&mut tx, site_id, &[&rel], self.now_millis())?;
+        regenerate_site(&mut tx, &self.inner.blob_files, site_id, self.now_millis())?;
+        prune_undo_locked(&mut tx, self.now_millis())?;
+        let removed = gc_blobs(&mut tx, self.now_millis())?;
+        let (revision, tree_hash) =
+            site_revision_locked(&mut tx, name).unwrap_or((0, String::new()));
         tx.commit()?;
         drop(db);
         self.remove_blob_files(&removed);
@@ -1744,12 +1875,12 @@ impl Store {
         let fingerprint = staged_fingerprint(&files);
         let now = self.now_millis();
         let mut db = self.inner.writer.lock().unwrap();
-        let tx = db.transaction()?;
-        prune_idempotency_locked(&tx, now)?;
+        let mut tx = DbTransaction::begin(&mut db)?;
+        prune_idempotency_locked(&mut tx, now)?;
         if let Some(idempotency) = options.idempotency {
             validate_idempotency_key(&idempotency.key)?;
             if let Some(replay) = idempotency_replay(
-                &tx,
+                &mut tx,
                 &idempotency.key,
                 &fingerprint,
                 IdempotencyKind::UnnamedPut,
@@ -1757,9 +1888,14 @@ impl Store {
                 return Ok((replay.name, replay.mutation));
             }
         }
-        let name = generate_id(|candidate| site_exists_locked(&tx, candidate).unwrap_or(true));
+        let existing_names = sites::table
+            .select(sites::name)
+            .load::<String>(&mut *tx)?
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let name = generate_id(|candidate| existing_names.contains(candidate));
         let mutation = self.merge_staged_locked(
-            &tx,
+            &mut tx,
             &files,
             MergeContext {
                 name: &name,
@@ -1776,7 +1912,7 @@ impl Store {
         };
         if let Some(idempotency) = options.idempotency {
             store_idempotency(
-                &tx,
+                &mut tx,
                 &idempotency.key,
                 &fingerprint,
                 IdempotencyKind::UnnamedPut,
@@ -1784,7 +1920,7 @@ impl Store {
                 now,
             )?;
         }
-        let removed = gc_blobs(&tx, now)?;
+        let removed = gc_blobs(&mut tx, now)?;
         tx.commit()?;
         drop(db);
         self.remove_blob_files(&removed);
@@ -1822,9 +1958,9 @@ impl Store {
         }
         let now = self.now_millis();
         let mut db = self.inner.writer.lock().unwrap();
-        let tx = db.transaction()?;
+        let mut tx = DbTransaction::begin(&mut db)?;
         let mutation = self.merge_staged_locked(
-            &tx,
+            &mut tx,
             &files,
             MergeContext {
                 name,
@@ -1835,7 +1971,7 @@ impl Store {
                 authorization,
             },
         )?;
-        let removed = gc_blobs(&tx, now)?;
+        let removed = gc_blobs(&mut tx, now)?;
         tx.commit()?;
         drop(db);
         self.remove_blob_files(&removed);
@@ -1845,7 +1981,7 @@ impl Store {
     #[allow(clippy::large_types_passed_by_value, clippy::too_many_lines)]
     fn merge_staged_locked(
         &self,
-        tx: &rusqlite::Transaction<'_>,
+        tx: &mut SqliteConnection,
         files: &[&StagedFile],
         context: MergeContext<'_>,
     ) -> Result<MutationResult, StoreError> {
@@ -1874,17 +2010,24 @@ impl Store {
                 });
             }
         }
-        let changed = files.iter().try_fold(false, |changed, file| {
-            let current = tx
-                .query_row(
-                    "SELECT hash FROM files
-                     WHERE site_id = (SELECT id FROM sites WHERE name = ?1) AND path = ?2",
-                    params![name, file.path],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?;
-            Ok::<_, rusqlite::Error>(changed || current.as_deref() != Some(file.hash.as_str()))
-        })?;
+        let existing_site_id = sites::table
+            .filter(sites::name.eq(name))
+            .select(sites::id)
+            .first::<i64>(tx)
+            .optional()?;
+        let mut changed = false;
+        for file in files {
+            let current = if let Some(site_id) = existing_site_id {
+                files::table
+                    .find((site_id, file.path.as_str()))
+                    .select(files::hash)
+                    .first::<String>(tx)
+                    .optional()?
+            } else {
+                None
+            };
+            changed |= current.as_deref() != Some(file.hash.as_str());
+        }
         if !changed {
             let (revision, tree_hash) = site_revision_locked(tx, name)?;
             return Ok(MutationResult {
@@ -1908,48 +2051,53 @@ impl Store {
         };
         let undo = snapshot_site_with_description(tx, name, kind, &description, now)?;
         for file in files {
-            tx.execute(
-                "INSERT OR IGNORE INTO blobs (hash, bytes, size) VALUES (?1, X'', ?2)",
-                params![file.hash, file.size],
-            )?;
+            diesel::insert_into(blobs::table)
+                .values((
+                    blobs::hash.eq(&file.hash),
+                    blobs::bytes.eq(Vec::<u8>::new()),
+                    blobs::size.eq(file.size),
+                ))
+                .on_conflict_do_nothing()
+                .execute(tx)?;
         }
-        tx.execute(
-            "INSERT INTO sites
-                (name, updated, public_url, content_revision, tree_hash,
-                 creator_kind, creator_hash, claim_hash, management_hash, management_status)
-             VALUES (?1, ?2, ?3, 0, '', ?4, ?5, ?6, ?7, ?8)
-             ON CONFLICT(name) DO NOTHING",
-            params![
+        diesel::insert_into(sites::table)
+            .values(NewSite {
                 name,
-                now,
-                self.inner.public_url,
-                creation.creator.map(|creator| creator.kind as i64),
-                creation.creator.map(|creator| creator.hash.to_vec()),
-                creation.claim_hash.map(|hash| hash.as_bytes().to_vec()),
-                creation
+                updated: now,
+                public_url: &self.inner.public_url,
+                content_revision: 0,
+                tree_hash: "",
+                creator_kind: creation.creator.map(|creator| creator.kind as i64),
+                creator_hash: creation.creator.map(|creator| creator.hash.to_vec()),
+                claim_hash: creation.claim_hash.map(|hash| hash.as_bytes().to_vec()),
+                management_hash: creation
                     .management_hash
                     .map(|hash| hash.as_bytes().to_vec()),
-                i64::from(creation.management_hash.is_some())
-            ],
-        )?;
-        let site_id: i64 = tx.query_row(
-            "SELECT id FROM sites WHERE name = ?1",
-            params![name],
-            |row| row.get(0),
-        )?;
+                management_status: i64::from(creation.management_hash.is_some()),
+            })
+            .on_conflict_do_nothing()
+            .execute(tx)?;
+        let site_id = site_id_locked(tx, name)?;
         for file in files {
-            let previous_size = tx
-                .query_row(
-                    "SELECT size FROM files WHERE site_id = ?1 AND path = ?2",
-                    params![site_id, file.path],
-                    |row| row.get::<_, i64>(0),
-                )
+            let previous_size = files::table
+                .find((site_id, file.path.as_str()))
+                .select(files::size)
+                .first::<i64>(tx)
                 .optional()?;
-            tx.execute(
-                "INSERT INTO files (site_id, path, hash, size) VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(site_id, path) DO UPDATE SET hash = excluded.hash, size = excluded.size",
-                params![site_id, file.path, file.hash, file.size],
-            )?;
+            diesel::insert_into(files::table)
+                .values(NewFile {
+                    site_id,
+                    path: &file.path,
+                    hash: &file.hash,
+                    size: file.size,
+                })
+                .on_conflict((files::site_id, files::path))
+                .do_update()
+                .set((
+                    files::hash.eq(excluded(files::hash)),
+                    files::size.eq(excluded(files::size)),
+                ))
+                .execute(tx)?;
             adjust_aggregates_locked(
                 tx,
                 site_id,
@@ -1959,18 +2107,16 @@ impl Store {
             )?;
         }
         let revision = if existed {
-            tx.query_row(
-                "SELECT content_revision + 1 FROM sites WHERE id = ?1",
-                [site_id],
-                |row| row.get::<_, i64>(0),
-            )?
+            sites::table
+                .find(site_id)
+                .select(sites::content_revision + 1)
+                .first::<i64>(tx)?
         } else {
             1
         };
-        tx.execute(
-            "UPDATE sites SET updated = ?1, content_revision = ?2 WHERE id = ?3",
-            params![now, revision, site_id],
-        )?;
+        diesel::update(sites::table.find(site_id))
+            .set((sites::updated.eq(now), sites::content_revision.eq(revision)))
+            .execute(tx)?;
         let changed_paths = files
             .iter()
             .map(|file| file.path.as_str())
@@ -2009,12 +2155,10 @@ impl Store {
 
     fn migrate_sqlite_blobs(&self) -> Result<(), StoreError> {
         let mut db = self.inner.writer.lock().unwrap();
-        let migrated = db
-            .query_row(
-                "SELECT 1 FROM metadata WHERE key = 'external_blobs_v1'",
-                [],
-                |_| Ok(()),
-            )
+        let migrated = metadata::table
+            .find("external_blobs_v1")
+            .select(metadata::key)
+            .first::<String>(&mut *db)
             .optional()?
             .is_some();
         if migrated {
@@ -2022,16 +2166,11 @@ impl Store {
         }
 
         {
-            let mut stmt = db.prepare("SELECT hash, bytes, size FROM blobs ORDER BY hash")?;
-            let rows = stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })?;
-            for row in rows {
-                let (hash, bytes, size) = row?;
+            let rows = blobs::table
+                .select((blobs::hash, blobs::bytes, blobs::size))
+                .order(blobs::hash)
+                .load::<(String, Vec<u8>, i64)>(&mut *db)?;
+            for (hash, bytes, size) in rows {
                 if i64::try_from(bytes.len()).expect("blob size fits in i64") != size
                     || blake3::hash(&bytes).to_hex().as_str() != hash
                 {
@@ -2045,14 +2184,18 @@ impl Store {
             }
         }
 
-        let tx = db.transaction()?;
-        tx.execute("UPDATE blobs SET bytes = X''", [])?;
-        tx.execute(
-            "INSERT INTO metadata (key, value) VALUES ('external_blobs_v1', '1')",
-            [],
-        )?;
+        let mut tx = DbTransaction::begin(&mut db)?;
+        diesel::update(blobs::table)
+            .set(blobs::bytes.eq(Vec::<u8>::new()))
+            .execute(&mut *tx)?;
+        diesel::insert_into(metadata::table)
+            .values((
+                metadata::key.eq("external_blobs_v1"),
+                metadata::value.eq("1"),
+            ))
+            .execute(&mut *tx)?;
         tx.commit()?;
-        if let Err(err) = db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;") {
+        if let Err(err) = db.batch_execute("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;") {
             tracing::warn!(%err, "blob migration succeeded but database compaction failed");
         }
         drop(db);
@@ -2061,8 +2204,8 @@ impl Store {
 
     fn migrate_legacy(&self) -> Result<(), StoreError> {
         {
-            let db = self.inner.writer.lock().unwrap();
-            let n: i64 = db.query_row("SELECT COUNT(*) FROM sites", [], |row| row.get(0))?;
+            let mut db = self.inner.writer.lock().unwrap();
+            let n = sites::table.select(count_star()).first::<i64>(&mut *db)?;
             drop(db);
             if n > 0 {
                 return Ok(());
@@ -2134,13 +2277,14 @@ impl Store {
 
     fn gc_junk(&self) -> Result<(), StoreError> {
         let mut db = self.inner.writer.lock().unwrap();
-        let tx = db.transaction()?;
+        let mut tx = DbTransaction::begin(&mut db)?;
         let mut apple = HashSet::new();
         {
-            let mut stmt = tx.prepare("SELECT hash FROM blobs WHERE size <= 65536")?;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-            for row in rows {
-                let hash = row?;
+            let rows = blobs::table
+                .filter(blobs::size.le(65_536_i64))
+                .select(blobs::hash)
+                .load::<String>(&mut *tx)?;
+            for hash in rows {
                 let mut prefix = [0_u8; 4];
                 let read = fs::File::open(self.inner.blob_files.path(&hash))?.read(&mut prefix)?;
                 if looks_like_apple_fork(&prefix[..read]) {
@@ -2150,16 +2294,10 @@ impl Store {
         }
         let mut junk = Vec::new();
         {
-            let mut stmt = tx.prepare("SELECT site_id, path, hash FROM files")?;
-            let rows = stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })?;
-            for row in rows {
-                let (site_id, path, hash) = row?;
+            let rows = files::table
+                .select((files::site_id, files::path, files::hash))
+                .load::<(i64, String, String)>(&mut *tx)?;
+            for (site_id, path, hash) in rows {
                 if is_junk(Path::new(&path), None) || apple.contains(&hash) {
                     junk.push((site_id, path));
                 }
@@ -2167,23 +2305,19 @@ impl Store {
         }
         let mut sites = HashSet::new();
         for (site_id, path) in &junk {
-            tx.execute(
-                "DELETE FROM files WHERE site_id = ?1 AND path = ?2",
-                params![site_id, path],
-            )?;
+            diesel::delete(files::table.find((*site_id, path.as_str()))).execute(&mut *tx)?;
             sites.insert(*site_id);
         }
         for site_id in sites {
-            let remaining: i64 = tx.query_row(
-                "SELECT COUNT(*) FROM files WHERE site_id = ?1",
-                params![site_id],
-                |row| row.get(0),
-            )?;
+            let remaining = files::table
+                .filter(files::site_id.eq(site_id))
+                .select(count_star())
+                .first::<i64>(&mut *tx)?;
             if remaining == 0 {
-                tx.execute("DELETE FROM sites WHERE id = ?1", params![site_id])?;
+                diesel::delete(sites::table.find(site_id)).execute(&mut *tx)?;
             }
         }
-        let removed = gc_blobs(&tx, self.now_millis())?;
+        let removed = gc_blobs(&mut tx, self.now_millis())?;
         tx.commit()?;
         drop(db);
         self.remove_blob_files(&removed);
@@ -2191,12 +2325,12 @@ impl Store {
     }
 
     fn gc_blob_files(&self) -> Result<(), StoreError> {
-        let db = self.inner.readers.get();
-        let mut stmt = db.prepare("SELECT hash FROM blobs")?;
-        let live = stmt
-            .query_map([], |row| row.get(0))?
-            .collect::<Result<HashSet<String>, _>>()?;
-        drop(stmt);
+        let mut db = self.inner.readers.get();
+        let live = blobs::table
+            .select(blobs::hash)
+            .load::<String>(&mut *db)?
+            .into_iter()
+            .collect::<HashSet<_>>();
         drop(db);
         self.inner.blob_files.retain(&live)?;
         Ok(())
@@ -2205,30 +2339,38 @@ impl Store {
     pub fn undo_stack(&self, name: &str) -> Result<UndoStack, StoreError> {
         let name = parse_site_name(name)?;
         let now = self.now_millis();
-        let db = self.inner.readers.get();
-        let mut stmt = db.prepare(
-            "SELECT operation.token, operation.kind, operation.description,
-                    operation.created, operation.expires
-             FROM undo_operations AS operation
-             JOIN undo_names AS names ON names.token = operation.token
-             WHERE names.name = ?1 AND operation.consumed = 0 AND operation.expires > ?2
-             ORDER BY operation.created DESC, operation.rowid DESC",
-        )?;
-        let entries = stmt
-            .query_map(params![name, now], |row| {
-                let created = row.get::<_, i64>(3)?;
-                let expires = row.get::<_, i64>(4)?;
+        let mut db = self.inner.readers.get();
+        let rows = undo_operations::table
+            .inner_join(undo_names::table.on(undo_names::token.eq(undo_operations::token)))
+            .filter(undo_names::name.eq(name))
+            .filter(undo_operations::consumed.eq(0_i64))
+            .filter(undo_operations::expires.gt(now))
+            .select((
+                undo_operations::token,
+                undo_operations::kind,
+                undo_operations::description,
+                undo_operations::created,
+                undo_operations::expires,
+            ))
+            .order((
+                undo_operations::created.desc(),
+                undo_operations::rowid.desc(),
+            ))
+            .load::<(String, i64, String, i64, i64)>(&mut *db)?;
+        let entries = rows
+            .into_iter()
+            .map(|(token, kind, description, created, expires)| {
                 Ok(UndoEntry {
-                    token: row.get(0)?,
-                    kind: UndoKind::from_i64(row.get(1)?).as_str().to_string(),
-                    description: row.get(2)?,
+                    token,
+                    kind: UndoKind::from_i64(kind)?.as_str().to_string(),
+                    description,
                     created_at: format_timestamp(created),
                     expires_at: format_timestamp(expires),
                     remaining_seconds: u64::try_from((expires - now).max(0) / 1000)
                         .expect("remaining time is non-negative"),
                 })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?;
         Ok(UndoStack {
             site: name.to_string(),
             entries,
@@ -2250,110 +2392,114 @@ impl Store {
         let name = parse_site_name(name)?;
         let now = self.now_millis();
         let mut db = self.inner.writer.lock().unwrap();
-        let tx = db.transaction()?;
-        authorize_locked(&tx, name, authorization)?;
-        let latest = tx
-            .query_row(
-                "SELECT operation.token
-                 FROM undo_operations AS operation
-                 JOIN undo_names AS names ON names.token = operation.token
-                 WHERE names.name = ?1 AND operation.consumed = 0 AND operation.expires > ?2
-                 ORDER BY operation.created DESC, operation.rowid DESC
-                 LIMIT 1",
-                params![name, now],
-                |row| row.get::<_, String>(0),
-            )
+        let mut tx = DbTransaction::begin(&mut db)?;
+        authorize_locked(&mut tx, name, authorization)?;
+        let latest = undo_operations::table
+            .inner_join(undo_names::table.on(undo_names::token.eq(undo_operations::token)))
+            .filter(undo_names::name.eq(name))
+            .filter(undo_operations::consumed.eq(0_i64))
+            .filter(undo_operations::expires.gt(now))
+            .select(undo_operations::token)
+            .order((
+                undo_operations::created.desc(),
+                undo_operations::rowid.desc(),
+            ))
+            .first::<String>(&mut *tx)
             .optional()?
             .ok_or(StoreError::NotFound)?;
         if guard.is_some_and(|token| token != latest) {
             return Err(StoreError::StaleUndo(latest));
         }
-        let snapshot = tx.query_row(
-            "SELECT name, existed, public_url, updated, content_revision, tree_hash
-             FROM undo_sites WHERE token = ?1",
-            [&latest],
-            |row| {
-                Ok(SiteSnapshot {
-                    name: row.get(0)?,
-                    existed: row.get(1)?,
-                    public_url: row.get(2)?,
-                    updated: row.get(3)?,
-                    content_revision: row.get(4)?,
-                    tree_hash: row.get(5)?,
-                })
-            },
-        )?;
-        {
-            let mut stmt = tx.prepare("SELECT name FROM undo_names WHERE token = ?1")?;
-            let names = stmt
-                .query_map([&latest], |row| row.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()?;
-            for name in names {
-                retain_management_tombstone(&tx, &name, now)?;
-                tx.execute("DELETE FROM sites WHERE name = ?1", [name])?;
-            }
+        let (snapshot_name, existed, public_url, updated, content_revision, tree_hash) =
+            undo_sites::table
+                .find(&latest)
+                .select((
+                    undo_sites::name,
+                    undo_sites::existed,
+                    undo_sites::public_url,
+                    undo_sites::updated,
+                    undo_sites::content_revision,
+                    undo_sites::tree_hash,
+                ))
+                .first::<(String, i64, String, i64, i64, String)>(&mut *tx)?;
+        let snapshot = SiteSnapshot {
+            name: snapshot_name,
+            existed: existed != 0,
+            public_url,
+            updated,
+            content_revision,
+            tree_hash,
+        };
+        let names = undo_names::table
+            .filter(undo_names::token.eq(&latest))
+            .select(undo_names::name)
+            .load::<String>(&mut *tx)?;
+        for name in names {
+            retain_management_tombstone(&mut tx, &name, now)?;
+            diesel::delete(sites::table.filter(sites::name.eq(name))).execute(&mut *tx)?;
         }
         if snapshot.existed {
-            tx.execute(
-                "INSERT INTO sites
-                    (name, updated, public_url, content_revision, tree_hash)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    snapshot.name,
-                    snapshot.updated,
-                    snapshot.public_url,
-                    snapshot.content_revision,
-                    snapshot.tree_hash
-                ],
-            )?;
-            let site_id = tx.last_insert_rowid();
-            let retained_hash = tx
-                .query_row(
-                    "SELECT management_hash FROM management_tombstones
-                     WHERE name IN (SELECT name FROM undo_names WHERE token = ?1)
-                     LIMIT 1",
-                    [&latest],
-                    |row| row.get::<_, Vec<u8>>(0),
-                )
+            let site_id = diesel::insert_into(sites::table)
+                .values(NewSite {
+                    name: &snapshot.name,
+                    updated: snapshot.updated,
+                    public_url: &snapshot.public_url,
+                    content_revision: snapshot.content_revision,
+                    tree_hash: &snapshot.tree_hash,
+                    creator_kind: None,
+                    creator_hash: None,
+                    claim_hash: None,
+                    management_hash: None,
+                    management_status: 0,
+                })
+                .returning(sites::id)
+                .get_result::<i64>(&mut *tx)?;
+            let retained_hash = management_tombstones::table
+                .inner_join(undo_names::table.on(undo_names::name.eq(management_tombstones::name)))
+                .filter(undo_names::token.eq(&latest))
+                .select(management_tombstones::management_hash)
+                .first::<Vec<u8>>(&mut *tx)
                 .optional()?;
             if let Some(hash) = retained_hash {
-                tx.execute(
-                    "UPDATE sites
-                     SET management_hash = ?1, management_status = 1
-                     WHERE id = ?2",
-                    params![hash, site_id],
-                )?;
+                diesel::update(sites::table.find(site_id))
+                    .set((
+                        sites::management_hash.eq(Some(hash)),
+                        sites::management_status.eq(1_i64),
+                    ))
+                    .execute(&mut *tx)?;
             }
-            tx.execute(
-                "INSERT INTO files (site_id, path, hash, size)
-                 SELECT ?1, path, hash, size FROM undo_files WHERE token = ?2",
-                params![site_id, latest],
-            )?;
-            tx.execute(
-                "INSERT INTO expiry_policies
-                    (site_id, path, target_kind, mode, duration_seconds, deadline,
-                     min_age_seconds, max_age_seconds, max_size_bytes, power,
-                     refreshed, own_deadline, size_bytes)
-                 SELECT ?1, path, target_kind, mode, duration_seconds, deadline,
-                        min_age_seconds, max_age_seconds, max_size_bytes, power,
-                        refreshed, own_deadline, size_bytes
-                 FROM undo_expiry_policies WHERE token = ?2",
-                params![site_id, latest],
-            )?;
-            rebuild_aggregates_locked(&tx, site_id)?;
-            regenerate_site(&tx, &self.inner.blob_files, site_id, snapshot.updated)?;
-            tx.execute(
-                "DELETE FROM management_tombstones
-                 WHERE name IN (SELECT name FROM undo_names WHERE token = ?1)",
-                [&latest],
-            )?;
+            let saved_files = undo_files::table
+                .filter(undo_files::token.eq(&latest))
+                .select((undo_files::path, undo_files::hash, undo_files::size))
+                .load::<(String, String, i64)>(&mut *tx)?;
+            for (path, hash, size) in saved_files {
+                diesel::insert_into(files::table)
+                    .values(NewFile {
+                        site_id,
+                        path: &path,
+                        hash: &hash,
+                        size,
+                    })
+                    .execute(&mut *tx)?;
+            }
+            restore_expiry_policies_locked(&mut tx, &latest, site_id)?;
+            rebuild_aggregates_locked(&mut tx, site_id)?;
+            regenerate_site(&mut tx, &self.inner.blob_files, site_id, snapshot.updated)?;
+            let tombstone_names = undo_names::table
+                .filter(undo_names::token.eq(&latest))
+                .select(undo_names::name)
+                .load::<String>(&mut *tx)?;
+            diesel::delete(
+                management_tombstones::table
+                    .filter(management_tombstones::name.eq_any(tombstone_names)),
+            )
+            .execute(&mut *tx)?;
         }
-        tx.execute(
-            "UPDATE undo_operations SET consumed = 1 WHERE token = ?1",
-            [&latest],
-        )?;
-        prune_undo_locked(&tx, now)?;
-        let removed = gc_blobs(&tx, now)?;
+        diesel::update(undo_operations::table.find(&latest))
+            .set(undo_operations::consumed.eq(1_i64))
+            .execute(&mut *tx)?;
+        prune_undo_locked(&mut tx, now)?;
+        let removed = gc_blobs(&mut tx, now)?;
         tx.commit()?;
         drop(db);
         self.remove_blob_files(&removed);
@@ -2384,23 +2530,19 @@ impl Store {
         let policy = policy.map(ExpiryPolicy::validate).transpose()?;
         let now = self.now_millis();
         let mut db = self.inner.writer.lock().unwrap();
-        let tx = db.transaction()?;
-        authorize_locked(&tx, name, authorization)?;
-        let kind = expiry_target_kind_locked(&tx, name, &rel)?;
-        let site_id: i64 = tx.query_row("SELECT id FROM sites WHERE name = ?1", [name], |row| {
-            row.get(0)
-        })?;
-        let previous = tx
-            .query_row(
-                "SELECT 1 FROM expiry_policies WHERE site_id = ?1 AND path = ?2",
-                params![site_id, rel],
-                |_| Ok(()),
-            )
+        let mut tx = DbTransaction::begin(&mut db)?;
+        authorize_locked(&mut tx, name, authorization)?;
+        let kind = expiry_target_kind_locked(&mut tx, name, &rel)?;
+        let site_id = site_id_locked(&mut tx, name)?;
+        let previous = expiry_policies::table
+            .find((site_id, rel.as_str()))
+            .select(expiry_policies::site_id)
+            .first::<i64>(&mut *tx)
             .optional()?
             .is_some();
         let undo = if previous || policy.is_some() {
             Some(snapshot_site_with_description(
-                &tx,
+                &mut tx,
                 name,
                 UndoKind::Expiry,
                 &format!(
@@ -2413,9 +2555,9 @@ impl Store {
             None
         };
         if let Some(policy) = policy {
-            let size = expiry_target_size_locked(&tx, site_id, &rel, kind)?;
+            let size = expiry_target_size_locked(&mut tx, site_id, &rel, kind)?;
             store_expiry_policy_locked(
-                &tx,
+                &mut tx,
                 ExpiryPolicyWrite {
                     site_id,
                     path: &rel,
@@ -2426,13 +2568,11 @@ impl Store {
                 },
             )?;
         } else {
-            tx.execute(
-                "DELETE FROM expiry_policies WHERE site_id = ?1 AND path = ?2",
-                params![site_id, rel],
-            )?;
+            diesel::delete(expiry_policies::table.find((site_id, rel.as_str())))
+                .execute(&mut *tx)?;
         }
-        regenerate_site(&tx, &self.inner.blob_files, site_id, now)?;
-        prune_undo_locked(&tx, now)?;
+        regenerate_site(&mut tx, &self.inner.blob_files, site_id, now)?;
+        prune_undo_locked(&mut tx, now)?;
         tx.commit()?;
         drop(db);
         let report = self.expiry_report(name, &rel)?;
@@ -2455,18 +2595,13 @@ impl Store {
 
     pub fn expiry_site_report(&self, name: &str) -> Result<ExpirySiteReport, StoreError> {
         let name = parse_site_name(name)?;
-        let db = self.inner.readers.get();
-        let site_id = db
-            .query_row("SELECT id FROM sites WHERE name = ?1", [name], |row| {
-                row.get::<_, i64>(0)
-            })
-            .map_err(map_sql)?;
-        let mut statement =
-            db.prepare("SELECT path FROM expiry_policies WHERE site_id = ?1 ORDER BY path")?;
-        let paths = statement
-            .query_map([site_id], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(statement);
+        let mut db = self.inner.readers.get();
+        let site_id = site_id_locked(&mut db, name)?;
+        let paths = expiry_policies::table
+            .filter(expiry_policies::site_id.eq(site_id))
+            .select(expiry_policies::path)
+            .order(expiry_policies::path)
+            .load::<String>(&mut *db)?;
         drop(db);
         let entries = paths
             .into_iter()
@@ -2482,16 +2617,14 @@ impl Store {
         let name = parse_site_name(name)?;
         let rel = normalize_rel(rel)?;
         let now = self.now_millis();
-        let db = self.inner.readers.get();
-        let kind = expiry_target_kind_locked(&db, name, &rel)?;
-        let site_id: i64 = db.query_row("SELECT id FROM sites WHERE name = ?1", [name], |row| {
-            row.get(0)
-        })?;
-        let size = expiry_target_size_locked(&db, site_id, &rel, kind)?;
-        let own = load_expiry_policy_locked(&db, site_id, &rel)?;
+        let mut db = self.inner.readers.get();
+        let kind = expiry_target_kind_locked(&mut db, name, &rel)?;
+        let site_id = site_id_locked(&mut db, name)?;
+        let size = expiry_target_size_locked(&mut db, site_id, &rel, kind)?;
+        let own = load_expiry_policy_locked(&mut db, site_id, &rel)?;
         let mut inherited = Vec::new();
         for ancestor in expiry_ancestor_paths(&rel) {
-            if let Some(stored) = load_expiry_policy_locked(&db, site_id, &ancestor)? {
+            if let Some(stored) = load_expiry_policy_locked(&mut db, site_id, &ancestor)? {
                 inherited.push((ancestor, stored));
             }
         }
@@ -2535,10 +2668,10 @@ impl Store {
     }
 
     pub fn next_expiry_delay(&self) -> Result<std::time::Duration, StoreError> {
-        let db = self.inner.readers.get();
-        let next = db.query_row("SELECT MIN(own_deadline) FROM expiry_policies", [], |row| {
-            row.get::<_, Option<i64>>(0)
-        })?;
+        let mut db = self.inner.readers.get();
+        let next = expiry_policies::table
+            .select(min(expiry_policies::own_deadline))
+            .first::<Option<i64>>(&mut *db)?;
         let millis = next.map_or(60_000, |deadline| {
             deadline.saturating_sub(self.now_millis()).clamp(0, 60_000)
         });
@@ -2547,53 +2680,46 @@ impl Store {
         ))
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn sweep_expired(&self) -> Result<usize, StoreError> {
         let now = self.now_millis();
         let mut db = self.inner.writer.lock().unwrap();
-        let tx = db.transaction()?;
-        let due = {
-            let mut stmt = tx.prepare(
-                "SELECT sites.name, expiry_policies.path, expiry_policies.target_kind
-                 FROM expiry_policies
-                 JOIN sites ON sites.id = expiry_policies.site_id
-                 WHERE expiry_policies.own_deadline <= ?1
-                 ORDER BY sites.id, expiry_policies.target_kind, expiry_policies.path",
-            )?;
-            stmt.query_map([now], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?
-        };
+        let mut tx = DbTransaction::begin(&mut db)?;
+        let due = expiry_policies::table
+            .inner_join(sites::table)
+            .filter(expiry_policies::own_deadline.le(now))
+            .select((
+                sites::name,
+                expiry_policies::path,
+                expiry_policies::target_kind,
+            ))
+            .order((
+                sites::id,
+                expiry_policies::target_kind,
+                expiry_policies::path,
+            ))
+            .load::<(String, String, i64)>(&mut *tx)?;
         let mut swept_sites = HashSet::new();
         let mut removed_targets = 0;
         for (name, path, raw_kind) in due {
-            if !site_exists_locked(&tx, &name)? {
+            if !site_exists_locked(&mut tx, &name)? {
                 continue;
             }
             let kind = ExpiryTargetKind::try_from(raw_kind)?;
-            let site_id: i64 =
-                tx.query_row("SELECT id FROM sites WHERE name = ?1", [&name], |row| {
-                    row.get(0)
-                })?;
-            let still_due = tx
-                .query_row(
-                    "SELECT own_deadline <= ?3 FROM expiry_policies
-                 WHERE site_id = ?1 AND path = ?2",
-                    params![site_id, path, now],
-                    |row| row.get::<_, bool>(0),
-                )
+            let site_id = site_id_locked(&mut tx, &name)?;
+            let deadline = expiry_policies::table
+                .find((site_id, path.as_str()))
+                .select(expiry_policies::own_deadline)
+                .first::<Option<i64>>(&mut *tx)
                 .optional()?
-                .unwrap_or(false);
+                .flatten();
+            let still_due = deadline.is_some_and(|deadline| deadline <= now);
             if !still_due {
                 continue;
             }
             if swept_sites.insert(name.clone()) {
                 snapshot_site_with_description(
-                    &tx,
+                    &mut tx,
                     &name,
                     UndoKind::ExpireSweep,
                     &format!("restore expired content in {name}"),
@@ -2602,38 +2728,68 @@ impl Store {
             }
             match kind {
                 ExpiryTargetKind::Site => {
-                    retain_management_tombstone(&tx, &name, now)?;
-                    tx.execute("DELETE FROM sites WHERE id = ?1", [site_id])?;
+                    retain_management_tombstone(&mut tx, &name, now)?;
+                    diesel::delete(sites::table.find(site_id)).execute(&mut *tx)?;
                 }
                 ExpiryTargetKind::File => {
-                    tx.execute(
-                        "DELETE FROM files WHERE site_id = ?1 AND path = ?2",
-                        params![site_id, path],
+                    let size = files::table
+                        .find((site_id, path.as_str()))
+                        .select(files::size)
+                        .first::<i64>(&mut *tx)?;
+                    diesel::delete(files::table.find((site_id, path.as_str())))
+                        .execute(&mut *tx)?;
+                    adjust_aggregates_locked(&mut tx, site_id, &path, -size, -1)?;
+                    diesel::delete(expiry_policies::table.find((site_id, path.as_str())))
+                        .execute(&mut *tx)?;
+                    finish_partial_expiry_locked(
+                        &mut tx,
+                        &self.inner.blob_files,
+                        site_id,
+                        &path,
+                        now,
                     )?;
-                    tx.execute(
-                        "DELETE FROM expiry_policies WHERE site_id = ?1 AND path = ?2",
-                        params![site_id, path],
-                    )?;
-                    finish_partial_expiry_locked(&tx, &self.inner.blob_files, site_id, &path, now)?;
                 }
                 ExpiryTargetKind::Folder => {
                     let (start, end) = descendant_bounds(&path);
-                    tx.execute(
-                        "DELETE FROM files WHERE site_id = ?1 AND path >= ?2 AND path < ?3",
-                        params![site_id, start, end],
+                    let removed_files = files::table
+                        .filter(files::site_id.eq(site_id))
+                        .filter(files::path.ge(&start))
+                        .filter(files::path.lt(&end))
+                        .select((files::path, files::size))
+                        .load::<(String, i64)>(&mut *tx)?;
+                    diesel::delete(
+                        files::table
+                            .filter(files::site_id.eq(site_id))
+                            .filter(files::path.ge(&start))
+                            .filter(files::path.lt(&end)),
+                    )
+                    .execute(&mut *tx)?;
+                    for (removed_path, size) in removed_files {
+                        adjust_aggregates_locked(&mut tx, site_id, &removed_path, -size, -1)?;
+                    }
+                    diesel::delete(
+                        expiry_policies::table
+                            .filter(expiry_policies::site_id.eq(site_id))
+                            .filter(
+                                expiry_policies::path.eq(&path).or(expiry_policies::path
+                                    .ge(&start)
+                                    .and(expiry_policies::path.lt(&end))),
+                            ),
+                    )
+                    .execute(&mut *tx)?;
+                    finish_partial_expiry_locked(
+                        &mut tx,
+                        &self.inner.blob_files,
+                        site_id,
+                        &path,
+                        now,
                     )?;
-                    tx.execute(
-                        "DELETE FROM expiry_policies
-                         WHERE site_id = ?1 AND (path = ?2 OR (path >= ?3 AND path < ?4))",
-                        params![site_id, path, start, end],
-                    )?;
-                    finish_partial_expiry_locked(&tx, &self.inner.blob_files, site_id, &path, now)?;
                 }
             }
             removed_targets += 1;
         }
-        prune_undo_locked(&tx, now)?;
-        let removed = gc_blobs(&tx, now)?;
+        prune_undo_locked(&mut tx, now)?;
+        let removed = gc_blobs(&mut tx, now)?;
         tx.commit()?;
         drop(db);
         self.remove_blob_files(&removed);
@@ -2643,22 +2799,24 @@ impl Store {
     fn backfill_manifests(&self) -> Result<(), StoreError> {
         let now = self.now_millis();
         let mut db = self.inner.writer.lock().unwrap();
-        let tx = db.transaction()?;
-        let ids = {
-            let mut stmt = tx.prepare("SELECT id FROM sites ORDER BY id")?;
-            stmt.query_map([], |row| row.get::<_, i64>(0))?
-                .collect::<Result<Vec<_>, _>>()?
-        };
+        let mut tx = DbTransaction::begin(&mut db)?;
+        let ids = sites::table
+            .select(sites::id)
+            .order(sites::id)
+            .load::<i64>(&mut *tx)?;
         for site_id in ids {
-            tx.execute(
-                "UPDATE sites
-                 SET public_url = ?1,
-                     content_revision = CASE WHEN content_revision = 0 THEN 1 ELSE content_revision END
-                 WHERE id = ?2",
-                params![self.inner.public_url, site_id],
-            )?;
-            rebuild_aggregates_locked(&tx, site_id)?;
-            regenerate_site(&tx, &self.inner.blob_files, site_id, now)?;
+            let revision = sites::table
+                .find(site_id)
+                .select(sites::content_revision)
+                .first::<i64>(&mut *tx)?;
+            diesel::update(sites::table.find(site_id))
+                .set((
+                    sites::public_url.eq(&self.inner.public_url),
+                    sites::content_revision.eq(if revision == 0 { 1 } else { revision }),
+                ))
+                .execute(&mut *tx)?;
+            rebuild_aggregates_locked(&mut tx, site_id)?;
+            regenerate_site(&mut tx, &self.inner.blob_files, site_id, now)?;
         }
         tx.commit()?;
         drop(db);
@@ -2668,10 +2826,10 @@ impl Store {
     fn prune_undo_and_gc(&self) -> Result<(), StoreError> {
         let now = self.now_millis();
         let mut db = self.inner.writer.lock().unwrap();
-        let tx = db.transaction()?;
-        prune_undo_locked(&tx, now)?;
-        prune_idempotency_locked(&tx, now)?;
-        let removed = gc_blobs(&tx, now)?;
+        let mut tx = DbTransaction::begin(&mut db)?;
+        prune_undo_locked(&mut tx, now)?;
+        prune_idempotency_locked(&mut tx, now)?;
+        let removed = gc_blobs(&mut tx, now)?;
         tx.commit()?;
         drop(db);
         self.remove_blob_files(&removed);
@@ -2684,10 +2842,11 @@ impl Store {
 
     fn tmp_dir(&self, name: &str) -> PathBuf {
         let t = self.now_millis();
+        let generation = self.inner.temp_generation.fetch_add(1, Ordering::Relaxed);
         self.inner
             .root
             .join("tmp")
-            .join(format!("{name}-{}-{t}", std::process::id()))
+            .join(format!("{name}-{}-{t}-{generation}", std::process::id()))
     }
 }
 
@@ -2718,16 +2877,17 @@ impl UndoKind {
         }
     }
 
-    const fn from_i64(value: i64) -> Self {
+    const fn from_i64(value: i64) -> Result<Self, StoreError> {
         match value {
-            2 => Self::DeletePath,
-            3 => Self::DeleteSite,
-            4 => Self::Copy,
-            5 => Self::Move,
-            6 => Self::Expiry,
-            7 => Self::ExpireSweep,
-            8 => Self::PutFile,
-            _ => Self::Put,
+            1 => Ok(Self::Put),
+            2 => Ok(Self::DeletePath),
+            3 => Ok(Self::DeleteSite),
+            4 => Ok(Self::Copy),
+            5 => Ok(Self::Move),
+            6 => Ok(Self::Expiry),
+            7 => Ok(Self::ExpireSweep),
+            8 => Ok(Self::PutFile),
+            _ => Err(StoreError::UnsupportedUndoKind(value)),
         }
     }
 }
@@ -2783,251 +2943,39 @@ struct ExpiryPolicyWrite<'a> {
     now: i64,
 }
 
-fn run_migrations(db: &mut Connection) -> Result<(), StoreError> {
-    let mut version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if version == 0 {
-        let tx = db.transaction()?;
-        tx.execute_batch(SCHEMA)?;
-        tx.pragma_update(None, "user_version", 1)?;
-        tx.commit()?;
-        version = 1;
-    }
-    if version == 1 {
-        let collisions = {
-            let mut stmt = db.prepare(
-                "SELECT sites.name, files.path FROM files JOIN sites ON sites.id = files.site_id",
-            )?;
-            stmt.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .filter(|(_, path)| path != MANIFEST_PATH && is_reserved_path(path))
-            .collect::<Vec<_>>()
-        };
-        if let Some((site, path)) = collisions.first() {
-            return Err(StoreError::ReservedCollision(format!("{site}/{path}")));
-        }
-        migrate_lifecycle_schema(db)?;
-        version = 3;
-    }
-    if version == 2 {
-        migrate_expiry_schema(db)?;
-        version = 3;
-    }
-    if version == 3 {
-        migrate_management_schema(db)?;
-        version = 4;
-    }
-    if version == 4 {
-        migrate_aggregates_schema(db)?;
-        version = 5;
-    }
-    if version == 5 {
-        migrate_management_audit_ip(db)?;
-        version = LATEST_SCHEMA_VERSION;
-    }
-    if version != LATEST_SCHEMA_VERSION {
+fn run_migrations(db: &mut SqliteConnection) -> Result<(), StoreError> {
+    let version = diesel::sql_query("PRAGMA user_version")
+        .get_result::<SchemaVersion>(db)?
+        .user_version;
+    let legacy_v2 = version == 2;
+    if legacy_v2 {
+        db.batch_execute(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/migrations/legacy_v2_to_v6.sql"
+        )))?;
+    } else if version != 0 && version != LATEST_SCHEMA_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unsupported database schema version {version}"),
         )
         .into());
     }
-    let integrity: String = db.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    db.run_pending_migrations(MIGRATIONS)?;
+    if legacy_v2 {
+        db.transaction::<_, StoreError, _>(|connection| {
+            let site_ids = sites::table.select(sites::id).load::<i64>(connection)?;
+            for site_id in site_ids {
+                rebuild_aggregates_locked(connection, site_id)?;
+            }
+            Ok(())
+        })?;
+    }
+    let integrity = diesel::sql_query("PRAGMA integrity_check")
+        .get_result::<IntegrityCheck>(db)?
+        .integrity_check;
     if integrity != "ok" {
         return Err(io::Error::new(io::ErrorKind::InvalidData, integrity).into());
     }
-    Ok(())
-}
-
-fn migrate_management_schema(db: &mut Connection) -> Result<(), StoreError> {
-    let tx = db.transaction()?;
-    tx.execute_batch(
-        "ALTER TABLE sites ADD COLUMN creator_kind INTEGER;
-         ALTER TABLE sites ADD COLUMN creator_hash BLOB;
-         ALTER TABLE sites ADD COLUMN claim_hash BLOB;
-         ALTER TABLE sites ADD COLUMN management_hash BLOB;
-         ALTER TABLE sites ADD COLUMN management_status INTEGER NOT NULL DEFAULT 0;
-         CREATE TABLE management_tombstones (
-             name TEXT PRIMARY KEY,
-             management_hash BLOB NOT NULL,
-             created INTEGER NOT NULL
-         );
-         CREATE TABLE management_audit (
-             id INTEGER PRIMARY KEY,
-             site_name TEXT NOT NULL,
-             action INTEGER NOT NULL,
-             occurred INTEGER NOT NULL
-         );
-         CREATE TABLE management_idempotency (
-             key_hash TEXT PRIMARY KEY,
-             fingerprint TEXT NOT NULL,
-             expires INTEGER NOT NULL
-         );
-         CREATE INDEX management_idempotency_expiry ON management_idempotency(expires);
-         CREATE INDEX management_audit_site ON management_audit(site_name, occurred);",
-    )?;
-    tx.pragma_update(None, "user_version", 4)?;
-    tx.commit()?;
-    Ok(())
-}
-
-fn migrate_aggregates_schema(db: &mut Connection) -> Result<(), StoreError> {
-    let tx = db.transaction()?;
-    tx.execute_batch(
-        "CREATE TABLE path_aggregates (
-             site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
-             path TEXT NOT NULL,
-             logical_bytes INTEGER NOT NULL,
-             file_count INTEGER NOT NULL,
-             PRIMARY KEY (site_id, path)
-         );",
-    )?;
-    let files = {
-        let mut statement = tx.prepare(
-            "SELECT site_id, path, size FROM files
-             WHERE path <> ?1 ORDER BY site_id, path",
-        )?;
-        statement
-            .query_map([MANIFEST_PATH], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?
-    };
-    for (site_id, path, size) in files {
-        adjust_aggregates_locked(&tx, site_id, &path, size, 1)?;
-    }
-    tx.pragma_update(None, "user_version", 5)?;
-    tx.commit()?;
-    Ok(())
-}
-
-fn migrate_management_audit_ip(db: &mut Connection) -> Result<(), StoreError> {
-    let tx = db.transaction()?;
-    tx.execute_batch("ALTER TABLE management_audit ADD COLUMN source_ip TEXT;")?;
-    tx.pragma_update(None, "user_version", LATEST_SCHEMA_VERSION)?;
-    tx.commit()?;
-    Ok(())
-}
-
-fn migrate_expiry_schema(db: &mut Connection) -> Result<(), StoreError> {
-    let tx = db.transaction()?;
-    tx.execute_batch(
-        "ALTER TABLE expiry_policies ADD COLUMN size_bytes INTEGER NOT NULL DEFAULT 0;
-         CREATE TABLE undo_expiry_policies (
-             token TEXT NOT NULL REFERENCES undo_operations(token) ON DELETE CASCADE,
-             path TEXT NOT NULL,
-             target_kind INTEGER NOT NULL,
-             mode INTEGER NOT NULL,
-             duration_seconds INTEGER,
-             deadline INTEGER,
-             min_age_seconds INTEGER,
-             max_age_seconds INTEGER,
-             max_size_bytes INTEGER,
-             power REAL,
-             refreshed INTEGER,
-             own_deadline INTEGER NOT NULL,
-             size_bytes INTEGER NOT NULL,
-             PRIMARY KEY (token, path)
-         );
-         CREATE INDEX expiry_policies_site_kind
-             ON expiry_policies(site_id, target_kind, path);",
-    )?;
-    tx.pragma_update(None, "user_version", 3)?;
-    tx.commit()?;
-    Ok(())
-}
-
-fn migrate_lifecycle_schema(db: &mut Connection) -> Result<(), StoreError> {
-    let tx = db.transaction()?;
-    tx.execute_batch(
-        "ALTER TABLE sites ADD COLUMN public_url TEXT NOT NULL DEFAULT '';
-             ALTER TABLE sites ADD COLUMN content_revision INTEGER NOT NULL DEFAULT 0;
-             ALTER TABLE sites ADD COLUMN tree_hash TEXT NOT NULL DEFAULT '';
-             CREATE TABLE undo_operations (
-                 token TEXT PRIMARY KEY,
-                 kind INTEGER NOT NULL,
-                 description TEXT NOT NULL,
-                 created INTEGER NOT NULL,
-                 expires INTEGER NOT NULL,
-                 consumed INTEGER NOT NULL DEFAULT 0
-             );
-             CREATE INDEX undo_operations_retention
-                 ON undo_operations(consumed, expires, created);
-             CREATE TABLE undo_names (
-                 token TEXT NOT NULL REFERENCES undo_operations(token) ON DELETE CASCADE,
-                 name TEXT NOT NULL,
-                 PRIMARY KEY (token, name)
-             );
-             CREATE INDEX undo_names_stack ON undo_names(name, token);
-             CREATE TABLE undo_sites (
-                 token TEXT PRIMARY KEY REFERENCES undo_operations(token) ON DELETE CASCADE,
-                 name TEXT NOT NULL,
-                 existed INTEGER NOT NULL,
-                 public_url TEXT NOT NULL,
-                 updated INTEGER NOT NULL,
-                 content_revision INTEGER NOT NULL,
-                 tree_hash TEXT NOT NULL
-             );
-             CREATE TABLE undo_files (
-                 token TEXT NOT NULL REFERENCES undo_operations(token) ON DELETE CASCADE,
-                 path TEXT NOT NULL,
-                 hash TEXT NOT NULL REFERENCES blobs(hash),
-                 size INTEGER NOT NULL,
-                 PRIMARY KEY (token, path)
-             );
-             CREATE INDEX undo_files_hash ON undo_files(hash);
-             CREATE TABLE expiry_policies (
-                 site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
-                 path TEXT NOT NULL,
-                 target_kind INTEGER NOT NULL,
-                 mode INTEGER NOT NULL,
-                 duration_seconds INTEGER,
-                 deadline INTEGER,
-                 min_age_seconds INTEGER,
-                 max_age_seconds INTEGER,
-                 max_size_bytes INTEGER,
-                 power REAL,
-                 refreshed INTEGER,
-                 own_deadline INTEGER,
-                 size_bytes INTEGER NOT NULL DEFAULT 0,
-                 PRIMARY KEY (site_id, path)
-             );
-             CREATE INDEX expiry_policies_deadline ON expiry_policies(own_deadline);
-             CREATE INDEX expiry_policies_site_kind
-                 ON expiry_policies(site_id, target_kind, path);
-             CREATE TABLE undo_expiry_policies (
-                 token TEXT NOT NULL REFERENCES undo_operations(token) ON DELETE CASCADE,
-                 path TEXT NOT NULL,
-                 target_kind INTEGER NOT NULL,
-                 mode INTEGER NOT NULL,
-                 duration_seconds INTEGER,
-                 deadline INTEGER,
-                 min_age_seconds INTEGER,
-                 max_age_seconds INTEGER,
-                 max_size_bytes INTEGER,
-                 power REAL,
-                 refreshed INTEGER,
-                 own_deadline INTEGER NOT NULL,
-                 size_bytes INTEGER NOT NULL,
-                 PRIMARY KEY (token, path)
-             );
-             CREATE TABLE idempotency_records (
-                 key_hash TEXT PRIMARY KEY,
-                 fingerprint TEXT NOT NULL,
-                 operation_kind INTEGER NOT NULL,
-                 result_metadata TEXT NOT NULL,
-                 expires INTEGER NOT NULL
-             );
-             CREATE INDEX idempotency_records_expiry ON idempotency_records(expires);",
-    )?;
-    tx.pragma_update(None, "user_version", 3)?;
-    tx.commit()?;
     Ok(())
 }
 
@@ -3088,25 +3036,20 @@ fn sanitized_counts(files: &[&StagedFile]) -> TokenCounts {
 }
 
 fn idempotency_replay(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &mut SqliteConnection,
     key: &str,
     fingerprint: &str,
     kind: IdempotencyKind,
 ) -> Result<Option<PublishedMutation>, StoreError> {
     let key_hash = idempotency_key_hash(key);
-    let record = tx
-        .query_row(
-            "SELECT fingerprint, operation_kind, result_metadata
-             FROM idempotency_records WHERE key_hash = ?1",
-            [key_hash],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            },
-        )
+    let record = idempotency_records::table
+        .find(key_hash)
+        .select((
+            idempotency_records::fingerprint,
+            idempotency_records::operation_kind,
+            idempotency_records::result_metadata,
+        ))
+        .first::<(String, i64, String)>(tx)
         .optional()?;
     let Some((stored_fingerprint, stored_kind, metadata)) = record else {
         return Ok(None);
@@ -3121,7 +3064,7 @@ fn idempotency_replay(
 }
 
 fn store_idempotency(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &mut SqliteConnection,
     key: &str,
     fingerprint: &str,
     kind: IdempotencyKind,
@@ -3130,26 +3073,24 @@ fn store_idempotency(
 ) -> Result<(), StoreError> {
     let metadata = serde_json::to_string(result)
         .map_err(|err| StoreError::Io(io::Error::new(io::ErrorKind::InvalidData, err)))?;
-    tx.execute(
-        "INSERT INTO idempotency_records
-            (key_hash, fingerprint, operation_kind, result_metadata, expires)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![
-            idempotency_key_hash(key),
-            fingerprint,
-            kind as i64,
-            metadata,
-            now + IDEMPOTENCY_RETENTION_MILLIS
-        ],
-    )?;
+    diesel::insert_into(idempotency_records::table)
+        .values((
+            idempotency_records::key_hash.eq(idempotency_key_hash(key)),
+            idempotency_records::fingerprint.eq(fingerprint),
+            idempotency_records::operation_kind.eq(kind as i64),
+            idempotency_records::result_metadata.eq(metadata),
+            idempotency_records::expires.eq(now + IDEMPOTENCY_RETENTION_MILLIS),
+        ))
+        .execute(tx)?;
     Ok(())
 }
 
 fn prune_idempotency_locked(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &mut SqliteConnection,
     now: i64,
-) -> Result<(), rusqlite::Error> {
-    tx.execute("DELETE FROM idempotency_records WHERE expires <= ?1", [now])?;
+) -> Result<(), diesel::result::Error> {
+    diesel::delete(idempotency_records::table.filter(idempotency_records::expires.le(now)))
+        .execute(tx)?;
     Ok(())
 }
 
@@ -3161,26 +3102,22 @@ fn management_hash_from_blob(bytes: &[u8]) -> Result<ManagementTokenHash, StoreE
 }
 
 fn authorize_locked(
-    db: &Connection,
+    db: &mut SqliteConnection,
     name: &str,
     token: Option<&ManagementToken>,
 ) -> Result<(), StoreError> {
-    let live = db
-        .query_row(
-            "SELECT management_status, management_hash FROM sites WHERE name = ?1",
-            [name],
-            |row| Ok((row.get::<_, bool>(0)?, row.get::<_, Option<Vec<u8>>>(1)?)),
-        )
+    let live = sites::table
+        .filter(sites::name.eq(name))
+        .select((sites::management_status, sites::management_hash))
+        .first::<(i64, Option<Vec<u8>>)>(db)
         .optional()?;
     let expected = match live {
-        Some((false, _)) => return Ok(()),
-        Some((true, hash)) => hash,
-        None => db
-            .query_row(
-                "SELECT management_hash FROM management_tombstones WHERE name = ?1",
-                [name],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
+        Some((0, _)) => return Ok(()),
+        Some((_, hash)) => hash,
+        None => management_tombstones::table
+            .find(name)
+            .select(management_tombstones::management_hash)
+            .first::<Vec<u8>>(db)
             .optional()?,
     };
     let Some(expected) = expected else {
@@ -3202,7 +3139,7 @@ fn claim_hash_from_blob(bytes: &[u8]) -> Result<ClaimTokenHash, StoreError> {
 }
 
 fn management_replay(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &mut SqliteConnection,
     idempotency: Option<&Idempotency>,
     fingerprint: &str,
 ) -> Result<bool, StoreError> {
@@ -3210,12 +3147,10 @@ fn management_replay(
         return Ok(false);
     };
     validate_idempotency_key(&idempotency.key)?;
-    let stored = tx
-        .query_row(
-            "SELECT fingerprint FROM management_idempotency WHERE key_hash = ?1",
-            [idempotency_key_hash(&idempotency.key)],
-            |row| row.get::<_, String>(0),
-        )
+    let stored = management_idempotency::table
+        .find(idempotency_key_hash(&idempotency.key))
+        .select(management_idempotency::fingerprint)
+        .first::<String>(tx)
         .optional()?;
     match stored {
         Some(stored) if stored == fingerprint => Ok(true),
@@ -3225,7 +3160,7 @@ fn management_replay(
 }
 
 fn store_management_idempotency(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &mut SqliteConnection,
     idempotency: Option<&Idempotency>,
     fingerprint: &str,
     now: i64,
@@ -3233,46 +3168,45 @@ fn store_management_idempotency(
     let Some(idempotency) = idempotency else {
         return Ok(());
     };
-    tx.execute(
-        "INSERT INTO management_idempotency(key_hash, fingerprint, expires)
-         VALUES (?1, ?2, ?3)",
-        params![
-            idempotency_key_hash(&idempotency.key),
-            fingerprint,
-            now + IDEMPOTENCY_RETENTION_MILLIS
-        ],
-    )?;
+    diesel::insert_into(management_idempotency::table)
+        .values((
+            management_idempotency::key_hash.eq(idempotency_key_hash(&idempotency.key)),
+            management_idempotency::fingerprint.eq(fingerprint),
+            management_idempotency::expires.eq(now + IDEMPOTENCY_RETENTION_MILLIS),
+        ))
+        .execute(tx)?;
     Ok(())
 }
 
 fn prune_management_idempotency(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &mut SqliteConnection,
     now: i64,
-) -> Result<(), rusqlite::Error> {
-    tx.execute(
-        "DELETE FROM management_idempotency WHERE expires <= ?1",
-        [now],
-    )?;
+) -> Result<(), diesel::result::Error> {
+    diesel::delete(management_idempotency::table.filter(management_idempotency::expires.le(now)))
+        .execute(tx)?;
     Ok(())
 }
 
 fn record_management(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &mut SqliteConnection,
     name: &str,
     action: i64,
     now: i64,
     source_ip: Option<&str>,
-) -> Result<(), rusqlite::Error> {
-    tx.execute(
-        "INSERT INTO management_audit(site_name, action, occurred, source_ip)
-         VALUES (?1, ?2, ?3, ?4)",
-        params![name, action, now, source_ip],
-    )?;
+) -> Result<(), diesel::result::Error> {
+    diesel::insert_into(management_audit::table)
+        .values((
+            management_audit::site_name.eq(name),
+            management_audit::action.eq(action),
+            management_audit::occurred.eq(now),
+            management_audit::source_ip.eq(source_ip),
+        ))
+        .execute(tx)?;
     Ok(())
 }
 
 fn snapshot_site(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &mut SqliteConnection,
     name: &str,
     kind: UndoKind,
     now: i64,
@@ -3289,7 +3223,7 @@ fn snapshot_site(
 }
 
 fn snapshot_site_with_description(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &mut SqliteConnection,
     name: &str,
     kind: UndoKind,
     description: &str,
@@ -3297,78 +3231,146 @@ fn snapshot_site_with_description(
 ) -> Result<UndoInfo, StoreError> {
     let token = undo_token()?;
     let expires = now + UNDO_RETENTION_MILLIS;
-    tx.execute(
-        "INSERT INTO undo_operations(token, kind, description, created, expires)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![token, kind as i64, description, now, expires],
-    )?;
-    tx.execute(
-        "INSERT INTO undo_names(token, name) VALUES (?1, ?2)",
-        params![token, name],
-    )?;
-    let site = tx
-        .query_row(
-            "SELECT name, public_url, updated, content_revision, tree_hash
-             FROM sites WHERE name = ?1",
-            [name],
-            |row| {
-                Ok(SiteSnapshot {
-                    name: row.get(0)?,
-                    existed: true,
-                    public_url: row.get(1)?,
-                    updated: row.get(2)?,
-                    content_revision: row.get(3)?,
-                    tree_hash: row.get(4)?,
-                })
-            },
-        )
+    diesel::insert_into(undo_operations::table)
+        .values((
+            undo_operations::token.eq(&token),
+            undo_operations::kind.eq(kind as i64),
+            undo_operations::description.eq(description),
+            undo_operations::created.eq(now),
+            undo_operations::expires.eq(expires),
+            undo_operations::consumed.eq(0_i64),
+        ))
+        .execute(tx)?;
+    diesel::insert_into(undo_names::table)
+        .values((undo_names::token.eq(&token), undo_names::name.eq(name)))
+        .execute(tx)?;
+    let site = sites::table
+        .filter(sites::name.eq(name))
+        .select((
+            sites::name,
+            sites::public_url,
+            sites::updated,
+            sites::content_revision,
+            sites::tree_hash,
+        ))
+        .first::<(String, String, i64, i64, String)>(tx)
         .optional()?
-        .unwrap_or_else(|| SiteSnapshot {
-            name: name.to_string(),
-            existed: false,
-            public_url: String::new(),
-            updated: now,
-            content_revision: 0,
-            tree_hash: String::new(),
-        });
-    tx.execute(
-        "INSERT INTO undo_sites
-            (token, name, existed, public_url, updated, content_revision, tree_hash)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![
-            token,
-            site.name,
-            site.existed,
-            site.public_url,
-            site.updated,
-            site.content_revision,
-            site.tree_hash
-        ],
-    )?;
+        .map_or_else(
+            || SiteSnapshot {
+                name: name.to_string(),
+                existed: false,
+                public_url: String::new(),
+                updated: now,
+                content_revision: 0,
+                tree_hash: String::new(),
+            },
+            |(name, public_url, updated, content_revision, tree_hash)| SiteSnapshot {
+                name,
+                existed: true,
+                public_url,
+                updated,
+                content_revision,
+                tree_hash,
+            },
+        );
+    diesel::insert_into(undo_sites::table)
+        .values((
+            undo_sites::token.eq(&token),
+            undo_sites::name.eq(&site.name),
+            undo_sites::existed.eq(i64::from(site.existed)),
+            undo_sites::public_url.eq(&site.public_url),
+            undo_sites::updated.eq(site.updated),
+            undo_sites::content_revision.eq(site.content_revision),
+            undo_sites::tree_hash.eq(&site.tree_hash),
+        ))
+        .execute(tx)?;
     if site.existed {
-        tx.execute(
-            "INSERT INTO undo_files(token, path, hash, size)
-             SELECT ?1, path, hash, size FROM files
-             WHERE site_id = (SELECT id FROM sites WHERE name = ?2) AND path <> ?3",
-            params![token, name, MANIFEST_PATH],
-        )?;
-        tx.execute(
-            "INSERT INTO undo_expiry_policies
-                (token, path, target_kind, mode, duration_seconds, deadline,
-                 min_age_seconds, max_age_seconds, max_size_bytes, power,
-                 refreshed, own_deadline, size_bytes)
-             SELECT ?1, path, target_kind, mode, duration_seconds, deadline,
-                    min_age_seconds, max_age_seconds, max_size_bytes, power,
-                    refreshed, own_deadline, size_bytes
-             FROM expiry_policies
-             WHERE site_id = (SELECT id FROM sites WHERE name = ?2)",
-            params![token, name],
-        )?;
+        let site_id = site_id_locked(tx, name)?;
+        let saved_files = files::table
+            .filter(files::site_id.eq(site_id))
+            .filter(files::path.ne(MANIFEST_PATH))
+            .select((files::path, files::hash, files::size))
+            .load::<(String, String, i64)>(tx)?;
+        for (path, hash, size) in saved_files {
+            diesel::insert_into(undo_files::table)
+                .values((
+                    undo_files::token.eq(&token),
+                    undo_files::path.eq(path),
+                    undo_files::hash.eq(hash),
+                    undo_files::size.eq(size),
+                ))
+                .execute(tx)?;
+        }
+        snapshot_expiry_policies_locked(tx, &token, site_id)?;
     }
     Ok(UndoInfo {
         token,
         expires_at: format_timestamp(expires),
     })
+}
+
+fn snapshot_expiry_policies_locked(
+    db: &mut SqliteConnection,
+    token: &str,
+    site_id: i64,
+) -> Result<(), StoreError> {
+    let policies = expiry_policies::table
+        .filter(expiry_policies::site_id.eq(site_id))
+        .select(ExpiryPolicyRow::as_select())
+        .load::<ExpiryPolicyRow>(db)?;
+    for policy in policies {
+        diesel::insert_into(undo_expiry_policies::table)
+            .values((
+                undo_expiry_policies::token.eq(token),
+                undo_expiry_policies::path.eq(policy.path),
+                undo_expiry_policies::target_kind.eq(policy.target_kind),
+                undo_expiry_policies::mode.eq(policy.mode),
+                undo_expiry_policies::duration_seconds.eq(policy.duration_seconds),
+                undo_expiry_policies::deadline.eq(policy.deadline),
+                undo_expiry_policies::min_age_seconds.eq(policy.min_age_seconds),
+                undo_expiry_policies::max_age_seconds.eq(policy.max_age_seconds),
+                undo_expiry_policies::max_size_bytes.eq(policy.max_size_bytes),
+                undo_expiry_policies::power.eq(policy.power),
+                undo_expiry_policies::refreshed.eq(policy.refreshed),
+                undo_expiry_policies::own_deadline.eq(policy
+                    .own_deadline
+                    .expect("stored expiry deadline is present")),
+                undo_expiry_policies::size_bytes.eq(policy.size_bytes),
+            ))
+            .execute(db)?;
+    }
+    Ok(())
+}
+
+fn restore_expiry_policies_locked(
+    db: &mut SqliteConnection,
+    token: &str,
+    site_id: i64,
+) -> Result<(), StoreError> {
+    let policies = undo_expiry_policies::table
+        .filter(undo_expiry_policies::token.eq(token))
+        .select(UndoExpiryPolicyRow::as_select())
+        .load::<UndoExpiryPolicyRow>(db)?;
+    for policy in policies {
+        diesel::insert_into(expiry_policies::table)
+            .values((
+                expiry_policies::site_id.eq(site_id),
+                expiry_policies::path.eq(policy.path),
+                expiry_policies::target_kind.eq(policy.target_kind),
+                expiry_policies::mode.eq(policy.mode),
+                expiry_policies::duration_seconds.eq(policy.duration_seconds),
+                expiry_policies::deadline.eq(policy.deadline),
+                expiry_policies::min_age_seconds.eq(policy.min_age_seconds),
+                expiry_policies::max_age_seconds.eq(policy.max_age_seconds),
+                expiry_policies::max_size_bytes.eq(policy.max_size_bytes),
+                expiry_policies::power.eq(policy.power),
+                expiry_policies::refreshed.eq(policy.refreshed),
+                expiry_policies::own_deadline.eq(Some(policy.own_deadline)),
+                expiry_policies::size_bytes.eq(policy.size_bytes),
+            ))
+            .execute(db)?;
+    }
+    Ok(())
 }
 
 fn expiry_display_path(name: &str, path: &str) -> String {
@@ -3380,7 +3382,7 @@ fn expiry_display_path(name: &str, path: &str) -> String {
 }
 
 fn expiry_target_kind_locked(
-    db: &Connection,
+    db: &mut SqliteConnection,
     name: &str,
     rel: &str,
 ) -> Result<ExpiryTargetKind, StoreError> {
@@ -3404,7 +3406,7 @@ fn aggregate_paths(path: &str) -> Vec<&str> {
 }
 
 fn adjust_aggregates_locked(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &mut SqliteConnection,
     site_id: i64,
     path: &str,
     byte_delta: i64,
@@ -3414,37 +3416,44 @@ fn adjust_aggregates_locked(
         return Ok(());
     }
     for aggregate_path in aggregate_paths(path) {
-        tx.execute(
-            "INSERT INTO path_aggregates(site_id, path, logical_bytes, file_count)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(site_id, path) DO UPDATE SET
-                 logical_bytes = logical_bytes + excluded.logical_bytes,
-                 file_count = file_count + excluded.file_count",
-            params![site_id, aggregate_path, byte_delta, count_delta],
-        )?;
+        diesel::insert_into(path_aggregates::table)
+            .values((
+                path_aggregates::site_id.eq(site_id),
+                path_aggregates::path.eq(aggregate_path),
+                path_aggregates::logical_bytes.eq(byte_delta),
+                path_aggregates::file_count.eq(count_delta),
+            ))
+            .on_conflict((path_aggregates::site_id, path_aggregates::path))
+            .do_update()
+            .set((
+                path_aggregates::logical_bytes
+                    .eq(path_aggregates::logical_bytes + excluded(path_aggregates::logical_bytes)),
+                path_aggregates::file_count
+                    .eq(path_aggregates::file_count + excluded(path_aggregates::file_count)),
+            ))
+            .execute(tx)?;
     }
-    tx.execute(
-        "DELETE FROM path_aggregates
-         WHERE site_id = ?1 AND (logical_bytes <= 0 OR file_count <= 0)",
-        [site_id],
-    )?;
+    diesel::delete(
+        path_aggregates::table
+            .filter(path_aggregates::site_id.eq(site_id))
+            .filter(
+                path_aggregates::logical_bytes
+                    .le(0_i64)
+                    .or(path_aggregates::file_count.le(0_i64)),
+            ),
+    )
+    .execute(tx)?;
     Ok(())
 }
 
-fn rebuild_aggregates_locked(
-    tx: &rusqlite::Transaction<'_>,
-    site_id: i64,
-) -> Result<(), StoreError> {
-    tx.execute("DELETE FROM path_aggregates WHERE site_id = ?1", [site_id])?;
-    let files = {
-        let mut statement =
-            tx.prepare("SELECT path, size FROM files WHERE site_id = ?1 AND path <> ?2")?;
-        statement
-            .query_map(params![site_id, MANIFEST_PATH], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?
-    };
+fn rebuild_aggregates_locked(tx: &mut SqliteConnection, site_id: i64) -> Result<(), StoreError> {
+    diesel::delete(path_aggregates::table.filter(path_aggregates::site_id.eq(site_id)))
+        .execute(tx)?;
+    let files = files::table
+        .filter(files::site_id.eq(site_id))
+        .filter(files::path.ne(MANIFEST_PATH))
+        .select((files::path, files::size))
+        .load::<(String, i64)>(tx)?;
     for (path, size) in files {
         adjust_aggregates_locked(tx, site_id, &path, size, 1)?;
     }
@@ -3452,39 +3461,33 @@ fn rebuild_aggregates_locked(
 }
 
 fn expiry_target_size_locked(
-    db: &Connection,
+    db: &mut SqliteConnection,
     site_id: i64,
     rel: &str,
     kind: ExpiryTargetKind,
 ) -> Result<u64, StoreError> {
-    let size: i64 = match kind {
-        ExpiryTargetKind::Site => db.query_row(
-            "SELECT COALESCE(
-                 (SELECT logical_bytes FROM path_aggregates
-                  WHERE site_id = ?1 AND path = ''),
-                 0
-             )",
-            [site_id],
-            |row| row.get(0),
-        )?,
-        ExpiryTargetKind::File => db.query_row(
-            "SELECT size FROM files WHERE site_id = ?1 AND path = ?2",
-            params![site_id, rel],
-            |row| row.get(0),
-        )?,
-        ExpiryTargetKind::Folder => db.query_row(
-            "SELECT logical_bytes FROM path_aggregates
-             WHERE site_id = ?1 AND path = ?2",
-            params![site_id, rel],
-            |row| row.get(0),
-        )?,
+    let size = match kind {
+        ExpiryTargetKind::Site => path_aggregates::table
+            .find((site_id, ""))
+            .select(path_aggregates::logical_bytes)
+            .first::<i64>(db)
+            .optional()?
+            .unwrap_or(0),
+        ExpiryTargetKind::File => files::table
+            .find((site_id, rel))
+            .select(files::size)
+            .first::<i64>(db)?,
+        ExpiryTargetKind::Folder => path_aggregates::table
+            .find((site_id, rel))
+            .select(path_aggregates::logical_bytes)
+            .first::<i64>(db)?,
     };
     Ok(size.cast_unsigned())
 }
 
 #[allow(clippy::too_many_lines)]
 fn store_expiry_policy_locked(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &mut SqliteConnection,
     write: ExpiryPolicyWrite<'_>,
 ) -> Result<(), StoreError> {
     let ExpiryPolicyWrite {
@@ -3559,88 +3562,66 @@ fn store_expiry_policy_locked(
                 )
             }
         };
-    tx.execute(
-        "INSERT INTO expiry_policies
-            (site_id, path, target_kind, mode, duration_seconds, deadline,
-             min_age_seconds, max_age_seconds, max_size_bytes, power,
-             refreshed, own_deadline, size_bytes)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-         ON CONFLICT(site_id, path) DO UPDATE SET
-             target_kind = excluded.target_kind,
-             mode = excluded.mode,
-             duration_seconds = excluded.duration_seconds,
-             deadline = excluded.deadline,
-             min_age_seconds = excluded.min_age_seconds,
-             max_age_seconds = excluded.max_age_seconds,
-             max_size_bytes = excluded.max_size_bytes,
-             power = excluded.power,
-             refreshed = excluded.refreshed,
-             own_deadline = excluded.own_deadline,
-             size_bytes = excluded.size_bytes",
-        params![
-            site_id,
-            path,
-            i64::from(kind),
-            i64::from(policy.mode()),
-            duration,
-            deadline,
-            min_age,
-            max_age,
-            max_size,
-            power,
-            refreshed,
-            own_deadline,
-            i64::try_from(size).map_err(|_| ExpiryError::DeadlineOverflow)?,
-        ],
-    )?;
+    diesel::insert_into(expiry_policies::table)
+        .values((
+            expiry_policies::site_id.eq(site_id),
+            expiry_policies::path.eq(path),
+            expiry_policies::target_kind.eq(i64::from(kind)),
+            expiry_policies::mode.eq(i64::from(policy.mode())),
+            expiry_policies::duration_seconds.eq(duration),
+            expiry_policies::deadline.eq(deadline),
+            expiry_policies::min_age_seconds.eq(min_age),
+            expiry_policies::max_age_seconds.eq(max_age),
+            expiry_policies::max_size_bytes.eq(max_size),
+            expiry_policies::power.eq(power),
+            expiry_policies::refreshed.eq(refreshed),
+            expiry_policies::own_deadline.eq(Some(own_deadline)),
+            expiry_policies::size_bytes
+                .eq(i64::try_from(size).map_err(|_| ExpiryError::DeadlineOverflow)?),
+        ))
+        .on_conflict((expiry_policies::site_id, expiry_policies::path))
+        .do_update()
+        .set((
+            expiry_policies::target_kind.eq(excluded(expiry_policies::target_kind)),
+            expiry_policies::mode.eq(excluded(expiry_policies::mode)),
+            expiry_policies::duration_seconds.eq(excluded(expiry_policies::duration_seconds)),
+            expiry_policies::deadline.eq(excluded(expiry_policies::deadline)),
+            expiry_policies::min_age_seconds.eq(excluded(expiry_policies::min_age_seconds)),
+            expiry_policies::max_age_seconds.eq(excluded(expiry_policies::max_age_seconds)),
+            expiry_policies::max_size_bytes.eq(excluded(expiry_policies::max_size_bytes)),
+            expiry_policies::power.eq(excluded(expiry_policies::power)),
+            expiry_policies::refreshed.eq(excluded(expiry_policies::refreshed)),
+            expiry_policies::own_deadline.eq(excluded(expiry_policies::own_deadline)),
+            expiry_policies::size_bytes.eq(excluded(expiry_policies::size_bytes)),
+        ))
+        .execute(tx)?;
     Ok(())
 }
 
 fn load_expiry_policy_locked(
-    db: &Connection,
+    db: &mut SqliteConnection,
     site_id: i64,
     path: &str,
 ) -> Result<Option<StoredExpiryPolicy>, StoreError> {
-    let row = db
-        .query_row(
-            "SELECT target_kind, mode, duration_seconds, deadline,
-                    min_age_seconds, max_age_seconds, max_size_bytes, power,
-                    refreshed, own_deadline, size_bytes
-             FROM expiry_policies WHERE site_id = ?1 AND path = ?2",
-            params![site_id, path],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, Option<i64>>(2)?,
-                    row.get::<_, Option<i64>>(3)?,
-                    row.get::<_, Option<i64>>(4)?,
-                    row.get::<_, Option<i64>>(5)?,
-                    row.get::<_, Option<i64>>(6)?,
-                    row.get::<_, Option<f64>>(7)?,
-                    row.get::<_, Option<i64>>(8)?,
-                    row.get::<_, i64>(9)?,
-                    row.get::<_, i64>(10)?,
-                ))
-            },
-        )
+    let row = expiry_policies::table
+        .find((site_id, path))
+        .select(ExpiryPolicyRow::as_select())
+        .first::<ExpiryPolicyRow>(db)
         .optional()?;
-    let Some((
-        raw_kind,
-        raw_mode,
-        duration,
-        deadline,
-        min_age,
-        max_age,
-        max_size,
-        power,
-        refreshed,
-        own_deadline,
-        size,
-    )) = row
-    else {
+    let Some(row) = row else {
         return Ok(None);
     };
+    let raw_kind = row.target_kind;
+    let raw_mode = row.mode;
+    let duration = row.duration_seconds;
+    let deadline = row.deadline;
+    let min_age = row.min_age_seconds;
+    let max_age = row.max_age_seconds;
+    let max_size = row.max_size_bytes;
+    let power = row.power;
+    let refreshed = row.refreshed;
+    let own_deadline = row.own_deadline.ok_or(ExpiryError::InvalidTimestamp)?;
+    let size = row.size_bytes;
     let mode = ExpiryMode::try_from(raw_mode)?;
     let policy = match mode {
         ExpiryMode::Relative => ExpiryPolicy::Relative {
@@ -3719,17 +3700,16 @@ fn policy_is_affected(path: &str, kind: ExpiryTargetKind, changed: &str) -> bool
 }
 
 fn copy_expiry_policies_locked(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &mut SqliteConnection,
     source_id: i64,
     destination_id: i64,
     now: i64,
 ) -> Result<(), StoreError> {
-    let paths = {
-        let mut stmt =
-            tx.prepare("SELECT path FROM expiry_policies WHERE site_id = ?1 ORDER BY path")?;
-        stmt.query_map([source_id], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?
-    };
+    let paths = expiry_policies::table
+        .filter(expiry_policies::site_id.eq(source_id))
+        .select(expiry_policies::path)
+        .order(expiry_policies::path)
+        .load::<String>(tx)?;
     for path in paths {
         let stored = load_expiry_policy_locked(tx, source_id, &path)?
             .expect("selected expiry policy still exists");
@@ -3750,26 +3730,19 @@ fn copy_expiry_policies_locked(
 }
 
 fn refresh_expiry_for_changes_locked(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &mut SqliteConnection,
     site_id: i64,
     changed_paths: &[&str],
     now: i64,
 ) -> Result<(), StoreError> {
-    let policies = {
-        let mut stmt = tx.prepare(
-            "SELECT path, target_kind FROM expiry_policies
-             WHERE site_id = ?1 AND mode IN (?2, ?3)",
-        )?;
-        stmt.query_map(
-            params![
-                site_id,
-                i64::from(ExpiryMode::Relative),
-                i64::from(ExpiryMode::Decay)
-            ],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
-        )?
-        .collect::<Result<Vec<_>, _>>()?
-    };
+    let policies = expiry_policies::table
+        .filter(expiry_policies::site_id.eq(site_id))
+        .filter(expiry_policies::mode.eq_any([
+            i64::from(ExpiryMode::Relative),
+            i64::from(ExpiryMode::Decay),
+        ]))
+        .select((expiry_policies::path, expiry_policies::target_kind))
+        .load::<(String, i64)>(tx)?;
     for (path, raw_kind) in policies {
         let kind = ExpiryTargetKind::try_from(raw_kind)?;
         if !changed_paths
@@ -3798,57 +3771,57 @@ fn refresh_expiry_for_changes_locked(
 }
 
 fn finish_partial_expiry_locked(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &mut SqliteConnection,
     blobs: &BlobFiles,
     site_id: i64,
     changed_path: &str,
     now: i64,
 ) -> Result<(), StoreError> {
-    let remaining: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM files WHERE site_id = ?1 AND path <> ?2",
-        params![site_id, MANIFEST_PATH],
-        |row| row.get(0),
-    )?;
+    let remaining = files::table
+        .filter(files::site_id.eq(site_id))
+        .filter(files::path.ne(MANIFEST_PATH))
+        .select(count_star())
+        .first::<i64>(tx)?;
     if remaining == 0 {
-        let name: String =
-            tx.query_row("SELECT name FROM sites WHERE id = ?1", [site_id], |row| {
-                row.get(0)
-            })?;
+        let name = sites::table
+            .find(site_id)
+            .select(sites::name)
+            .first::<String>(tx)?;
         retain_management_tombstone(tx, &name, now)?;
-        tx.execute("DELETE FROM sites WHERE id = ?1", [site_id])?;
+        diesel::delete(sites::table.find(site_id)).execute(tx)?;
         return Ok(());
     }
-    tx.execute(
-        "UPDATE sites SET content_revision = content_revision + 1 WHERE id = ?1",
-        [site_id],
-    )?;
-    rebuild_aggregates_locked(tx, site_id)?;
+    diesel::update(sites::table.find(site_id))
+        .set(sites::content_revision.eq(sites::content_revision + 1))
+        .execute(tx)?;
     refresh_expiry_for_changes_locked(tx, site_id, &[changed_path], now)?;
     regenerate_site(tx, blobs, site_id, now)?;
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn regenerate_site(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &mut SqliteConnection,
     blobs: &BlobFiles,
     site_id: i64,
     updated: i64,
 ) -> Result<String, StoreError> {
-    let (name, public_url, revision, managed): (String, String, i64, bool) = tx.query_row(
-        "SELECT name, public_url, content_revision, management_status FROM sites WHERE id = ?1",
-        [site_id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-    )?;
-    let entries = {
-        let mut stmt = tx.prepare(
-            "SELECT path, hash FROM files
-             WHERE site_id = ?1 AND path <> ?2 ORDER BY path",
-        )?;
-        stmt.query_map(params![site_id, MANIFEST_PATH], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
-        .collect::<Result<Vec<_>, _>>()?
-    };
+    let (name, public_url, revision, management_status) = sites::table
+        .find(site_id)
+        .select((
+            sites::name,
+            sites::public_url,
+            sites::content_revision,
+            sites::management_status,
+        ))
+        .first::<(String, String, i64, i64)>(tx)?;
+    let managed = management_status != 0;
+    let entries = files::table
+        .filter(files::site_id.eq(site_id))
+        .filter(files::path.ne(MANIFEST_PATH))
+        .select((files::path, files::hash))
+        .order(files::path)
+        .load::<(String, String)>(tx)?;
     let mut hasher = blake3::Hasher::new();
     for (path, hash) in &entries {
         hasher.update(&(path.len() as u64).to_le_bytes());
@@ -3867,15 +3840,11 @@ fn regenerate_site(
         writeln!(manifest, "\"{}\" = \"blake3:{}\"", toml_escape(path), hash)
             .expect("writing to String cannot fail");
     }
-    let expiry_paths = {
-        let mut stmt = tx.prepare(
-            "SELECT path FROM expiry_policies
-             WHERE site_id = ?1
-             ORDER BY target_kind, path",
-        )?;
-        stmt.query_map([site_id], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?
-    };
+    let expiry_paths = expiry_policies::table
+        .filter(expiry_policies::site_id.eq(site_id))
+        .select(expiry_policies::path)
+        .order((expiry_policies::target_kind, expiry_policies::path))
+        .load::<String>(tx)?;
     for path in expiry_paths {
         let stored = load_expiry_policy_locked(tx, site_id, &path)?
             .expect("selected expiry policy still exists");
@@ -3914,19 +3883,31 @@ fn regenerate_site(
     }
     let staged = stage_bytes(MANIFEST_PATH, manifest.as_bytes());
     blobs.put_bytes(&staged.hash, manifest.as_bytes())?;
-    tx.execute(
-        "INSERT OR IGNORE INTO blobs(hash, bytes, size) VALUES (?1, X'', ?2)",
-        params![staged.hash, staged.size],
-    )?;
-    tx.execute(
-        "INSERT INTO files(site_id, path, hash, size) VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT(site_id, path) DO UPDATE SET hash = excluded.hash, size = excluded.size",
-        params![site_id, MANIFEST_PATH, staged.hash, staged.size],
-    )?;
-    tx.execute(
-        "UPDATE sites SET tree_hash = ?1, updated = ?2 WHERE id = ?3",
-        params![tree_hash, updated, site_id],
-    )?;
+    diesel::insert_into(blobs::table)
+        .values((
+            blobs::hash.eq(&staged.hash),
+            blobs::bytes.eq(Vec::<u8>::new()),
+            blobs::size.eq(staged.size),
+        ))
+        .on_conflict_do_nothing()
+        .execute(tx)?;
+    diesel::insert_into(files::table)
+        .values(NewFile {
+            site_id,
+            path: MANIFEST_PATH,
+            hash: &staged.hash,
+            size: staged.size,
+        })
+        .on_conflict((files::site_id, files::path))
+        .do_update()
+        .set((
+            files::hash.eq(excluded(files::hash)),
+            files::size.eq(excluded(files::size)),
+        ))
+        .execute(tx)?;
+    diesel::update(sites::table.find(site_id))
+        .set((sites::tree_hash.eq(&tree_hash), sites::updated.eq(updated)))
+        .execute(tx)?;
     Ok(tree_hash)
 }
 
@@ -3938,52 +3919,85 @@ const fn expiry_mode_name(mode: ExpiryMode) -> &'static str {
     }
 }
 
-fn site_revision_locked(db: &Connection, name: &str) -> Result<(u64, String), StoreError> {
-    db.query_row(
-        "SELECT content_revision, tree_hash FROM sites WHERE name = ?1",
-        [name],
-        |row| Ok((row.get::<_, i64>(0)?.cast_unsigned(), row.get(1)?)),
-    )
-    .map_err(map_sql)
+fn site_revision_locked(
+    db: &mut SqliteConnection,
+    name: &str,
+) -> Result<(u64, String), StoreError> {
+    let (revision, tree_hash) = sites::table
+        .filter(sites::name.eq(name))
+        .select((sites::content_revision, sites::tree_hash))
+        .first::<(i64, String)>(db)
+        .map_err(map_sql)?;
+    Ok((revision.cast_unsigned(), tree_hash))
 }
 
 fn retain_management_tombstone(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &mut SqliteConnection,
     name: &str,
     now: i64,
-) -> Result<(), rusqlite::Error> {
-    tx.execute(
-        "INSERT INTO management_tombstones(name, management_hash, created)
-         SELECT name, management_hash, ?2 FROM sites
-         WHERE name = ?1 AND management_status = 1 AND management_hash IS NOT NULL
-         ON CONFLICT(name) DO UPDATE SET
-             management_hash = excluded.management_hash,
-             created = excluded.created",
-        params![name, now],
-    )?;
+) -> Result<(), diesel::result::Error> {
+    let hash = sites::table
+        .filter(sites::name.eq(name))
+        .filter(sites::management_status.eq(1_i64))
+        .select(sites::management_hash)
+        .first::<Option<Vec<u8>>>(tx)
+        .optional()?
+        .flatten();
+    if let Some(hash) = hash {
+        diesel::insert_into(management_tombstones::table)
+            .values((
+                management_tombstones::name.eq(name),
+                management_tombstones::management_hash.eq(hash),
+                management_tombstones::created.eq(now),
+            ))
+            .on_conflict(management_tombstones::name)
+            .do_update()
+            .set((
+                management_tombstones::management_hash
+                    .eq(excluded(management_tombstones::management_hash)),
+                management_tombstones::created.eq(excluded(management_tombstones::created)),
+            ))
+            .execute(tx)?;
+    }
     Ok(())
 }
 
-fn prune_undo_locked(tx: &rusqlite::Transaction<'_>, now: i64) -> Result<(), rusqlite::Error> {
-    tx.execute(
-        "DELETE FROM undo_operations WHERE consumed = 1 OR expires <= ?1",
-        [now],
-    )?;
-    tx.execute(
-        "DELETE FROM undo_operations
-         WHERE token IN (
-             SELECT token FROM (
-                 SELECT names.token,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY names.name
-                            ORDER BY operation.created DESC, operation.rowid DESC
-                        ) AS position
-                 FROM undo_names AS names
-                 JOIN undo_operations AS operation ON operation.token = names.token
-             ) WHERE position > ?1
-         )",
-        [UNDO_LIMIT_PER_SITE],
-    )?;
+fn prune_undo_locked(tx: &mut SqliteConnection, now: i64) -> Result<(), diesel::result::Error> {
+    diesel::delete(
+        undo_operations::table.filter(
+            undo_operations::consumed
+                .eq(1_i64)
+                .or(undo_operations::expires.le(now)),
+        ),
+    )
+    .execute(tx)?;
+    let rows = undo_names::table
+        .inner_join(undo_operations::table.on(undo_operations::token.eq(undo_names::token)))
+        .select((undo_names::name, undo_names::token))
+        .order((
+            undo_names::name,
+            undo_operations::created.desc(),
+            undo_operations::rowid.desc(),
+        ))
+        .load::<(String, String)>(tx)?;
+    let mut previous = None::<String>;
+    let mut position = 0_i64;
+    let mut stale = Vec::new();
+    for (name, token) in rows {
+        if previous.as_deref() == Some(name.as_str()) {
+            position += 1;
+        } else {
+            previous = Some(name);
+            position = 1;
+        }
+        if position > UNDO_LIMIT_PER_SITE {
+            stale.push(token);
+        }
+    }
+    stale.sort_unstable();
+    stale.dedup();
+    diesel::delete(undo_operations::table.filter(undo_operations::token.eq_any(stale)))
+        .execute(tx)?;
     Ok(())
 }
 
@@ -4015,15 +4029,27 @@ enum NodeKind {
     File { hash: String },
 }
 
-fn site_exists_locked(db: &Connection, name: &str) -> Result<bool, rusqlite::Error> {
-    db.query_row("SELECT 1 FROM sites WHERE name = ?1", params![name], |_| {
-        Ok(())
-    })
-    .optional()
-    .map(|row| row.is_some())
+fn site_exists_locked(
+    db: &mut SqliteConnection,
+    name: &str,
+) -> Result<bool, diesel::result::Error> {
+    sites::table
+        .filter(sites::name.eq(name))
+        .select(sites::id)
+        .first::<i64>(db)
+        .optional()
+        .map(|site| site.is_some())
 }
 
-fn node_locked(db: &Connection, name: &str, rel: &str) -> Result<NodeKind, StoreError> {
+fn site_id_locked(db: &mut SqliteConnection, name: &str) -> Result<i64, StoreError> {
+    sites::table
+        .filter(sites::name.eq(name))
+        .select(sites::id)
+        .first::<i64>(db)
+        .map_err(map_sql)
+}
+
+fn node_locked(db: &mut SqliteConnection, name: &str, rel: &str) -> Result<NodeKind, StoreError> {
     if rel.is_empty() {
         return site_exists_locked(db, name)
             .map(|exists| {
@@ -4035,76 +4061,76 @@ fn node_locked(db: &Connection, name: &str, rel: &str) -> Result<NodeKind, Store
             })
             .map_err(StoreError::Sqlite);
     }
+    let Some(site_id) = sites::table
+        .filter(sites::name.eq(name))
+        .select(sites::id)
+        .first::<i64>(db)
+        .optional()?
+    else {
+        return Ok(NodeKind::Missing);
+    };
+    let hash = files::table
+        .find((site_id, rel))
+        .select(files::hash)
+        .first::<String>(db)
+        .optional()?;
+    if let Some(hash) = hash {
+        return Ok(NodeKind::File { hash });
+    }
     let (prefix_start, prefix_end) = descendant_bounds(rel);
-    let (site_exists, hash, dir_exists): (bool, Option<String>, bool) = db.query_row(
-        "SELECT
-            EXISTS(SELECT 1 FROM sites WHERE name = ?1),
-            (
-                SELECT hash FROM files
-                WHERE site_id = (SELECT id FROM sites WHERE name = ?1)
-                  AND path = ?2
-            ),
-            EXISTS(
-                SELECT 1 FROM files
-                WHERE site_id = (SELECT id FROM sites WHERE name = ?1)
-                  AND path >= ?3
-                  AND path < ?4
-            )",
-        params![name, rel, prefix_start, prefix_end],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    )?;
-    Ok(if !site_exists {
-        NodeKind::Missing
-    } else if let Some(hash) = hash {
-        NodeKind::File { hash }
-    } else if dir_exists {
+    let dir_exists = files::table
+        .filter(files::site_id.eq(site_id))
+        .filter(files::path.ge(prefix_start))
+        .filter(files::path.lt(prefix_end))
+        .select(files::site_id)
+        .first::<i64>(db)
+        .optional()?
+        .is_some();
+    Ok(if dir_exists {
         NodeKind::Dir
     } else {
         NodeKind::Missing
     })
 }
 
-fn load_root_files(db: &Connection, name: &str) -> Result<Vec<(String, u64)>, rusqlite::Error> {
-    let mut stmt = db.prepare(
-        "SELECT path, size
-         FROM files
-         WHERE site_id = (SELECT id FROM sites WHERE name = ?1)
-         ORDER BY path",
-    )?;
-    let rows = stmt.query_map(params![name], file_path_and_size)?;
-    rows.collect()
+fn load_root_files(
+    db: &mut SqliteConnection,
+    name: &str,
+) -> Result<Vec<(String, u64)>, StoreError> {
+    let site_id = site_id_locked(db, name)?;
+    let rows = files::table
+        .filter(files::site_id.eq(site_id))
+        .select((files::path, files::size))
+        .order(files::path)
+        .load::<(String, i64)>(db)?;
+    Ok(rows
+        .into_iter()
+        .map(|(path, size)| (path, size.cast_unsigned()))
+        .collect())
 }
 
 fn load_descendant_files(
-    db: &Connection,
+    db: &mut SqliteConnection,
     name: &str,
     rel: &str,
-) -> Result<Vec<(String, u64)>, rusqlite::Error> {
+) -> Result<Vec<(String, u64)>, StoreError> {
+    let site_id = site_id_locked(db, name)?;
     let (prefix_start, prefix_end) = descendant_bounds(rel);
-    let mut stmt = db.prepare(
-        "SELECT path, size
-         FROM files
-         WHERE site_id = (SELECT id FROM sites WHERE name = ?1)
-           AND path >= ?2
-           AND path < ?3
-         ORDER BY path",
-    )?;
-    let rows = stmt.query_map(params![name, prefix_start, prefix_end], file_path_and_size)?;
-    rows.collect()
-}
-
-fn file_path_and_size(row: &rusqlite::Row<'_>) -> Result<(String, u64), rusqlite::Error> {
-    Ok((row.get(0)?, row.get::<_, i64>(1)?.cast_unsigned()))
+    let rows = files::table
+        .filter(files::site_id.eq(site_id))
+        .filter(files::path.ge(prefix_start))
+        .filter(files::path.lt(prefix_end))
+        .select((files::path, files::size))
+        .order(files::path)
+        .load::<(String, i64)>(db)?;
+    Ok(rows
+        .into_iter()
+        .map(|(path, size)| (path, size.cast_unsigned()))
+        .collect())
 }
 
 fn descendant_bounds(rel: &str) -> (String, String) {
     (format!("{rel}/"), format!("{rel}0"))
-}
-
-fn load_sizes(db: &Connection, sql: &str) -> Result<Vec<u64>, rusqlite::Error> {
-    let mut stmt = db.prepare(sql)?;
-    let rows = stmt.query_map([], |row| row.get::<_, i64>(0).map(i64::cast_unsigned))?;
-    rows.collect()
 }
 
 fn u64_to_f64(value: u64) -> f64 {
@@ -4295,7 +4321,11 @@ fn stage_file(path: &str, source: PathBuf) -> io::Result<Option<StagedFile>> {
 }
 
 #[cfg(test)]
-fn site_files(db: &Connection, blobs: &BlobFiles, name: &str) -> Result<SiteArchive, StoreError> {
+fn site_files(
+    db: &mut SqliteConnection,
+    blobs: &BlobFiles,
+    name: &str,
+) -> Result<SiteArchive, StoreError> {
     let entries = site_manifest(db, name)?;
     let mut files = Vec::new();
     for entry in entries {
@@ -4310,28 +4340,21 @@ fn site_files(db: &Connection, blobs: &BlobFiles, name: &str) -> Result<SiteArch
     Ok(SiteArchive { files })
 }
 
-fn site_manifest(db: &Connection, name: &str) -> Result<Vec<ArchiveEntry>, StoreError> {
-    let site_id: i64 = db
-        .query_row(
-            "SELECT id FROM sites WHERE name = ?1",
-            params![name],
-            |row| row.get(0),
-        )
-        .map_err(map_sql)?;
-    let mut stmt = db.prepare(
-        "SELECT path, hash, size
-         FROM files
-         WHERE site_id = ?1
-         ORDER BY path",
-    )?;
-    let rows = stmt.query_map(params![site_id], |row| {
-        Ok(ArchiveEntry {
-            path: row.get(0)?,
-            hash: row.get(1)?,
-            size: row.get::<_, i64>(2)?.cast_unsigned(),
+fn site_manifest(db: &mut SqliteConnection, name: &str) -> Result<Vec<ArchiveEntry>, StoreError> {
+    let site_id = site_id_locked(db, name)?;
+    let rows = files::table
+        .filter(files::site_id.eq(site_id))
+        .select((files::path, files::hash, files::size))
+        .order(files::path)
+        .load::<(String, String, i64)>(db)?;
+    Ok(rows
+        .into_iter()
+        .map(|(path, hash, size)| ArchiveEntry {
+            path,
+            hash,
+            size: size.cast_unsigned(),
         })
-    })?;
-    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        .collect())
 }
 
 fn write_site_archive(
@@ -4433,32 +4456,27 @@ fn pack_zip(files: &[ArchiveFile]) -> io::Result<Vec<u8>> {
         .map_err(io::Error::other)
 }
 
-fn gc_blobs(tx: &rusqlite::Transaction<'_>, now: i64) -> Result<Vec<String>, rusqlite::Error> {
-    let hashes = {
-        let mut stmt = tx.prepare(
-            "SELECT hash FROM blobs
-             WHERE hash NOT IN (SELECT DISTINCT hash FROM files)
-               AND hash NOT IN (
-                   SELECT DISTINCT files.hash
-                   FROM undo_files AS files
-                   JOIN undo_operations AS operation ON operation.token = files.token
-                   WHERE operation.consumed = 0 AND operation.expires > ?1
-               )",
-        )?;
-        stmt.query_map([now], |row| row.get(0))?
-            .collect::<Result<Vec<_>, _>>()?
-    };
-    tx.execute(
-        "DELETE FROM blobs
-         WHERE hash NOT IN (SELECT DISTINCT hash FROM files)
-           AND hash NOT IN (
-               SELECT DISTINCT files.hash
-               FROM undo_files AS files
-               JOIN undo_operations AS operation ON operation.token = files.token
-               WHERE operation.consumed = 0 AND operation.expires > ?1
-           )",
-        [now],
-    )?;
+fn gc_blobs(tx: &mut SqliteConnection, now: i64) -> Result<Vec<String>, diesel::result::Error> {
+    let live_files = files::table
+        .select(files::hash)
+        .distinct()
+        .load::<String>(tx)?;
+    let live_undo = undo_files::table
+        .inner_join(undo_operations::table.on(undo_operations::token.eq(undo_files::token)))
+        .filter(undo_operations::consumed.eq(0_i64))
+        .filter(undo_operations::expires.gt(now))
+        .select(undo_files::hash)
+        .distinct()
+        .load::<String>(tx)?;
+    let mut live = live_files.into_iter().collect::<HashSet<_>>();
+    live.extend(live_undo);
+    let hashes = blobs::table
+        .select(blobs::hash)
+        .load::<String>(tx)?
+        .into_iter()
+        .filter(|hash| !live.contains(hash))
+        .collect::<Vec<_>>();
+    diesel::delete(blobs::table.filter(blobs::hash.eq_any(&hashes))).execute(tx)?;
     Ok(hashes)
 }
 
@@ -4481,9 +4499,9 @@ fn elapsed_micros(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
-fn map_sql(err: rusqlite::Error) -> StoreError {
+fn map_sql(err: diesel::result::Error) -> StoreError {
     match err {
-        rusqlite::Error::QueryReturnedNoRows => StoreError::NotFound,
+        diesel::result::Error::NotFound => StoreError::NotFound,
         other => StoreError::Sqlite(other),
     }
 }
@@ -4491,6 +4509,17 @@ fn map_sql(err: rusqlite::Error) -> StoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_connection(path: &Path) -> SqliteConnection {
+        SqliteConnection::establish(&path.to_string_lossy()).unwrap()
+    }
+
+    fn schema_version(db: &mut SqliteConnection) -> i64 {
+        diesel::sql_query("PRAGMA user_version")
+            .get_result::<SchemaVersion>(db)
+            .unwrap()
+            .user_version
+    }
 
     struct TestClock {
         millis: AtomicU64,
@@ -4546,60 +4575,115 @@ mod tests {
             store.put_file("hello", "nested/UNDO", b"no"),
             Err(StoreError::Upload(UploadError::ReservedPath))
         ));
-        let db = Connection::open(dir.path().join("symbol.db")).unwrap();
+        let mut db = test_connection(&dir.path().join("symbol.db"));
+        assert_eq!(schema_version(&mut db), LATEST_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn production_v6_database_is_safely_baselined() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("symbol.db");
+        let mut db = test_connection(&path);
+        db.batch_execute(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/migrations/00000000000000_schema_v6/up.sql"
+        )))
+        .unwrap();
+        diesel::insert_into(sites::table)
+            .values(NewSite {
+                name: "existing",
+                updated: 1,
+                public_url: "https://symbol.example",
+                content_revision: 7,
+                tree_hash: "blake3:existing",
+                creator_kind: None,
+                creator_hash: None,
+                claim_hash: None,
+                management_hash: None,
+                management_status: 0,
+            })
+            .execute(&mut db)
+            .unwrap();
+        run_migrations(&mut db).unwrap();
+        run_migrations(&mut db).unwrap();
+        assert_eq!(schema_version(&mut db), LATEST_SCHEMA_VERSION);
         assert_eq!(
-            db.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            sites::table
+                .filter(sites::name.eq("existing"))
+                .select(sites::content_revision)
+                .first::<i64>(&mut db)
                 .unwrap(),
-            LATEST_SCHEMA_VERSION
+            7
         );
     }
 
     #[test]
-    fn version_two_database_runs_expiry_management_and_aggregate_migrations() {
+    fn production_shaped_v2_database_migrates_through_current_schema() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("symbol.db");
-        let mut db = Connection::open(path).unwrap();
-        db.pragma_update(None, "foreign_keys", "ON").unwrap();
-        db.execute_batch(SCHEMA).unwrap();
-        migrate_lifecycle_schema(&mut db).unwrap();
-        db.execute_batch(
-            "DROP TABLE undo_expiry_policies;
-             DROP INDEX expiry_policies_site_kind;
-             ALTER TABLE expiry_policies DROP COLUMN size_bytes;
-             PRAGMA user_version = 2;",
-        )
+        let mut db = test_connection(&path);
+        db.batch_execute(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/migrations/00000000000000_schema_v6/up.sql"
+        )))
+        .unwrap();
+        diesel::insert_into(sites::table)
+            .values(NewSite {
+                name: "legacy",
+                updated: 1,
+                public_url: "https://symbol.example",
+                content_revision: 2,
+                tree_hash: "blake3:legacy",
+                creator_kind: None,
+                creator_hash: None,
+                claim_hash: None,
+                management_hash: None,
+                management_status: 0,
+            })
+            .execute(&mut db)
+            .unwrap();
+        let site_id = site_id_locked(&mut db, "legacy").unwrap();
+        diesel::insert_into(blobs::table)
+            .values((
+                blobs::hash.eq("legacy-hash"),
+                blobs::bytes.eq(Vec::<u8>::new()),
+                blobs::size.eq(4_i64),
+            ))
+            .execute(&mut db)
+            .unwrap();
+        diesel::insert_into(files::table)
+            .values(NewFile {
+                site_id,
+                path: "index.html",
+                hash: "legacy-hash",
+                size: 4,
+            })
+            .execute(&mut db)
+            .unwrap();
+        db.batch_execute(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/downgrade_v6_to_v2.sql"
+        )))
         .unwrap();
 
         run_migrations(&mut db).unwrap();
 
-        let version: i64 = db
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, LATEST_SCHEMA_VERSION);
-        for table in [
-            "undo_expiry_policies",
-            "management_audit",
-            "path_aggregates",
-        ] {
-            assert_eq!(
-                db.query_row(
-                    "SELECT COUNT(*) FROM sqlite_master
-                     WHERE type = 'table' AND name = ?1",
-                    [table],
-                    |row| row.get::<_, i64>(0),
-                )
+        assert_eq!(schema_version(&mut db), LATEST_SCHEMA_VERSION);
+        assert_eq!(
+            path_aggregates::table
+                .find((site_id, ""))
+                .select((path_aggregates::logical_bytes, path_aggregates::file_count))
+                .first::<(i64, i64)>(&mut db)
                 .unwrap(),
-                1
-            );
-        }
-        let expiry_columns = db
-            .prepare("PRAGMA table_info(expiry_policies)")
-            .unwrap()
-            .query_map([], |row| row.get::<_, String>(1))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        assert!(expiry_columns.iter().any(|column| column == "size_bytes"));
+            (4, 1)
+        );
+        assert_eq!(
+            management_audit::table
+                .count()
+                .get_result::<i64>(&mut db)
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -4614,14 +4698,13 @@ mod tests {
         store.put_file("hello", "assets/a.txt", b"aaaaa").unwrap();
 
         let aggregate = |site: &str, path: &str| {
-            let db = Connection::open(dir.path().join("symbol.db")).unwrap();
-            db.query_row(
-                "SELECT logical_bytes, file_count FROM path_aggregates
-                 WHERE site_id = (SELECT id FROM sites WHERE name = ?1) AND path = ?2",
-                params![site, path],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-            )
-            .unwrap()
+            let mut db = test_connection(&dir.path().join("symbol.db"));
+            let site_id = site_id_locked(&mut db, site).unwrap();
+            path_aggregates::table
+                .find((site_id, path))
+                .select((path_aggregates::logical_bytes, path_aggregates::file_count))
+                .first::<(i64, i64)>(&mut db)
+                .unwrap()
         };
         assert_eq!(aggregate("hello", ""), (8, 3));
         assert_eq!(aggregate("hello", "assets"), (7, 2));
@@ -4679,6 +4762,51 @@ mod tests {
         clock.advance(u64::try_from(UNDO_RETENTION_MILLIS).unwrap() + 1);
         store.prune_undo_and_gc().unwrap();
         assert!(store.undo_stack("hello").unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn unknown_stored_undo_kind_is_rejected_instead_of_mislabeled() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+        store.put_file("hello", "index.html", b"content").unwrap();
+        let token = store.undo_stack("hello").unwrap().entries[0].token.clone();
+        let mut db = test_connection(&dir.path().join("symbol.db"));
+        diesel::update(undo_operations::table.find(&token))
+            .set(undo_operations::kind.eq(999_i64))
+            .execute(&mut db)
+            .unwrap();
+        assert!(matches!(
+            store.undo_stack("hello"),
+            Err(StoreError::UnsupportedUndoKind(999))
+        ));
+    }
+
+    #[test]
+    fn file_delete_and_site_create_have_isolated_undo_restoration() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+        store.put_file("existing", "keep.txt", b"keep").unwrap();
+        store.delete_file("existing", "keep.txt").unwrap();
+        assert!(matches!(
+            store.lookup("existing", "keep.txt"),
+            Err(StoreError::NotFound)
+        ));
+        let delete = store.undo_stack("existing").unwrap().entries[0]
+            .token
+            .clone();
+        store.undo("existing", Some(&delete)).unwrap();
+        let hash = match store.lookup("existing", "keep.txt").unwrap() {
+            Node::File { hash, .. } => hash,
+            Node::Dir => panic!("expected restored file"),
+        };
+        assert_eq!(store.read_blob(&hash).unwrap().as_ref(), b"keep");
+
+        store.put_file("created", "index.html", b"new").unwrap();
+        let create = store.undo_stack("created").unwrap().entries[0]
+            .token
+            .clone();
+        store.undo("created", Some(&create)).unwrap();
+        assert!(!store.site_exists("created"));
     }
 
     #[test]
@@ -4816,6 +4944,48 @@ mod tests {
             store.lookup("soon", "index.html"),
             Ok(Node::File { .. })
         ));
+    }
+
+    #[test]
+    fn partial_expiry_updates_aggregates_without_full_site_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(TestClock::new(1_700_000_000_000));
+        let store = Store::with_clock(
+            dir.path().to_path_buf(),
+            "http://symbol".to_string(),
+            Arc::<TestClock>::clone(&clock),
+        )
+        .unwrap();
+        store.put_file("hello", "assets/a.txt", b"aaa").unwrap();
+        store.put_file("hello", "assets/b.txt", b"bb").unwrap();
+        store.put_file("hello", "keep.txt", b"k").unwrap();
+        store
+            .set_expiry(
+                "hello",
+                "assets",
+                Some(ExpiryPolicy::Relative {
+                    duration_seconds: 1,
+                }),
+            )
+            .unwrap();
+        clock.advance(1_001);
+        assert_eq!(store.sweep_expired().unwrap(), 1);
+        assert!(matches!(
+            store.lookup("hello", "keep.txt"),
+            Ok(Node::File { .. })
+        ));
+        assert!(matches!(
+            store.lookup("hello", "assets"),
+            Err(StoreError::NotFound)
+        ));
+        let mut db = store.inner.readers.get();
+        let site_id = site_id_locked(&mut db, "hello").unwrap();
+        let aggregate = path_aggregates::table
+            .find((site_id, ""))
+            .select((path_aggregates::logical_bytes, path_aggregates::file_count))
+            .first::<(i64, i64)>(&mut *db)
+            .unwrap();
+        assert_eq!(aggregate, (1, 1));
     }
 
     #[test]
@@ -5021,15 +5191,13 @@ mod tests {
         };
         let blob_path = store.blob_path(&hash);
         assert_eq!(fs::read(&blob_path).unwrap(), b"<h1>x</h1>");
-        let db = Connection::open(dir.path().join("symbol.db")).unwrap();
-        let stored_bytes: i64 = db
-            .query_row(
-                "SELECT length(bytes) FROM blobs WHERE hash = ?1",
-                [&hash],
-                |row| row.get(0),
-            )
+        let mut db = test_connection(&dir.path().join("symbol.db"));
+        let stored_bytes = blobs::table
+            .find(&hash)
+            .select(blobs::bytes)
+            .first::<Vec<u8>>(&mut db)
             .unwrap();
-        assert_eq!(stored_bytes, 0);
+        assert!(stored_bytes.is_empty());
         drop(db);
         assert_eq!(store.read_blob(&hash).unwrap().as_ref(), b"<h1>x</h1>");
         let tar = store.pack_site("hello", ArchiveFormat::Tar).unwrap();
@@ -5051,21 +5219,41 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let hash = blake3::hash(b"legacy").to_hex().to_string();
         {
-            let db = Connection::open(dir.path().join("symbol.db")).unwrap();
-            db.execute_batch(SCHEMA).unwrap();
-            db.execute(
-                "INSERT INTO blobs (hash, bytes, size) VALUES (?1, ?2, 6)",
-                params![hash, b"legacy".as_slice()],
-            )
-            .unwrap();
-            db.execute("INSERT INTO sites (name, updated) VALUES ('hello', 0)", [])
+            let mut db = test_connection(&dir.path().join("symbol.db"));
+            run_migrations(&mut db).unwrap();
+            diesel::insert_into(blobs::table)
+                .values((
+                    blobs::hash.eq(&hash),
+                    blobs::bytes.eq(b"legacy".as_slice()),
+                    blobs::size.eq(6_i64),
+                ))
+                .execute(&mut db)
                 .unwrap();
-            db.execute(
-                "INSERT INTO files (site_id, path, hash, size)
-                 VALUES ((SELECT id FROM sites WHERE name = 'hello'), 'legacy.bin', ?1, 6)",
-                [&hash],
-            )
-            .unwrap();
+            let site_id = diesel::insert_into(sites::table)
+                .values(NewSite {
+                    name: "hello",
+                    updated: 0,
+                    public_url: "",
+                    content_revision: 0,
+                    tree_hash: "",
+                    creator_kind: None,
+                    creator_hash: None,
+                    claim_hash: None,
+                    management_hash: None,
+                    management_status: 0,
+                })
+                .returning(sites::id)
+                .get_result::<i64>(&mut db)
+                .unwrap();
+            diesel::insert_into(files::table)
+                .values(NewFile {
+                    site_id,
+                    path: "legacy.bin",
+                    hash: &hash,
+                    size: 6,
+                })
+                .execute(&mut db)
+                .unwrap();
         }
         let target = dir.path().join("blobs").join(&hash[..2]).join(&hash[2..]);
         fs::create_dir_all(target.parent().unwrap()).unwrap();
@@ -5074,23 +5262,22 @@ mod tests {
         let store = Store::new(dir.path().to_path_buf()).unwrap();
         assert_eq!(fs::read(store.blob_path(&hash)).unwrap(), b"legacy");
         assert_eq!(store.read_blob(&hash).unwrap(), "legacy");
-        let db = Connection::open(dir.path().join("symbol.db")).unwrap();
+        let mut db = test_connection(&dir.path().join("symbol.db"));
         assert_eq!(
-            db.query_row(
-                "SELECT length(bytes) FROM blobs WHERE hash = ?1",
-                [&hash],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap(),
+            blobs::table
+                .find(&hash)
+                .select(blobs::bytes)
+                .first::<Vec<u8>>(&mut db)
+                .unwrap()
+                .len(),
             0
         );
         assert_eq!(
-            db.query_row(
-                "SELECT value FROM metadata WHERE key = 'external_blobs_v1'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .unwrap(),
+            metadata::table
+                .find("external_blobs_v1")
+                .select(metadata::value)
+                .first::<String>(&mut db)
+                .unwrap(),
             "1"
         );
     }
@@ -5148,33 +5335,33 @@ mod tests {
                 .unwrap();
         }
         {
-            let db = Connection::open(dir.path().join("symbol.db")).unwrap();
+            let mut db = test_connection(&dir.path().join("symbol.db"));
             let apple = [0x00u8, 0x05, 0x16, 0x07, 0, 2, 0, 0];
             let apple_len = i64::try_from(apple.len()).unwrap();
             let hash = blake3::hash(&apple).to_hex().to_string();
             let blob = dir.path().join("blobs").join(&hash[..2]).join(&hash[2..]);
             fs::create_dir_all(blob.parent().unwrap()).unwrap();
             fs::write(blob, apple).unwrap();
-            db.execute(
-                "INSERT INTO blobs (hash, bytes, size) VALUES (?1, X'', ?2)",
-                params![hash, apple_len],
-            )
-            .unwrap();
-            let site_id: i64 = db
-                .query_row("SELECT id FROM sites WHERE name = 'hello'", [], |row| {
-                    row.get(0)
-                })
+            diesel::insert_into(blobs::table)
+                .values((
+                    blobs::hash.eq(&hash),
+                    blobs::bytes.eq(Vec::<u8>::new()),
+                    blobs::size.eq(apple_len),
+                ))
+                .execute(&mut db)
                 .unwrap();
-            db.execute(
-                "INSERT INTO files (site_id, path, hash, size) VALUES (?1, ?2, ?3, ?4)",
-                params![site_id, "._index.html", hash, apple_len],
-            )
-            .unwrap();
-            db.execute(
-                "INSERT INTO files (site_id, path, hash, size) VALUES (?1, ?2, ?3, ?4)",
-                params![site_id, "keep.bin", hash, apple_len],
-            )
-            .unwrap();
+            let site_id = site_id_locked(&mut db, "hello").unwrap();
+            for path in ["._index.html", "keep.bin"] {
+                diesel::insert_into(files::table)
+                    .values(NewFile {
+                        site_id,
+                        path,
+                        hash: &hash,
+                        size: apple_len,
+                    })
+                    .execute(&mut db)
+                    .unwrap();
+            }
         }
         let store = Store::new(dir.path().to_path_buf()).unwrap();
         assert_eq!(
@@ -5469,5 +5656,24 @@ mod tests {
         });
 
         assert_eq!(store.list_files("hello").unwrap().len(), 42);
+    }
+
+    #[test]
+    fn concurrent_upload_paths_are_unique_within_one_clock_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(TestClock::new(1_700_000_000_000));
+        let store = Store::with_clock(dir.path().to_path_buf(), "http://symbol".to_string(), clock)
+            .unwrap();
+        let paths = Arc::new(Mutex::new(HashSet::new()));
+        std::thread::scope(|scope| {
+            for _ in 0..32 {
+                let store = store.clone();
+                let paths = Arc::clone(&paths);
+                scope.spawn(move || {
+                    paths.lock().unwrap().insert(store.upload_path());
+                });
+            }
+        });
+        assert_eq!(paths.lock().unwrap().len(), 32);
     }
 }
