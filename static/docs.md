@@ -6,6 +6,8 @@ archives (zip, tar, tar.gz, gz) can be unpacked with `-H unpack:1`.
 
 GET is the site. PUT adds files. DELETE pops a site as tar.gz.
 
+see [{host}/FILES]({host}/FILES) for site listing.
+
 ## the client
 
 for convenience, you may install the utility client.
@@ -24,6 +26,9 @@ symbol put hello ./dist      # merge a folder into {host}/hello
 symbol put -u hello site.zip # merge an unpacked zip
 symbol put hello style.css   # add or update one file
 symbol clone hello           # make a local checkout
+symbol copy hello hello-copy # duplicate a site on the server
+symbol remix hello           # duplicate and clone locally
+symbol move hello-copy moved # rename without copying files
 symbol sync                  # publish if upstream has not changed
 symbol ls                    # list all sites
 symbol stats                 # storage totals and distributions
@@ -40,6 +45,13 @@ uploading to an existing site only adds or updates the files you send; it does
 not remove anything else. every clone contains a generated `symbol.toml`, so
 running bare `symbol put` from that directory publishes it to the same site.
 `symbol sync` is stricter and refuses if upstream has changed.
+
+copy and move refuse an existing destination. `symbol undo` reverses the most
+recent retained mutation. managed sites use `symbol manage NAME --claim`,
+`--rotate`, or `--release`; tokens are read from `-t`, `SYMBOL_TOKEN`, then
+`symbol.toml`.
+the server redacts recognizable Symbol tokens from inspectable uploads, but
+encrypted or otherwise opaque content cannot be guaranteed safe.
 
 ## curl
 
@@ -110,6 +122,7 @@ curl -X MOVE {host}/hello-copy -H 'Destination: /hello-moved'
 curl {host}/hello/UNDO
 curl -X UNDO {host}/hello
 curl -X EXPIRE {host}/hello
+curl -X MANAGE {host}/hello -H 'Management-Action: status'
 ```
 
 download a site without removing it

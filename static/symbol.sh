@@ -656,10 +656,8 @@ print_mutation_result() {
     [ -z "$last" ] || printf '\n'
   fi
   undo=$(header_value Undo-Token)
-  undo_expires=$(header_value Undo-Expires)
   if [ -n "$undo" ]; then
-    printf 'undo: symbol undo %s %s (expires %s)\n' \
-      "$1" "$undo" "${undo_expires:-unknown}"
+    printf 'undo within 4h: symbol undo %s %s\n' "$1" "$undo"
   fi
   management_count=$(header_value Sanitized-Management-Tokens)
   claim_count=$(header_value Sanitized-Creator-Claims)
@@ -692,6 +690,11 @@ update update upgrade
 help help -h --help
 EOF
 }
+
+if [ "${SYMBOL_TEST_COMMAND_REGISTRY:-0}" = 1 ]; then
+  command_registry
+  exit 0
+fi
 
 resolve_command() {
   query=$1
@@ -793,9 +796,8 @@ archive_transfer() {
     if [ "$method" = DELETE ]; then
       HTTP_HEADERS=$archive_headers
       undo=$(header_value Undo-Token)
-      undo_expires=$(header_value Undo-Expires)
-      [ -z "$undo" ] || printf 'undo: symbol undo %s %s (expires %s)\n' \
-        "$name" "$undo" "${undo_expires:-unknown}" >&2
+      [ -z "$undo" ] ||
+        printf 'undo within 4h: symbol undo %s %s\n' "$name" "$undo" >&2
     fi
     rm -f "$archive_headers"
     return
@@ -806,9 +808,8 @@ archive_transfer() {
     if [ "$method" = DELETE ]; then
       HTTP_HEADERS=$archive_headers
       undo=$(header_value Undo-Token)
-      undo_expires=$(header_value Undo-Expires)
-      [ -z "$undo" ] || printf 'undo: symbol undo %s %s (expires %s)\n' \
-        "$name" "$undo" "${undo_expires:-unknown}" >&2
+      [ -z "$undo" ] ||
+        printf 'undo within 4h: symbol undo %s %s\n' "$name" "$undo" >&2
     fi
     rm -f "$archive_headers"
   else
@@ -916,6 +917,22 @@ write_secret_sidecar() {
   printf 'saved %s to %s/%s (mode 0600)\n' "$kind" "$dir" "$sidecar"
 }
 
+remove_secret_sidecar() {
+  kind=$1
+  manifest=$2
+  dir=$(dirname "$manifest")
+  case "$kind" in
+    token) sidecar=.symbol-token ;;
+    claim) sidecar=.symbol-claim ;;
+    *) return 1 ;;
+  esac
+  rm -f "$dir/$sidecar"
+  tmp=$(mktemp "$dir/.symbol.toml.XXXXXX") || exit 1
+  awk -v key="$kind" '$0 !~ "^[[:space:]]*" key "[[:space:]]*="' \
+    "$manifest" > "$tmp"
+  mv "$tmp" "$manifest"
+}
+
 save_claim_recovery() {
   name=$1
   claim=$2
@@ -929,6 +946,29 @@ save_claim_recovery() {
   chmod 600 "$file"
   umask "$old_umask"
   printf 'saved creator claim to %s (mode 0600)\n' "$file"
+}
+
+persist_pending_claim() {
+  key=$1
+  claim=$2
+  state_root=${XDG_STATE_HOME:-${HOME}/.local/state}
+  directory=$state_root/symbol/claims
+  old_umask=$(umask)
+  umask 077
+  mkdir -p "$directory"
+  PENDING_CLAIM_FILE=$directory/pending-$key
+  printf '%s\n' "$claim" > "$PENDING_CLAIM_FILE"
+  chmod 600 "$PENDING_CLAIM_FILE"
+  umask "$old_umask"
+}
+
+finish_pending_claim() {
+  name=$1
+  [ -n "${PENDING_CLAIM_FILE:-}" ] || return 0
+  destination=$(dirname "$PENDING_CLAIM_FILE")/$name
+  mv "$PENDING_CLAIM_FILE" "$destination"
+  PENDING_CLAIM_FILE=
+  printf 'saved creator claim to %s (mode 0600)\n' "$destination"
 }
 
 remove_claim_recovery() {
@@ -979,7 +1019,8 @@ put_file_request() {
     usage_error "invalid site name: $site"
   auth=$(mktemp) || exit 1
   auth_args_file "$auth"
-  set -- -H "Idempotency-Key: $(random_key)"
+  idempotency_key=$(random_key)
+  set -- -H "Idempotency-Key: $idempotency_key"
   while IFS= read -r arg; do set -- "$@" "$arg"; done < "$auth"
   rm -f "$auth"
   [ -z "$conditional" ] || set -- "$@" -H "If-Match: $conditional"
@@ -992,13 +1033,18 @@ put_file_request() {
     fi
   fi
   claim=
+  claim_generated=0
   if [ -n "$claim_manifest" ] && manifest_value claim "$claim_manifest" >/dev/null 2>&1; then
     claim=$(claim_from_manifest "$claim_manifest")
   fi
   if [ -z "$claim" ]; then
     claim="sym_claim_$(random_key)$(random_key)"
+    claim_generated=1
     [ -z "$claim_manifest" ] || write_secret_sidecar claim "$claim" "$claim_manifest"
   fi
+  PENDING_CLAIM_FILE=
+  [ -n "$claim_manifest" ] ||
+    persist_pending_claim "$idempotency_key" "$claim"
   set -- "$@" -H "Creator-Claim: $claim"
   if [ "$managed" -eq 1 ]; then
     set -- "$@" -H 'Management-Action: claim'
@@ -1035,14 +1081,36 @@ put_file_request() {
   else
     url="${base}/${site}"
   fi
-  if [ "$generated" -eq 1 ]; then
-    http_request PUT "$url" "$@" -T - < "$source"
-  else
-    http_request PUT "$url" "$@" -T "$source"
-  fi || {
-    [ -z "${ARCHIVE_FILE:-}" ] || rm -f "$ARCHIVE_FILE"
-    return 1
+  put_attempt() {
+    if [ "$generated" -eq 1 ]; then
+      http_request PUT "$url" "$@" -T - < "$source"
+    else
+      http_request PUT "$url" "$@" -T "$source"
+    fi
   }
+  if ! put_attempt "$@"; then
+    if [ -z "${HTTP_STATUS:-}" ] || [ "$HTTP_STATUS" = 000 ]; then
+      put_attempt "$@" || {
+        if [ -n "${HTTP_STATUS:-}" ] && [ "$HTTP_STATUS" != 000 ]; then
+          rm -f "${PENDING_CLAIM_FILE:-}"
+          PENDING_CLAIM_FILE=
+          if [ "$claim_generated" -eq 1 ] && [ -n "$claim_manifest" ]; then
+            remove_secret_sidecar claim "$claim_manifest"
+          fi
+        fi
+        [ -z "${ARCHIVE_FILE:-}" ] || rm -f "$ARCHIVE_FILE"
+        return 1
+      }
+    else
+      rm -f "${PENDING_CLAIM_FILE:-}"
+      PENDING_CLAIM_FILE=
+      if [ "$claim_generated" -eq 1 ] && [ -n "$claim_manifest" ]; then
+        remove_secret_sidecar claim "$claim_manifest"
+      fi
+      [ -z "${ARCHIVE_FILE:-}" ] || rm -f "$ARCHIVE_FILE"
+      return 1
+    fi
+  fi
   [ -z "${ARCHIVE_FILE:-}" ] || rm -f "$ARCHIVE_FILE"
   ARCHIVE_FILE=
   location=$(header_value Location)
@@ -1062,7 +1130,13 @@ put_file_request() {
   print_mutation_result "$final_name" 1
   save_response_secrets "$base" "$final_name"
   if [ "$HTTP_STATUS" = 201 ] && [ -z "$claim_manifest" ]; then
-    save_claim_recovery "$final_name" "$claim"
+    finish_pending_claim "$final_name"
+  elif [ "$HTTP_STATUS" != 201 ]; then
+    rm -f "${PENDING_CLAIM_FILE:-}"
+    PENDING_CLAIM_FILE=
+    if [ "$claim_generated" -eq 1 ] && [ -n "$claim_manifest" ]; then
+      remove_secret_sidecar claim "$claim_manifest"
+    fi
   fi
   management=$(header_value Management-Token)
   if [ -n "$management" ] && [ -n "$claim_manifest" ]; then
@@ -1118,32 +1192,62 @@ copy_or_move_request() {
   while IFS= read -r arg; do set -- "$@" "$arg"; done < "$auth"
   rm -f "$auth"
   [ -z "$destination" ] || set -- "$@" -H "Destination: /$destination"
+  PENDING_CLAIM_FILE=
   if [ "$method" = COPY ]; then
-    set -- "$@" -H "Idempotency-Key: $(random_key)"
+    idempotency_key=$(random_key)
+    set -- "$@" -H "Idempotency-Key: $idempotency_key"
     claim="sym_claim_$(random_key)$(random_key)"
+    persist_pending_claim "$idempotency_key" "$claim"
     set -- "$@" -H "Creator-Claim: $claim"
     if [ "$managed" -eq 1 ]; then
       set -- "$@" -H 'Management-Action: claim'
     fi
   fi
-  http_request "$method" "${HOST}/${source}" "$@" || return 1
-  location=$(header_value Location)
+  recovered_location=
+  if ! http_request "$method" "${HOST}/${source}" "$@"; then
+    if [ "$method" = COPY ] &&
+      { [ -z "${HTTP_STATUS:-}" ] || [ "$HTTP_STATUS" = 000 ]; }; then
+      if [ -n "$destination" ]; then
+        if curl -fsS "${HOST}/${destination}/symbol.toml" >/dev/null 2>&1; then
+          recovered_location="${HOST}/${destination}/"
+        else
+          return 1
+        fi
+      else
+        http_request "$method" "${HOST}/${source}" "$@" || return 1
+      fi
+    else
+      rm -f "${PENDING_CLAIM_FILE:-}"
+      PENDING_CLAIM_FILE=
+      return 1
+    fi
+  fi
+  location=${recovered_location:-$(header_value Location)}
   [ -n "$location" ] || die "server omitted Location"
   RESULT_NAME=${location%/}
   RESULT_NAME=${RESULT_NAME##*/}
-  RESULT_MANAGEMENT_TOKEN=$(header_value Management-Token)
-  RESULT_CLAIM_TOKEN=$(header_value Creator-Claim)
+  if [ -n "$recovered_location" ]; then
+    RESULT_MANAGEMENT_TOKEN=
+    RESULT_CLAIM_TOKEN=
+  else
+    RESULT_MANAGEMENT_TOKEN=$(header_value Management-Token)
+    RESULT_CLAIM_TOKEN=$(header_value Creator-Claim)
+  fi
   if [ "$method" = COPY ] && [ -n "$claim" ]; then
     RESULT_CLAIM_TOKEN=$claim
-    save_claim_recovery "$RESULT_NAME" "$claim"
+    finish_pending_claim "$RESULT_NAME"
   fi
   if [ "$method" = COPY ]; then
     printf 'copied %s/%s/ -> %s\n' "$HOST" "$source" "$location"
   else
     printf 'moved %s/%s/ -> %s\n' "$HOST" "$source" "$location"
   fi
-  print_mutation_result "$RESULT_NAME" 1
-  save_response_secrets "$HOST" "$RESULT_NAME"
+  if [ -z "$recovered_location" ]; then
+    print_mutation_result "$RESULT_NAME" 1
+    save_response_secrets "$HOST" "$RESULT_NAME"
+  else
+    printf 'response was lost; creator claim retained for recovery\n' >&2
+  fi
 }
 
 clone_site() {
@@ -1295,6 +1399,14 @@ print_inherited_expiry_caps() {
         if (expires != "") printf "inherited cap:      %s %s at %s\n", kind, path, expires
         rest = substr(rest, RSTART + RLENGTH)
       }
+      limit = text
+      sub(/^.*"limited_by":[[:space:]]*/, "", limit)
+      if (substr(limit, 1, 4) != "null") {
+        kind = field(limit, "kind")
+        path = field(limit, "path")
+        if (path == "null" || path == "") path = "(site)"
+        if (kind != "") printf "limited by:         %s %s\n", kind, path
+      }
     }
     function field(object, key, token, value) {
       token = "\"" key "\":"
@@ -1311,7 +1423,96 @@ print_inherited_expiry_caps() {
   ' "$HTTP_BODY"
 }
 
+print_expiry_site_report() {
+  awk '
+    {
+      text = text $0
+    }
+    END {
+      site = string_field(text, "site")
+      printf "expiry policies for %s\n", site
+      printf "%-28s %-9s %-22s %s\n", "TARGET", "MODE", "EXPIRES", "LIMITED BY"
+      marker = "\"entries\":["
+      start = index(text, marker)
+      if (!start) exit
+      rest = substr(text, start + length(marker))
+      depth = 0
+      quoted = 0
+      escaped = 0
+      object = ""
+      for (i = 1; i <= length(rest); i++) {
+        character = substr(rest, i, 1)
+        if (quoted) {
+          if (escaped) escaped = 0
+          else if (character == "\\") escaped = 1
+          else if (character == "\"") quoted = 0
+        } else if (character == "\"") {
+          quoted = 1
+        } else if (character == "{") {
+          depth++
+        } else if (character == "}") {
+          depth--
+        } else if (character == "]" && depth == 0) {
+          break
+        }
+        if (depth > 0 || object != "") object = object character
+        if (depth == 0 && object != "") {
+          render(object, site)
+          object = ""
+        }
+      }
+    }
+    function string_field(object, key, token, value) {
+      token = "\"" key "\":"
+      if (!index(object, token)) return ""
+      value = substr(object, index(object, token) + length(token))
+      sub(/^[[:space:]]*/, "", value)
+      if (substr(value, 1, 1) != "\"") {
+        sub(/[,}].*$/, "", value)
+        return value
+      }
+      value = substr(value, 2)
+      sub(/".*$/, "", value)
+      return value
+    }
+    function human(seconds, days, hours, minutes, result) {
+      seconds = int(seconds)
+      days = int(seconds / 86400); seconds %= 86400
+      hours = int(seconds / 3600); seconds %= 3600
+      minutes = int(seconds / 60); seconds %= 60
+      if (days) result = days "d"
+      if (hours) result = result (result ? " " : "") hours "h"
+      if (minutes) result = result (result ? " " : "") minutes "m"
+      if (seconds || !result) result = result (result ? " " : "") seconds "s"
+      return result
+    }
+    function render(object, site, path, target, mode, expires, remaining, limit, limited) {
+      path = string_field(object, "path")
+      target = site (path == "null" || path == "" ? "/" : "/" path)
+      mode = string_field(object, "mode")
+      expires = string_field(object, "effective_expires_at")
+      remaining = string_field(object, "remaining_seconds")
+      limit = object
+      sub(/^.*"limited_by":[[:space:]]*/, "", limit)
+      if (substr(limit, 1, 4) == "null") {
+        limited = "-"
+      } else {
+        limited = string_field(limit, "kind")
+        path = string_field(limit, "path")
+        if (path != "null" && path != "") limited = limited " " path
+      }
+      if (expires == "null" || expires == "") expires = "disabled"
+      else expires = expires " (in " human(remaining) ")"
+      printf "%-28s %-9s %-22s %s\n", target, mode, expires, limited
+    }
+  ' "$HTTP_BODY"
+}
+
 print_expire_report() {
+  if awk 'index($0, "\"entries\":[") { found=1 } END { exit !found }' "$HTTP_BODY"; then
+    print_expiry_site_report
+    return
+  fi
   report_site=$(json_string site < "$HTTP_BODY" 2>/dev/null || true)
   report_path=$(json_string path < "$HTTP_BODY" 2>/dev/null || true)
   expires=$(json_string effective_expires_at < "$HTTP_BODY" 2>/dev/null || true)
@@ -1871,6 +2072,8 @@ case "$cmd" in
             token=object; sub(/^.*"token"[[:space:]]*:[[:space:]]*"/,"",token); sub(/".*$/,"",token)
             description=object; sub(/^.*"description"[[:space:]]*:[[:space:]]*"/,"",description); sub(/".*$/,"",description)
             expires=object; sub(/^.*"expires_at"[[:space:]]*:[[:space:]]*"/,"",expires); sub(/".*$/,"",expires)
+            sub("T", " ", expires)
+            sub(/:[0-9][0-9](\.[0-9]+)?Z$/, "Z", expires)
             remaining=object; sub(/^.*"remaining_seconds"[[:space:]]*:[[:space:]]*/,"",remaining); sub(/[^0-9].*$/,"",remaining)
             printf "%-10s %-34s %s (in %s)\n",token,description,expires,human(remaining)
             rest=substr(rest,RSTART+RLENGTH)

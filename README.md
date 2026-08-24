@@ -122,3 +122,26 @@ identity, so management relies on claim/management tokens by default.
 This runs formatting checks, strict Clippy lints, Rust tests, shell syntax
 checks, and client conformance tests. The public guide is parsed and rendered
 by the Rust page tests.
+
+The server binary exposes its typed public contract for conformance tooling:
+
+```sh
+target/debug/symbol contract
+```
+
+Before release:
+
+```sh
+./release-check
+```
+
+This adds the locked release build and bounded Nix build. Production sign-off
+uses the complete deployment gate:
+
+```sh
+SYMBOL_DEPLOY_CHECK=1 ./release-check
+```
+
+That installs/restarts the service and verifies STATS JSON and the public
+homepage. A plain `release-check` intentionally does not mutate a running
+deployment.

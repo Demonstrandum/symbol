@@ -6,6 +6,7 @@ macro_rules! static_asset {
 
 mod blob_store;
 mod browse;
+mod contract;
 mod expiry;
 mod http_cache;
 mod name;
@@ -108,6 +109,7 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
+    Contract,
     Admin {
         #[command(subcommand)]
         action: AdminAction,
@@ -310,6 +312,13 @@ async fn main() {
         .init();
 
     let mut args = Args::parse();
+    if matches!(args.command.as_ref(), Some(Command::Contract)) {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(contract::ENDPOINTS).expect("contract is serializable")
+        );
+        return;
+    }
     let is_admin = args.command.is_some();
     let public_url = args.public_url.take().unwrap_or_else(|| {
         assert!(
@@ -384,40 +393,40 @@ async fn main() {
 fn router(app: App) -> Router {
     let identity_provider = app.identity_provider.clone();
     Router::new()
-        .route("/", get(docs).put(put_site_unnamed))
-        .route("/HASH", get(docs_hash))
-        .route("/STATS", get(stats))
-        .route("/STATS/", get(stats))
-        .route("/install.sh", get(install_sh))
-        .route("/install.sh/HASH", get(install_sh_hash))
-        .route("/symbol.sh", get(symbol_sh))
-        .route("/symbol.sh/HASH", get(symbol_sh_hash))
-        .route("/FILES", get(list_sites))
-        .route("/FILES/", get(list_sites))
-        .route("/{name}/FILES", get(browse_root))
-        .route("/{name}/FILES/", get(browse_root))
-        .route("/{name}/FILES/{*path}", get(browse_path))
-        .route("/{name}/UNDO", get(undo_stack))
-        .route("/{name}/UNDO/", get(undo_stack))
-        .route("/{name}/EXPIRES", get(expiry_site_report))
-        .route("/{name}/EXPIRES/", get(expiry_site_report))
+        .route(contract::ROOT, get(docs).put(put_site_unnamed))
+        .route(contract::HASH, get(docs_hash))
+        .route(contract::STATS, get(stats))
+        .route(contract::STATS_SLASH, get(stats))
+        .route(contract::INSTALL, get(install_sh))
+        .route(contract::INSTALL_HASH, get(install_sh_hash))
+        .route(contract::CLIENT, get(symbol_sh))
+        .route(contract::CLIENT_HASH, get(symbol_sh_hash))
+        .route(contract::FILES, get(list_sites))
+        .route(contract::FILES_SLASH, get(list_sites))
+        .route(contract::SITE_FILES, get(browse_root))
+        .route(contract::SITE_FILES_SLASH, get(browse_root))
+        .route(contract::SITE_FILES_PATH, get(browse_path))
+        .route(contract::SITE_UNDO, get(undo_stack))
+        .route(contract::SITE_UNDO_SLASH, get(undo_stack))
+        .route(contract::SITE_EXPIRES, get(expiry_site_report))
+        .route(contract::SITE_EXPIRES_SLASH, get(expiry_site_report))
         .route(
-            "/{name}/",
+            contract::SITE_ROOT,
             get(serve_index)
                 .put(put_site)
                 .delete(delete_site)
                 .fallback(lifecycle_method),
         )
-        .route("/.blob/{name}/{hash}", get(serve_immutable_blob))
+        .route(contract::IMMUTABLE_BLOB, get(serve_immutable_blob))
         .route(
-            "/{name}/{*path}",
+            contract::SITE_PATH,
             get(serve_path)
                 .put(put_file)
                 .delete(delete_file)
                 .fallback(content_method),
         )
         .route(
-            "/{name}",
+            contract::SITE,
             get(redirect_site)
                 .put(put_site)
                 .delete(delete_site)
@@ -702,11 +711,11 @@ async fn lifecycle_method(
     headers: HeaderMap,
 ) -> Response {
     match method.as_str() {
-        "UNDO" => undo_site(&app, &name, &headers).await,
-        "COPY" => copy_site(&app, &name, &headers).await,
-        "MOVE" => move_site(&app, &name, &headers).await,
-        "EXPIRE" => expire_target(&app, &name, "", &headers).await,
-        "MANAGE" => manage_site(&app, &name, &headers, peer).await,
+        contract::METHOD_UNDO => undo_site(&app, &name, &headers).await,
+        contract::METHOD_COPY => copy_site(&app, &name, &headers).await,
+        contract::METHOD_MOVE => move_site(&app, &name, &headers).await,
+        contract::METHOD_EXPIRE => expire_target(&app, &name, "", &headers).await,
+        contract::METHOD_MANAGE => manage_site(&app, &name, &headers, peer).await,
         _ => plain(StatusCode::METHOD_NOT_ALLOWED, "error: method not allowed"),
     }
 }
@@ -819,7 +828,9 @@ async fn content_method(
     headers: HeaderMap,
 ) -> Response {
     match method.as_str() {
-        "EXPIRE" => expire_target(&app, &name, path.trim_end_matches('/'), &headers).await,
+        contract::METHOD_EXPIRE => {
+            expire_target(&app, &name, path.trim_end_matches('/'), &headers).await
+        }
         _ => plain(StatusCode::METHOD_NOT_ALLOWED, "error: method not allowed"),
     }
 }

@@ -72,6 +72,53 @@ CLIENT=$ROOT/bin/symbol
 ok "client installs"
 export XDG_STATE_HOME="$ROOT/state"
 
+REAL_CURL=$(command -v curl)
+export REAL_CURL
+mkdir "$ROOT/drop-bin" "$ROOT/drop-state"
+cat >"$ROOT/drop-bin/curl" <<'DROP_CURL'
+#!/bin/sh
+set -eu
+method=GET
+next_is_method=0
+next_is_dump=0
+next_is_output=0
+dump=
+output=
+for argument do
+  if [ "$next_is_method" -eq 1 ]; then
+    method=$argument
+    next_is_method=0
+  elif [ "$next_is_dump" -eq 1 ]; then
+    dump=$argument
+    next_is_dump=0
+  elif [ "$next_is_output" -eq 1 ]; then
+    output=$argument
+    next_is_output=0
+  elif [ "$argument" = -X ]; then
+    next_is_method=1
+  elif [ "$argument" = -D ]; then
+    next_is_dump=1
+  elif [ "$argument" = -o ]; then
+    next_is_output=1
+  fi
+done
+if [ "${DROP_METHOD:-}" = "$method" ] &&
+  [ ! -f "${DROP_STATE}/$method" ]; then
+  if ! ls "$XDG_STATE_HOME/symbol/claims"/pending-* >/dev/null 2>&1; then
+    : >"${DROP_STATE}/missing-pending-$method"
+  fi
+  "$REAL_CURL" "$@" >/dev/null
+  [ -z "$dump" ] || rm -f "$dump"
+  [ -z "$output" ] || rm -f "$output"
+  : >"${DROP_STATE}/$method"
+  exit 52
+fi
+exec "$REAL_CURL" "$@"
+DROP_CURL
+chmod +x "$ROOT/drop-bin/curl"
+PATH="$ROOT/drop-bin:$PATH"
+export PATH DROP_STATE="$ROOT/drop-state"
+
 explicit=$(printf '<h1>explicit</h1>\n' | "$CLIENT" put -)
 explicit_name=$(printf '%s\n' "$explicit" | site_from_put)
 [ -n "$explicit_name" ] &&
@@ -89,6 +136,17 @@ implicit_name=$(printf '%s\n' "$implicit" | site_from_put)
   fail "ordinary creation pre-persists creator claims"
 ok "bare piped put publishes random index"
 
+rm -f "$DROP_STATE/PUT" "$DROP_STATE/missing-pending-PUT"
+dropped_put=$(printf '<h1>dropped response</h1>\n' |
+  DROP_METHOD=PUT "$CLIENT" put)
+dropped_put_name=$(printf '%s\n' "$dropped_put" | site_from_put)
+[ -n "$dropped_put_name" ] &&
+  [ -s "$XDG_STATE_HOME/symbol/claims/$dropped_put_name" ] &&
+  [ ! -f "$DROP_STATE/missing-pending-PUT" ] &&
+  [ "$(curl -fsS "$BASE/$dropped_put_name/index.html")" = '<h1>dropped response</h1>' ] ||
+  fail "dropped PUT response recovers committed site and claim"
+ok "dropped PUT response recovers committed site and claim"
+
 printf '<h1>main</h1>\n' >"$ROOT/work/index.html"
 printf 'body{}\n' >"$ROOT/work/style.css"
 "$CLIENT" put e2e-main "$ROOT/work/index.html" >/dev/null
@@ -100,6 +158,27 @@ contains "$inventory" '"path":"index.html"' &&
     awk '$1 == "content_revision" { found=1 } END { exit !found }' ||
   fail "named puts merge and generate manifest"
 ok "named puts merge and generate manifest"
+
+printf '<h1>api example</h1>\n' >"$ROOT/work/api.html"
+"$CLIENT" put hello "$ROOT/work/api.html" >/dev/null
+api_curl=$(python3 -c '
+import pathlib,re,sys
+text=pathlib.Path(sys.argv[1]).read_text()
+blocks=re.findall(r"```sh\s*\n(.*?)\n```", text, re.S)
+commands=[]
+for block in blocks:
+    logical=block.replace(chr(92) + "\n", " ")
+    commands.extend(line.strip() for line in logical.splitlines() if line.strip().startswith("curl "))
+print(commands[0])
+' "$PWD/API.md")
+mkdir "$ROOT/work/api-curl"
+(cd "$ROOT/work/api-curl" && SYMBOL_BASE="$BASE" sh -c "$api_curl")
+tar -tzf "$ROOT/work/api-curl/hello.tar.gz" |
+  awk '$0 == "symbol.toml" { found=1 } END { exit !found }' ||
+  fail "documented API curl example returns archive"
+code=$(curl -sS -o /dev/null -w '%{http_code}' "$BASE/hello/")
+[ "$code" = 404 ] || fail "documented API curl example performs deletion"
+ok "documented API curl example executes unchanged"
 
 "$CLIENT" get e2e-main "$ROOT/work/main.zip" >/dev/null
 unzip -t "$ROOT/work/main.zip" >/dev/null
@@ -137,6 +216,25 @@ ok "clone and strict sync publish additions"
 curl -fsS "$BASE/e2e-moved/index.html" >/dev/null ||
   fail "copy and move preserve content"
 ok "copy and move preserve content"
+
+rm -f "$DROP_STATE/COPY" "$DROP_STATE/missing-pending-COPY"
+dropped_copy=$(DROP_METHOD=COPY "$CLIENT" copy e2e-main)
+dropped_copy_name=$(printf '%s\n' "$dropped_copy" |
+  awk '$1 == "copied" { url=$4; sub(/\/$/, "", url); sub(/^.*\//, "", url); print url; exit }')
+[ -n "$dropped_copy_name" ] &&
+  [ -s "$XDG_STATE_HOME/symbol/claims/$dropped_copy_name" ] &&
+  [ ! -f "$DROP_STATE/missing-pending-COPY" ] &&
+  curl -fsS "$BASE/$dropped_copy_name/index.html" >/dev/null ||
+  fail "dropped COPY response recovers committed destination and claim"
+ok "dropped COPY response recovers committed destination and claim"
+
+rm -f "$DROP_STATE/COPY" "$DROP_STATE/missing-pending-COPY"
+DROP_METHOD=COPY "$CLIENT" copy e2e-main e2e-drop-explicit >/dev/null
+[ -s "$XDG_STATE_HOME/symbol/claims/e2e-drop-explicit" ] &&
+  [ ! -f "$DROP_STATE/missing-pending-COPY" ] &&
+  curl -fsS "$BASE/e2e-drop-explicit/index.html" >/dev/null ||
+  fail "explicit dropped COPY persists claim before request"
+ok "explicit dropped COPY recovers known destination and claim"
 
 (
   cd "$ROOT/work"
@@ -187,11 +285,17 @@ ok "undo stack, mutation restore, and file-delete restore work"
 
 "$CLIENT" expire e2e-main >/dev/null
 expiry=$("$CLIENT" expire e2e-main --show)
-contains "$expiry" 'effective expiry:' &&
+contains "$expiry" 'expiry policies for e2e-main' &&
+  contains "$expiry" 'e2e-main/' &&
+  contains "$expiry" 'decay' ||
+  fail "site-wide expiry inventory renders all policies"
+"$CLIENT" expire e2e-main index.html >/dev/null
+expiry=$("$CLIENT" expire e2e-main index.html --show)
+contains "$expiry" 'effective lifetime: e2e-main/index.html' &&
   contains "$expiry" 'retention by size' ||
-  fail "expiry policy and report work"
+  fail "target expiry report renders curve and timeline"
 "$CLIENT" expire e2e-main --never >/dev/null
-ok "expiry policy and report work"
+ok "site and target expiry reports work"
 
 mkdir "$ROOT/work/managed"
 cat >"$ROOT/work/managed/symbol.toml" <<EOF
@@ -245,7 +349,7 @@ ok "create undo removes newly created site"
 tar -tzf "$ROOT/work/stream.tar.gz" |
   awk '$0 == "symbol.toml" { found=1 } END { exit !found }' ||
   fail "pop dash keeps stdout archive binary-only"
-contains "$(cat "$ROOT/work/stream.err")" 'undo:' ||
+contains "$(cat "$ROOT/work/stream.err")" 'undo within 4h:' ||
   fail "pop dash routes undo hint to stderr"
 ok "pop dash keeps binary stdout clean"
 
@@ -256,9 +360,13 @@ ok "pop dash keeps binary stdout clean"
 "$CLIENT" rm e2e-moved >/dev/null
 "$CLIENT" rm e2e-secure >/dev/null
 "$CLIENT" rm "$implicit_name" >/dev/null
+"$CLIENT" rm "$dropped_put_name" >/dev/null
+"$CLIENT" rm "$dropped_copy_name" >/dev/null
+"$CLIENT" rm e2e-drop-explicit >/dev/null
 
 left=$(curl -fsS -H 'Accept: application/json' "$BASE/FILES")
-for name in e2e-main e2e-moved e2e-remix e2e-secure "$explicit_name" "$implicit_name"; do
+for name in e2e-main e2e-moved e2e-remix e2e-secure "$explicit_name" "$implicit_name" \
+  "$dropped_put_name" "$dropped_copy_name" e2e-drop-explicit; do
   contains "$left" "\"name\":\"$name\"" && fail "cleanup removes all test sites"
 done
 ok "cleanup removes all test sites"

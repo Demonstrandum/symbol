@@ -1,10 +1,13 @@
 # symbol HTTP API
 
 This is the implementation reference for the current public HTTP surface.
-Examples use `https://symbol.example`; substitute the configured
+Examples use `SYMBOL_BASE=https://symbol.example`; set it to the configured
 `SYMBOL_PUBLIC_URL`. The human-facing client guide is
 [`static/docs.md`](static/docs.md), and deployment details are in
 [`README.md`](README.md).
+
+`symbol contract` on the server binary emits the typed route, method, header,
+and status inventory used by conformance tests for this document.
 
 ## Protocol conventions
 
@@ -117,6 +120,7 @@ Creator-Claim: sym_claim_...
 
 `Undo-Token` is omitted for a no-op mutation. Sanitization count headers are
 omitted when zero. Secret-returning responses use `Cache-Control: no-store`.
+`Undo-Expires` is the RFC 3339 deadline for the matching undo token.
 
 ## Route inventory
 
@@ -315,7 +319,7 @@ its own policy.
 
 Serves a file or directory as above, except these control suffixes:
 
-- `/{name}/{path}/HASH` returns the raw stored file hash with `200`, or `404`
+- `/{name}/{path...}/HASH` returns the raw stored file hash with `200`, or `404`
   for a directory/missing path.
 - `/{name}/{path}/EXPIRES` returns the expiry report JSON.
 
@@ -512,7 +516,7 @@ Success: `200`, archive headers, and undo headers.
 
 ```sh
 curl -D headers.txt -o hello.tar.gz -X DELETE \
-  https://symbol.example/hello.tar.gz
+  "$SYMBOL_BASE/hello.tar.gz"
 ```
 
 Canonical client: `symbol pop NAME [ARCHIVE]`. `symbol rm NAME` also calls this
@@ -648,7 +652,7 @@ are null. Absolute policy `retention_seconds` is null.
 
 Canonical client: `symbol expire NAME [PATH] --show`.
 
-### `EXPIRE /{name}` and `EXPIRE /{name}/{path...}`
+### `EXPIRE /{name}[/{path...}]`
 
 Sets or removes the exact target's policy and returns the report schema above.
 Folder/site policies cap descendants; the earliest effective deadline wins.
