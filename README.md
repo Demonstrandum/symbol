@@ -40,6 +40,9 @@ CLI flags have equivalent environment variables:
 - `SYMBOL_BIND` (default `127.0.0.1:4340`)
 - `SYMBOL_ROOT` (default `/var/lib/symbol`)
 - `SYMBOL_MAX_FILE_SIZE` in bytes (default 4 GiB)
+- `SYMBOL_MAX_ARCHIVE_UPLOAD` in bytes (default 50 MiB)
+- `SYMBOL_MAX_ARCHIVE_EXTRACTED` in bytes (default 80 MiB)
+- `SYMBOL_MAX_ARCHIVE_FILES` (default 5000)
 - `SYMBOL_PUBLIC_URL`
 - `SYMBOL_ALLOW_DEV_ORIGIN` (default false)
 - `SYMBOL_EXPIRY_MIN_AGE` (default `30d`)
@@ -48,9 +51,11 @@ CLI flags have equivalent environment variables:
 - `SYMBOL_EXPIRY_POWER` (default `3`)
 - `SYMBOL_TRUSTED_PROXY_PRINCIPAL_HEADER` and comma-separated
   `SYMBOL_TRUSTED_PROXY`; these must be configured together
+- `SYMBOL_MTLS_PRINCIPAL_HEADER` or `SYMBOL_TAILSCALE_USER_HEADER` may replace
+  the generic principal header; configure only one identity header
 
-Archive unpacking has fixed limits of 50 MiB compressed, 80 MiB extracted,
-and 5000 files.
+Archive upload, extracted-size, and file-count limits are independently
+configurable with the defaults above.
 
 ## Storage and migrations
 
@@ -60,7 +65,7 @@ SQLite stores sites, paths, hashes, sizes, and other metadata in
 
 Startup enables WAL, normal synchronous mode, foreign keys, and a five-second
 SQLite busy timeout. Schema migrations run automatically through schema
-version 4, followed by an integrity check. Startup also:
+version 6, followed by an integrity check. Startup also:
 
 - migrates legacy inline SQLite BLOBs to external blob files and verifies
   their size and Blake3 hash;

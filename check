@@ -4,6 +4,10 @@ set -eu
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --all-targets --all-features --locked
+cargo build --locked
 sh -n static/symbol.sh
 sh -n tests/symbol_client.sh
+sh -n tests/lifecycle_e2e.sh
+python3 tests/api_contract.py
 tests/symbol_client.sh
+sh tests/lifecycle_e2e.sh

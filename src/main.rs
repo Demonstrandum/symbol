@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
-use axum::extract::{ConnectInfo, Path, State};
+use axum::extract::{ConnectInfo, Extension, Path, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Redirect, Response};
@@ -34,8 +34,8 @@ use expiry::{DecayPolicy, ExpiryMode, ExpiryPolicy};
 use futures_util::StreamExt as _;
 use secrets::{ClaimToken, ManagementToken};
 use store::{
-    ArchiveFormat, CreationSecurity, CreatorIdentity, Idempotency, PublishOptions, Store,
-    StoreError,
+    ArchiveFormat, CreationSecurity, CreatorIdentity, Idempotency, ManagementRequest,
+    PublishOptions, Store, StoreError,
 };
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 use tokio::net::TcpListener;
@@ -43,7 +43,9 @@ use tokio::sync::Semaphore;
 use tokio_util::io::ReaderStream;
 use tower_http::trace::TraceLayer;
 
-const MAX_ARCHIVE_UPLOAD: usize = 50 * 1024 * 1024;
+const DEFAULT_MAX_ARCHIVE_UPLOAD: u64 = 50 * 1024 * 1024;
+const DEFAULT_MAX_ARCHIVE_EXTRACTED: u64 = 80 * 1024 * 1024;
+const DEFAULT_MAX_ARCHIVE_FILES: usize = 5000;
 const DEFAULT_MAX_FILE_SIZE: u64 = 4 * 1024 * 1024 * 1024;
 const STREAM_THRESHOLD: u64 = 1024 * 1024;
 const INSTALL_SH: &str = static_asset!("install.sh");
@@ -62,6 +64,24 @@ struct Args {
         env = "SYMBOL_MAX_FILE_SIZE"
     )]
     max_file_size: u64,
+    #[arg(
+        long,
+        default_value_t = DEFAULT_MAX_ARCHIVE_UPLOAD,
+        env = "SYMBOL_MAX_ARCHIVE_UPLOAD"
+    )]
+    max_archive_upload: u64,
+    #[arg(
+        long,
+        default_value_t = DEFAULT_MAX_ARCHIVE_EXTRACTED,
+        env = "SYMBOL_MAX_ARCHIVE_EXTRACTED"
+    )]
+    max_archive_extracted: u64,
+    #[arg(
+        long,
+        default_value_t = DEFAULT_MAX_ARCHIVE_FILES,
+        env = "SYMBOL_MAX_ARCHIVE_FILES"
+    )]
+    max_archive_files: usize,
     #[arg(long, env = "SYMBOL_PUBLIC_URL")]
     public_url: Option<String>,
     #[arg(long, env = "SYMBOL_ALLOW_DEV_ORIGIN", default_value_t = false)]
@@ -76,6 +96,10 @@ struct Args {
     expiry_power: f64,
     #[arg(long, env = "SYMBOL_TRUSTED_PROXY_PRINCIPAL_HEADER")]
     trusted_proxy_principal_header: Option<HeaderName>,
+    #[arg(long, env = "SYMBOL_MTLS_PRINCIPAL_HEADER")]
+    mtls_principal_header: Option<HeaderName>,
+    #[arg(long, env = "SYMBOL_TAILSCALE_USER_HEADER")]
+    tailscale_user_header: Option<HeaderName>,
     #[arg(long, env = "SYMBOL_TRUSTED_PROXY", value_delimiter = ',')]
     trusted_proxy: Vec<IpAddr>,
     #[command(subcommand)]
@@ -108,22 +132,32 @@ struct App {
     store_tasks: Arc<Semaphore>,
     hashes: Arc<Mutex<HashMap<String, String>>>,
     max_file_size: u64,
+    max_archive_upload: u64,
     public_url: Arc<str>,
     identity_provider: IdentityProvider,
 }
 
 #[derive(Clone)]
 enum IdentityProvider {
-    // Tailscale can be added as another startup-selected provider once a stable,
-    // authenticated local-daemon API contract is chosen; caller headers are never trusted.
     Receipt,
     TrustedProxy {
+        principal_header: HeaderName,
+        peers: Arc<[IpAddr]>,
+    },
+    Mtls {
+        principal_header: HeaderName,
+        peers: Arc<[IpAddr]>,
+    },
+    Tailscale {
         principal_header: HeaderName,
         peers: Arc<[IpAddr]>,
     },
 }
 
 const INTERNAL_CREATOR_HEADER: &str = "x-symbol-internal-creator-principal";
+
+#[derive(Clone, Copy)]
+struct AuditIp(Option<IpAddr>);
 
 struct TemporaryUpload {
     path: PathBuf,
@@ -178,6 +212,7 @@ impl App {
         Self::with_options(
             store,
             DEFAULT_MAX_FILE_SIZE,
+            DEFAULT_MAX_ARCHIVE_UPLOAD,
             "http://symbol".into(),
             IdentityProvider::Receipt,
         )
@@ -188,6 +223,7 @@ impl App {
         Self::with_options(
             store,
             max_file_size,
+            DEFAULT_MAX_ARCHIVE_UPLOAD,
             "http://symbol".into(),
             IdentityProvider::Receipt,
         )
@@ -196,6 +232,7 @@ impl App {
     fn with_options(
         store: Store,
         max_file_size: u64,
+        max_archive_upload: u64,
         public_url: String,
         identity_provider: IdentityProvider,
     ) -> Self {
@@ -204,6 +241,7 @@ impl App {
             store,
             hashes: Arc::new(Mutex::new(HashMap::new())),
             max_file_size,
+            max_archive_upload,
             public_url: public_url.into(),
             identity_provider,
         }
@@ -228,6 +266,40 @@ impl App {
     }
 }
 
+fn configured_identity_provider(args: &mut Args) -> IdentityProvider {
+    let configured = [
+        (1_u8, args.trusted_proxy_principal_header.take()),
+        (2_u8, args.mtls_principal_header.take()),
+        (3_u8, args.tailscale_user_header.take()),
+    ]
+    .into_iter()
+    .filter_map(|(kind, header)| header.map(|header| (kind, header)))
+    .collect::<Vec<_>>();
+    assert!(
+        configured.len() <= 1,
+        "configure only one creator identity provider"
+    );
+    let peers: Arc<[IpAddr]> = std::mem::take(&mut args.trusted_proxy).into();
+    match configured.as_slice() {
+        [] if peers.is_empty() => IdentityProvider::Receipt,
+        [(1, principal_header)] if !peers.is_empty() => IdentityProvider::TrustedProxy {
+            principal_header: principal_header.clone(),
+            peers,
+        },
+        [(2, principal_header)] if !peers.is_empty() => IdentityProvider::Mtls {
+            principal_header: principal_header.clone(),
+            peers,
+        },
+        [(3, principal_header)] if !peers.is_empty() => IdentityProvider::Tailscale {
+            principal_header: principal_header.clone(),
+            peers,
+        },
+        _ => {
+            panic!("identity principal header and SYMBOL_TRUSTED_PROXY must be configured together")
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -237,9 +309,9 @@ async fn main() {
         )
         .init();
 
-    let args = Args::parse();
+    let mut args = Args::parse();
     let is_admin = args.command.is_some();
-    let public_url = args.public_url.unwrap_or_else(|| {
+    let public_url = args.public_url.take().unwrap_or_else(|| {
         assert!(
             args.allow_dev_origin || is_admin,
             "SYMBOL_PUBLIC_URL is required (or set SYMBOL_ALLOW_DEV_ORIGIN=true for development)"
@@ -256,9 +328,15 @@ async fn main() {
             .expect("valid SYMBOL_EXPIRY_MAX_SIZE"),
         power: args.expiry_power,
     };
-    let store = Store::with_expiry_defaults(args.root, public_url.clone(), expiry_defaults)
+    upload::configure_archive_limits(upload::ArchiveLimits {
+        max_files: args.max_archive_files,
+        max_extracted: args.max_archive_extracted,
+    })
+    .expect("archive limits are configured once");
+    let root = std::mem::take(&mut args.root);
+    let store = Store::with_expiry_defaults(root, public_url.clone(), expiry_defaults)
         .expect("create data directory");
-    if let Some(Command::Admin { action }) = args.command {
+    if let Some(Command::Admin { action }) = args.command.take() {
         let (name, token, verb) = match action {
             AdminAction::Claim { name } => {
                 let token = store
@@ -280,20 +358,14 @@ async fn main() {
         println!("  {}", token.encode());
         return;
     }
-    let identity_provider = match (
-        args.trusted_proxy_principal_header,
-        args.trusted_proxy.is_empty(),
-    ) {
-        (None, true) => IdentityProvider::Receipt,
-        (Some(principal_header), false) => IdentityProvider::TrustedProxy {
-            principal_header,
-            peers: args.trusted_proxy.into(),
-        },
-        _ => panic!(
-            "SYMBOL_TRUSTED_PROXY_PRINCIPAL_HEADER and SYMBOL_TRUSTED_PROXY must be configured together"
-        ),
-    };
-    let state = App::with_options(store, args.max_file_size, public_url, identity_provider);
+    let identity_provider = configured_identity_provider(&mut args);
+    let state = App::with_options(
+        store,
+        args.max_file_size,
+        args.max_archive_upload,
+        public_url,
+        identity_provider,
+    );
     tokio::spawn(expiry_worker(state.clone()));
     let app = router(state);
     let listener = TcpListener::bind(&args.bind)
@@ -351,12 +423,20 @@ fn router(app: App) -> Router {
                 .delete(delete_site)
                 .fallback(lifecycle_method),
         )
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http().make_span_with(make_http_span))
         .layer(middleware::from_fn_with_state(
             identity_provider,
             resolve_creator,
         ))
         .with_state(app)
+}
+
+fn make_http_span(request: &Request<Body>) -> tracing::Span {
+    tracing::info_span!(
+        "http_request",
+        method = %request.method(),
+        uri = %request.uri()
+    )
 }
 
 async fn resolve_creator(
@@ -365,20 +445,38 @@ async fn resolve_creator(
     next: Next,
 ) -> Response {
     request.headers_mut().remove(INTERNAL_CREATOR_HEADER);
-    if let IdentityProvider::TrustedProxy {
-        principal_header,
-        peers,
-    } = provider
-        && let Some(peer) = request
-            .extensions()
-            .get::<ConnectInfo<SocketAddr>>()
-            .map(|peer| peer.0.ip())
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|peer| peer.0.ip());
+    request.extensions_mut().insert(AuditIp(peer));
+    let configured = match &provider {
+        IdentityProvider::Receipt => None,
+        IdentityProvider::TrustedProxy {
+            principal_header,
+            peers,
+        } => Some(("proxy", principal_header, peers)),
+        IdentityProvider::Mtls {
+            principal_header,
+            peers,
+        } => Some(("mtls", principal_header, peers)),
+        IdentityProvider::Tailscale {
+            principal_header,
+            peers,
+        } => Some(("tailscale", principal_header, peers)),
+    };
+    if let Some((kind, principal_header, peers)) = configured
+        && let Some(peer) = peer
         && peers.contains(&peer)
-        && let Some(principal) = request.headers().get(&principal_header).cloned()
+        && let Some(principal) = request
+            .headers()
+            .get(principal_header)
+            .and_then(|value| value.to_str().ok())
+        && let Ok(internal) = HeaderValue::from_str(&format!("{kind}:{principal}"))
     {
         request
             .headers_mut()
-            .insert(INTERNAL_CREATOR_HEADER, principal);
+            .insert(INTERNAL_CREATOR_HEADER, internal);
     }
     next.run(request).await
 }
@@ -561,7 +659,19 @@ async fn expiry_worker_iteration(app: &App) {
 }
 
 async fn expiry_site_report(State(app): State<App>, Path(name): Path<String>) -> Response {
-    expiry_report_response(&app, name, String::new()).await
+    let result = app
+        .run_store(move |store| store.expiry_site_report(&name))
+        .await;
+    match result {
+        Ok(report) => {
+            let mut response = Json(report).into_response();
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+            response
+        }
+        Err(err) => err.into_response(),
+    }
 }
 
 async fn expiry_path_report(app: &App, name: String, path: String) -> Response {
@@ -587,6 +697,7 @@ async fn expiry_report_response(app: &App, name: String, path: String) -> Respon
 async fn lifecycle_method(
     State(app): State<App>,
     Path(name): Path<String>,
+    Extension(AuditIp(peer)): Extension<AuditIp>,
     method: Method,
     headers: HeaderMap,
 ) -> Response {
@@ -595,12 +706,17 @@ async fn lifecycle_method(
         "COPY" => copy_site(&app, &name, &headers).await,
         "MOVE" => move_site(&app, &name, &headers).await,
         "EXPIRE" => expire_target(&app, &name, "", &headers).await,
-        "MANAGE" => manage_site(&app, &name, &headers).await,
+        "MANAGE" => manage_site(&app, &name, &headers, peer).await,
         _ => plain(StatusCode::METHOD_NOT_ALLOWED, "error: method not allowed"),
     }
 }
 
-async fn manage_site(app: &App, name: &str, headers: &HeaderMap) -> Response {
+async fn manage_site(
+    app: &App,
+    name: &str,
+    headers: &HeaderMap,
+    audit_ip: Option<IpAddr>,
+) -> Response {
     let action = match headers
         .get("management-action")
         .and_then(|value| value.to_str().ok())
@@ -632,18 +748,28 @@ async fn manage_site(app: &App, name: &str, headers: &HeaderMap) -> Response {
     };
     let creator = creator_identity(headers);
     let idempotency = idempotency_from(headers);
+    let audit_ip = audit_ip.map(|ip| ip.to_string());
     let name_owned = name.to_string();
     let result = app
         .run_store(move |store| match action {
-            ManagementAction::Claim => {
-                store.claim_management(&name_owned, creator, claim.as_ref(), idempotency.as_ref())
-            }
+            ManagementAction::Claim => store.claim_management(
+                &name_owned,
+                creator,
+                claim.as_ref(),
+                ManagementRequest {
+                    idempotency: idempotency.as_ref(),
+                    audit_ip: audit_ip.as_deref(),
+                },
+            ),
             ManagementAction::Rotate => store.rotate_management(
                 &name_owned,
                 bearer.as_ref(),
                 creator,
                 claim.as_ref(),
-                idempotency.as_ref(),
+                ManagementRequest {
+                    idempotency: idempotency.as_ref(),
+                    audit_ip: audit_ip.as_deref(),
+                },
             ),
             ManagementAction::Status => {
                 store
@@ -655,7 +781,7 @@ async fn manage_site(app: &App, name: &str, headers: &HeaderMap) -> Response {
                     })
             }
             ManagementAction::Release => store
-                .release_management(&name_owned, bearer.as_ref())
+                .release_management(&name_owned, bearer.as_ref(), audit_ip.as_deref())
                 .map(|status| store::ManagementMutation {
                     status,
                     token: None,
@@ -1043,7 +1169,13 @@ fn creator_identity(headers: &HeaderMap) -> Option<CreatorIdentity> {
         .get(INTERNAL_CREATOR_HEADER)
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.is_empty())
-        .map(CreatorIdentity::trusted_proxy)
+        .and_then(|value| value.split_once(':'))
+        .and_then(|(kind, principal)| match kind {
+            "proxy" => Some(CreatorIdentity::trusted_proxy(principal)),
+            "mtls" => Some(CreatorIdentity::mtls(principal)),
+            "tailscale" => Some(CreatorIdentity::tailscale(principal)),
+            _ => None,
+        })
 }
 
 #[allow(clippy::result_large_err)]
@@ -1198,10 +1330,7 @@ async fn publish(app: &App, wanted: Option<String>, headers: &HeaderMap, body: B
         .and_then(|v| v.to_str().ok());
     let unpack = wants_unpack(headers);
     let (limit, limit_kind) = if unpack {
-        (
-            u64::try_from(MAX_ARCHIVE_UPLOAD).expect("archive limit fits in u64"),
-            UploadLimitKind::Archive,
-        )
+        (app.max_archive_upload, UploadLimitKind::Archive)
     } else {
         (app.max_file_size, UploadLimitKind::File)
     };
@@ -1628,6 +1757,9 @@ async fn archive_response(
 async fn redirect_site(State(app): State<App>, Path(name): Path<String>) -> Response {
     if let Some(request) = archive_download(&name) {
         return download_site(&app, request).await;
+    }
+    if name.contains('.') {
+        return plain(StatusCode::BAD_REQUEST, "error: unsupported archive suffix");
     }
     let exists = app
         .run_store({
@@ -2276,6 +2408,30 @@ mod tests {
         App::new(store)
     }
 
+    #[test]
+    fn request_trace_span_never_records_secret_headers() {
+        let request = Request::builder()
+            .method("PUT")
+            .uri("/managed")
+            .header(header::AUTHORIZATION, "Bearer sym_mgmt_secret")
+            .header("creator-claim", "sym_claim_secret")
+            .header("idempotency-key", "secret-key")
+            .body(Body::empty())
+            .unwrap();
+        let span = make_http_span(&request);
+        let fields = span.metadata().unwrap().fields();
+        assert!(fields.field("method").is_some());
+        assert!(fields.field("uri").is_some());
+        for secret in [
+            "authorization",
+            "creator_claim",
+            "management_token",
+            "idempotency_key",
+        ] {
+            assert!(fields.field(secret).is_none());
+        }
+    }
+
     #[tokio::test]
     async fn stats_response_keeps_original_fields_and_adds_distributions() {
         let root = tempfile::tempdir().unwrap();
@@ -2325,6 +2481,26 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let report: expiry::ExpiryReport = serde_json::from_slice(&body).unwrap();
         assert_eq!(report.target.kind, expiry::ExpiryTargetKind::Site);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/hello/EXPIRES")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let report: expiry::ExpirySiteReport = serde_json::from_slice(&body).unwrap();
+        assert_eq!(report.site, "hello");
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(
+            report.entries[0].target.kind,
+            expiry::ExpiryTargetKind::Site
+        );
 
         let response = app
             .clone()
@@ -2775,6 +2951,20 @@ mod tests {
                 assert_eq!(&archive[..signature.len()], signature);
             }
             assert!(!store.site_exists(name));
+        }
+        for method in ["GET", "DELETE"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri("/unsupported.rar")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         }
     }
 
@@ -3407,6 +3597,7 @@ mod tests {
         let app = router(App::with_options(
             store,
             DEFAULT_MAX_FILE_SIZE,
+            DEFAULT_MAX_ARCHIVE_UPLOAD,
             "http://symbol".into(),
             provider,
         ));
@@ -3436,6 +3627,16 @@ mod tests {
         let claimed = app.clone().oneshot(claim).await.unwrap();
         assert_eq!(claimed.status(), StatusCode::OK);
         assert!(claimed.headers().contains_key("management-token"));
+        let audit_ip: Option<String> = rusqlite::Connection::open(root.path().join("symbol.db"))
+            .unwrap()
+            .query_row(
+                "SELECT source_ip FROM management_audit
+                 WHERE site_name = 'principal' ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(audit_ip.as_deref(), Some("127.0.0.1"));
 
         let forged = app
             .oneshot(
@@ -3450,5 +3651,49 @@ mod tests {
             .await
             .unwrap();
         assert!(forged.headers().contains_key("creator-claim"));
+    }
+
+    #[tokio::test]
+    async fn mtls_and_tailscale_principals_are_accepted_only_from_trusted_peers() {
+        for (provider, header, site) in [
+            (
+                IdentityProvider::Mtls {
+                    principal_header: HeaderName::from_static("x-client-cert-sha256"),
+                    peers: Arc::from([IpAddr::from([127, 0, 0, 1])]),
+                },
+                "x-client-cert-sha256",
+                "mtls-site",
+            ),
+            (
+                IdentityProvider::Tailscale {
+                    principal_header: HeaderName::from_static("tailscale-user-login"),
+                    peers: Arc::from([IpAddr::from([127, 0, 0, 1])]),
+                },
+                "tailscale-user-login",
+                "tailscale-site",
+            ),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let store = Store::new(root.path().to_path_buf()).unwrap();
+            let app = router(App::with_options(
+                store,
+                DEFAULT_MAX_FILE_SIZE,
+                DEFAULT_MAX_ARCHIVE_UPLOAD,
+                "http://symbol".into(),
+                provider,
+            ));
+            let mut request = Request::builder()
+                .method("PUT")
+                .uri(format!("/{site}/index.html"))
+                .header(header, "stable-principal")
+                .body(Body::from("content"))
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345))));
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+            assert!(!response.headers().contains_key("creator-claim"));
+        }
     }
 }

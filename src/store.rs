@@ -14,8 +14,9 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 use crate::blob_store::BlobFiles;
 use crate::expiry::{
-    DecayPolicy, ExpiryError, ExpiryLimit, ExpiryMode, ExpiryPolicy, ExpiryReport, ExpiryTarget,
-    ExpiryTargetKind, InheritedExpiryCap, OwnExpiryReport, remaining_seconds,
+    DecayPolicy, ExpiryError, ExpiryLimit, ExpiryMode, ExpiryPolicy, ExpiryReport,
+    ExpirySiteReport, ExpiryTarget, ExpiryTargetKind, InheritedExpiryCap, OwnExpiryReport,
+    remaining_seconds,
 };
 use crate::name::{NameError, generate_id, parse_site_name};
 use crate::pathutil::{PathError, is_junk, is_noise_path, looks_like_apple_fork, safe_rel_path};
@@ -54,7 +55,7 @@ CREATE TABLE IF NOT EXISTS metadata (
     value TEXT NOT NULL
 );
 ";
-const LATEST_SCHEMA_VERSION: i64 = 4;
+const LATEST_SCHEMA_VERSION: i64 = 6;
 const UNDO_RETENTION_MILLIS: i64 = 4 * 60 * 60 * 1000;
 const UNDO_LIMIT_PER_SITE: i64 = 10;
 const IDEMPOTENCY_RETENTION_MILLIS: i64 = 4 * 60 * 60 * 1000;
@@ -274,10 +275,18 @@ pub struct PublishOptions<'a> {
     pub authorization: Option<&'a ManagementToken>,
 }
 
+#[derive(Clone, Copy, Default)]
+pub struct ManagementRequest<'a> {
+    pub idempotency: Option<&'a Idempotency>,
+    pub audit_ip: Option<&'a str>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i64)]
 pub enum CreatorKind {
     TrustedProxy = 1,
+    Mtls = 2,
+    Tailscale = 3,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -292,6 +301,22 @@ impl CreatorIdentity {
         Self {
             kind: CreatorKind::TrustedProxy,
             hash: blake3::derive_key("symbol trusted proxy principal v1", principal.as_bytes()),
+        }
+    }
+
+    #[must_use]
+    pub fn mtls(fingerprint: &str) -> Self {
+        Self {
+            kind: CreatorKind::Mtls,
+            hash: blake3::derive_key("symbol mTLS creator principal v1", fingerprint.as_bytes()),
+        }
+    }
+
+    #[must_use]
+    pub fn tailscale(user: &str) -> Self {
+        Self {
+            kind: CreatorKind::Tailscale,
+            hash: blake3::derive_key("symbol Tailscale creator principal v1", user.as_bytes()),
         }
     }
 }
@@ -893,7 +918,7 @@ impl Store {
         name: &str,
         creator: Option<CreatorIdentity>,
         claim: Option<&ClaimToken>,
-        idempotency: Option<&Idempotency>,
+        request: ManagementRequest<'_>,
     ) -> Result<ManagementMutation, StoreError> {
         let name = parse_site_name(name)?;
         let now = self.now_millis();
@@ -930,7 +955,7 @@ impl Store {
         if !creator_matches && !claim_matches {
             return Err(StoreError::Forbidden);
         }
-        if management_replay(&tx, idempotency, &fingerprint)? {
+        if management_replay(&tx, request.idempotency, &fingerprint)? {
             return Ok(ManagementMutation {
                 status: ManagementStatus { managed: true },
                 token: None,
@@ -945,8 +970,8 @@ impl Store {
             "UPDATE sites SET management_hash = ?1, management_status = 1 WHERE id = ?2",
             params![token.hash().as_bytes().as_slice(), site_id],
         )?;
-        record_management(&tx, name, 1, now)?;
-        store_management_idempotency(&tx, idempotency, &fingerprint, now)?;
+        record_management(&tx, name, 1, now, request.audit_ip)?;
+        store_management_idempotency(&tx, request.idempotency, &fingerprint, now)?;
         regenerate_site(&tx, &self.inner.blob_files, site_id, now)?;
         tx.commit()?;
         drop(db);
@@ -963,7 +988,7 @@ impl Store {
         bearer: Option<&ManagementToken>,
         creator: Option<CreatorIdentity>,
         claim: Option<&ClaimToken>,
-        idempotency: Option<&Idempotency>,
+        request: ManagementRequest<'_>,
     ) -> Result<ManagementMutation, StoreError> {
         let name = parse_site_name(name)?;
         let now = self.now_millis();
@@ -1011,7 +1036,7 @@ impl Store {
         if !bearer_matches && !creator_matches && !claim_matches {
             return Err(StoreError::Unauthorized);
         }
-        if management_replay(&tx, idempotency, &fingerprint)? {
+        if management_replay(&tx, request.idempotency, &fingerprint)? {
             return Ok(ManagementMutation {
                 status: ManagementStatus { managed: true },
                 token: None,
@@ -1023,8 +1048,8 @@ impl Store {
             "UPDATE sites SET management_hash = ?1 WHERE id = ?2",
             params![token.hash().as_bytes().as_slice(), site_id],
         )?;
-        record_management(&tx, name, 2, now)?;
-        store_management_idempotency(&tx, idempotency, &fingerprint, now)?;
+        record_management(&tx, name, 2, now, request.audit_ip)?;
+        store_management_idempotency(&tx, request.idempotency, &fingerprint, now)?;
         tx.commit()?;
         drop(db);
         Ok(ManagementMutation {
@@ -1038,6 +1063,7 @@ impl Store {
         &self,
         name: &str,
         bearer: Option<&ManagementToken>,
+        audit_ip: Option<&str>,
     ) -> Result<ManagementStatus, StoreError> {
         let name = parse_site_name(name)?;
         let now = self.now_millis();
@@ -1054,7 +1080,7 @@ impl Store {
             [site_id],
         )?;
         tx.execute("DELETE FROM management_tombstones WHERE name = ?1", [name])?;
-        record_management(&tx, name, 3, now)?;
+        record_management(&tx, name, 3, now, audit_ip)?;
         regenerate_site(&tx, &self.inner.blob_files, site_id, now)?;
         tx.commit()?;
         drop(db);
@@ -1081,7 +1107,7 @@ impl Store {
             "UPDATE sites SET management_hash = ?1, management_status = 1 WHERE id = ?2",
             params![token.hash().as_bytes().as_slice(), site_id],
         )?;
-        record_management(&tx, name, 4, now)?;
+        record_management(&tx, name, 4, now, None)?;
         regenerate_site(&tx, &self.inner.blob_files, site_id, now)?;
         tx.commit()?;
         drop(db);
@@ -1108,7 +1134,7 @@ impl Store {
             "UPDATE sites SET management_hash = ?1 WHERE id = ?2",
             params![token.hash().as_bytes().as_slice(), site_id],
         )?;
-        record_management(&tx, name, 5, now)?;
+        record_management(&tx, name, 5, now, None)?;
         tx.commit()?;
         drop(db);
         Ok(token)
@@ -1293,7 +1319,7 @@ impl Store {
         self.merge_staged_conditional(
             &name,
             std::slice::from_ref(&staged),
-            UndoKind::Put,
+            UndoKind::PutFile,
             options.expected_tree_hash,
             options.creation,
             options.authorization,
@@ -1466,6 +1492,12 @@ impl Store {
              WHERE site_id = (SELECT id FROM sites WHERE name = ?2) AND path <> ?3",
             params![destination_id, source, MANIFEST_PATH],
         )?;
+        tx.execute(
+            "INSERT INTO path_aggregates(site_id, path, logical_bytes, file_count)
+             SELECT ?1, path, logical_bytes, file_count
+             FROM path_aggregates WHERE site_id = ?2",
+            params![destination_id, source_id],
+        )?;
         copy_expiry_policies_locked(&tx, source_id, destination_id, now)?;
         let files = tx.query_row(
             "SELECT COUNT(*) FROM files WHERE site_id = ?1",
@@ -1610,6 +1642,18 @@ impl Store {
             &format!("restore deleted {rel}"),
             self.now_millis(),
         )?;
+        let removed_files = {
+            let mut statement = tx.prepare(
+                "SELECT path, size FROM files
+                 WHERE site_id = ?1
+                   AND (path = ?2 OR (path >= ?3 AND path < ?4))",
+            )?;
+            statement
+                .query_map(params![site_id, rel, prefix_start, prefix_end], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
         let deleted = tx.execute(
             "DELETE FROM files
              WHERE site_id = ?1
@@ -1618,6 +1662,9 @@ impl Store {
         )?;
         if deleted == 0 {
             return Err(StoreError::NotFound);
+        }
+        for (path, size) in removed_files {
+            adjust_aggregates_locked(&tx, site_id, &path, -size, -1)?;
         }
         tx.execute(
             "DELETE FROM expiry_policies
@@ -1891,10 +1938,24 @@ impl Store {
             |row| row.get(0),
         )?;
         for file in files {
+            let previous_size = tx
+                .query_row(
+                    "SELECT size FROM files WHERE site_id = ?1 AND path = ?2",
+                    params![site_id, file.path],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
             tx.execute(
                 "INSERT INTO files (site_id, path, hash, size) VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(site_id, path) DO UPDATE SET hash = excluded.hash, size = excluded.size",
                 params![site_id, file.path, file.hash, file.size],
+            )?;
+            adjust_aggregates_locked(
+                tx,
+                site_id,
+                &file.path,
+                file.size - previous_size.unwrap_or(0),
+                i64::from(previous_size.is_none()),
             )?;
         }
         let revision = if existed {
@@ -2279,6 +2340,7 @@ impl Store {
                  FROM undo_expiry_policies WHERE token = ?2",
                 params![site_id, latest],
             )?;
+            rebuild_aggregates_locked(&tx, site_id)?;
             regenerate_site(&tx, &self.inner.blob_files, site_id, snapshot.updated)?;
             tx.execute(
                 "DELETE FROM management_tombstones
@@ -2389,6 +2451,31 @@ impl Store {
             Some(ExpiryPolicy::Decay(self.inner.expiry_defaults)),
             authorization,
         )
+    }
+
+    pub fn expiry_site_report(&self, name: &str) -> Result<ExpirySiteReport, StoreError> {
+        let name = parse_site_name(name)?;
+        let db = self.inner.readers.get();
+        let site_id = db
+            .query_row("SELECT id FROM sites WHERE name = ?1", [name], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(map_sql)?;
+        let mut statement =
+            db.prepare("SELECT path FROM expiry_policies WHERE site_id = ?1 ORDER BY path")?;
+        let paths = statement
+            .query_map([site_id], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        drop(db);
+        let entries = paths
+            .into_iter()
+            .map(|path| self.expiry_report(name, &path))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ExpirySiteReport {
+            site: name.to_string(),
+            entries,
+        })
     }
 
     pub fn expiry_report(&self, name: &str, rel: &str) -> Result<ExpiryReport, StoreError> {
@@ -2570,6 +2657,7 @@ impl Store {
                  WHERE id = ?2",
                 params![self.inner.public_url, site_id],
             )?;
+            rebuild_aggregates_locked(&tx, site_id)?;
             regenerate_site(&tx, &self.inner.blob_files, site_id, now)?;
         }
         tx.commit()?;
@@ -2613,6 +2701,7 @@ enum UndoKind {
     Move = 5,
     Expiry = 6,
     ExpireSweep = 7,
+    PutFile = 8,
 }
 
 impl UndoKind {
@@ -2625,6 +2714,7 @@ impl UndoKind {
             Self::Move => "move",
             Self::Expiry => "expiry",
             Self::ExpireSweep => "expire_sweep",
+            Self::PutFile => "put_file",
         }
     }
 
@@ -2636,6 +2726,7 @@ impl UndoKind {
             5 => Self::Move,
             6 => Self::Expiry,
             7 => Self::ExpireSweep,
+            8 => Self::PutFile,
             _ => Self::Put,
         }
     }
@@ -2726,6 +2817,14 @@ fn run_migrations(db: &mut Connection) -> Result<(), StoreError> {
     }
     if version == 3 {
         migrate_management_schema(db)?;
+        version = 4;
+    }
+    if version == 4 {
+        migrate_aggregates_schema(db)?;
+        version = 5;
+    }
+    if version == 5 {
+        migrate_management_audit_ip(db)?;
         version = LATEST_SCHEMA_VERSION;
     }
     if version != LATEST_SCHEMA_VERSION {
@@ -2769,6 +2868,48 @@ fn migrate_management_schema(db: &mut Connection) -> Result<(), StoreError> {
          CREATE INDEX management_idempotency_expiry ON management_idempotency(expires);
          CREATE INDEX management_audit_site ON management_audit(site_name, occurred);",
     )?;
+    tx.pragma_update(None, "user_version", 4)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn migrate_aggregates_schema(db: &mut Connection) -> Result<(), StoreError> {
+    let tx = db.transaction()?;
+    tx.execute_batch(
+        "CREATE TABLE path_aggregates (
+             site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+             path TEXT NOT NULL,
+             logical_bytes INTEGER NOT NULL,
+             file_count INTEGER NOT NULL,
+             PRIMARY KEY (site_id, path)
+         );",
+    )?;
+    let files = {
+        let mut statement = tx.prepare(
+            "SELECT site_id, path, size FROM files
+             WHERE path <> ?1 ORDER BY site_id, path",
+        )?;
+        statement
+            .query_map([MANIFEST_PATH], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for (site_id, path, size) in files {
+        adjust_aggregates_locked(&tx, site_id, &path, size, 1)?;
+    }
+    tx.pragma_update(None, "user_version", 5)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn migrate_management_audit_ip(db: &mut Connection) -> Result<(), StoreError> {
+    let tx = db.transaction()?;
+    tx.execute_batch("ALTER TABLE management_audit ADD COLUMN source_ip TEXT;")?;
     tx.pragma_update(None, "user_version", LATEST_SCHEMA_VERSION)?;
     tx.commit()?;
     Ok(())
@@ -3120,10 +3261,12 @@ fn record_management(
     name: &str,
     action: i64,
     now: i64,
+    source_ip: Option<&str>,
 ) -> Result<(), rusqlite::Error> {
     tx.execute(
-        "INSERT INTO management_audit(site_name, action, occurred) VALUES (?1, ?2, ?3)",
-        params![name, action, now],
+        "INSERT INTO management_audit(site_name, action, occurred, source_ip)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![name, action, now, source_ip],
     )?;
     Ok(())
 }
@@ -3135,7 +3278,7 @@ fn snapshot_site(
     now: i64,
 ) -> Result<UndoInfo, StoreError> {
     let description = match kind {
-        UndoKind::Put => format!("restore previous state of {name}"),
+        UndoKind::Put | UndoKind::PutFile => format!("restore previous state of {name}"),
         UndoKind::DeletePath | UndoKind::DeleteSite => format!("restore deleted site {name}"),
         UndoKind::Copy => format!("remove copied site {name}"),
         UndoKind::Move => format!("restore previous name {name}"),
@@ -3249,6 +3392,65 @@ fn expiry_target_kind_locked(
     }
 }
 
+fn aggregate_paths(path: &str) -> Vec<&str> {
+    let mut paths = vec![""];
+    let mut offset = 0;
+    while let Some(relative) = path[offset..].find('/') {
+        let end = offset + relative;
+        paths.push(&path[..end]);
+        offset = end + 1;
+    }
+    paths
+}
+
+fn adjust_aggregates_locked(
+    tx: &rusqlite::Transaction<'_>,
+    site_id: i64,
+    path: &str,
+    byte_delta: i64,
+    count_delta: i64,
+) -> Result<(), StoreError> {
+    if path == MANIFEST_PATH {
+        return Ok(());
+    }
+    for aggregate_path in aggregate_paths(path) {
+        tx.execute(
+            "INSERT INTO path_aggregates(site_id, path, logical_bytes, file_count)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(site_id, path) DO UPDATE SET
+                 logical_bytes = logical_bytes + excluded.logical_bytes,
+                 file_count = file_count + excluded.file_count",
+            params![site_id, aggregate_path, byte_delta, count_delta],
+        )?;
+    }
+    tx.execute(
+        "DELETE FROM path_aggregates
+         WHERE site_id = ?1 AND (logical_bytes <= 0 OR file_count <= 0)",
+        [site_id],
+    )?;
+    Ok(())
+}
+
+fn rebuild_aggregates_locked(
+    tx: &rusqlite::Transaction<'_>,
+    site_id: i64,
+) -> Result<(), StoreError> {
+    tx.execute("DELETE FROM path_aggregates WHERE site_id = ?1", [site_id])?;
+    let files = {
+        let mut statement =
+            tx.prepare("SELECT path, size FROM files WHERE site_id = ?1 AND path <> ?2")?;
+        statement
+            .query_map(params![site_id, MANIFEST_PATH], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for (path, size) in files {
+        adjust_aggregates_locked(tx, site_id, &path, size, 1)?;
+    }
+    Ok(())
+}
+
 fn expiry_target_size_locked(
     db: &Connection,
     site_id: i64,
@@ -3257,9 +3459,12 @@ fn expiry_target_size_locked(
 ) -> Result<u64, StoreError> {
     let size: i64 = match kind {
         ExpiryTargetKind::Site => db.query_row(
-            "SELECT COALESCE(SUM(size), 0) FROM files
-             WHERE site_id = ?1 AND path <> ?2",
-            params![site_id, MANIFEST_PATH],
+            "SELECT COALESCE(
+                 (SELECT logical_bytes FROM path_aggregates
+                  WHERE site_id = ?1 AND path = ''),
+                 0
+             )",
+            [site_id],
             |row| row.get(0),
         )?,
         ExpiryTargetKind::File => db.query_row(
@@ -3267,15 +3472,12 @@ fn expiry_target_size_locked(
             params![site_id, rel],
             |row| row.get(0),
         )?,
-        ExpiryTargetKind::Folder => {
-            let (start, end) = descendant_bounds(rel);
-            db.query_row(
-                "SELECT COALESCE(SUM(size), 0) FROM files
-                 WHERE site_id = ?1 AND path >= ?2 AND path < ?3 AND path <> ?4",
-                params![site_id, start, end, MANIFEST_PATH],
-                |row| row.get(0),
-            )?
-        }
+        ExpiryTargetKind::Folder => db.query_row(
+            "SELECT logical_bytes FROM path_aggregates
+             WHERE site_id = ?1 AND path = ?2",
+            params![site_id, rel],
+            |row| row.get(0),
+        )?,
     };
     Ok(size.cast_unsigned())
 }
@@ -3620,6 +3822,7 @@ fn finish_partial_expiry_locked(
         "UPDATE sites SET content_revision = content_revision + 1 WHERE id = ?1",
         [site_id],
     )?;
+    rebuild_aggregates_locked(tx, site_id)?;
     refresh_expiry_for_changes_locked(tx, site_id, &[changed_path], now)?;
     regenerate_site(tx, blobs, site_id, now)?;
     Ok(())
@@ -4349,6 +4552,91 @@ mod tests {
                 .unwrap(),
             LATEST_SCHEMA_VERSION
         );
+    }
+
+    #[test]
+    fn version_two_database_runs_expiry_management_and_aggregate_migrations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("symbol.db");
+        let mut db = Connection::open(path).unwrap();
+        db.pragma_update(None, "foreign_keys", "ON").unwrap();
+        db.execute_batch(SCHEMA).unwrap();
+        migrate_lifecycle_schema(&mut db).unwrap();
+        db.execute_batch(
+            "DROP TABLE undo_expiry_policies;
+             DROP INDEX expiry_policies_site_kind;
+             ALTER TABLE expiry_policies DROP COLUMN size_bytes;
+             PRAGMA user_version = 2;",
+        )
+        .unwrap();
+
+        run_migrations(&mut db).unwrap();
+
+        let version: i64 = db
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, LATEST_SCHEMA_VERSION);
+        for table in [
+            "undo_expiry_policies",
+            "management_audit",
+            "path_aggregates",
+        ] {
+            assert_eq!(
+                db.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                1
+            );
+        }
+        let expiry_columns = db
+            .prepare("PRAGMA table_info(expiry_policies)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(expiry_columns.iter().any(|column| column == "size_bytes"));
+    }
+
+    #[test]
+    fn path_aggregates_follow_incremental_put_delete_copy_and_undo() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+        store.put_file("hello", "assets/a.txt", b"aaa").unwrap();
+        store
+            .put_file("hello", "assets/nested/b.txt", b"bb")
+            .unwrap();
+        store.put_file("hello", "root.txt", b"r").unwrap();
+        store.put_file("hello", "assets/a.txt", b"aaaaa").unwrap();
+
+        let aggregate = |site: &str, path: &str| {
+            let db = Connection::open(dir.path().join("symbol.db")).unwrap();
+            db.query_row(
+                "SELECT logical_bytes, file_count FROM path_aggregates
+                 WHERE site_id = (SELECT id FROM sites WHERE name = ?1) AND path = ?2",
+                params![site, path],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(aggregate("hello", ""), (8, 3));
+        assert_eq!(aggregate("hello", "assets"), (7, 2));
+        assert_eq!(aggregate("hello", "assets/nested"), (2, 1));
+
+        store.delete_file("hello", "assets/nested").unwrap();
+        assert_eq!(aggregate("hello", ""), (6, 2));
+        assert_eq!(aggregate("hello", "assets"), (5, 1));
+
+        store.copy_site("hello", Some("copy"), None).unwrap();
+        assert_eq!(aggregate("copy", ""), (6, 2));
+        let token = store.undo_stack("hello").unwrap().entries[0].token.clone();
+        store.undo("hello", Some(&token)).unwrap();
+        assert_eq!(aggregate("hello", ""), (8, 3));
+        assert_eq!(aggregate("hello", "assets/nested"), (2, 1));
     }
 
     #[test]

@@ -51,8 +51,8 @@ Management tokens are generated from 32 random bytes, stored only as
 domain-separated Blake3-derived hashes, compared in constant time, returned
 once, and not recoverable.
 
-At site creation the service records either an authenticated trusted-proxy
-principal or a creator claim. Without a trusted principal and without a
+At site creation the service records either an authenticated configured
+creator principal or a creator claim. Without a trusted principal and without a
 caller-supplied claim, it generates a creator claim and returns it once:
 
 ```http
@@ -62,9 +62,12 @@ Cache-Control: no-store
 
 A caller may instead send `Creator-Claim: sym_claim_...`. To create a managed
 site in the same request, send `Management-Action: claim`; a new management
-token is returned in `Management-Token`. The trusted-proxy mode accepts a
-principal header only from IPs configured in `SYMBOL_TRUSTED_PROXY`; a
-caller-supplied internal principal header is always stripped.
+token is returned in `Management-Token`. Creator identity may come from one
+configured trusted-proxy account header, mTLS certificate-fingerprint header,
+or Tailscale user header. Identity headers are accepted only from peer IPs in
+`SYMBOL_TRUSTED_PROXY`; caller-supplied internal principal headers are always
+stripped. Management audit rows retain that socket peer IP as non-authoritative
+context.
 
 ## Common mutation request headers
 
@@ -466,9 +469,10 @@ Canonical client: `symbol put NAME FILE DEST`, or
 
 - Empty bodies return `400`.
 - Stored file requests use `SYMBOL_MAX_FILE_SIZE`, default 4 GiB.
-- Requests with `Unpack` have a fixed 50 MiB compressed-body limit.
-- Extraction permits at most 80 MiB of retained uncompressed bytes and 5000
-  files. Limit errors return `413 Payload Too Large`.
+- Requests with `Unpack` use `SYMBOL_MAX_ARCHIVE_UPLOAD`, default 50 MiB.
+- Extraction uses `SYMBOL_MAX_ARCHIVE_EXTRACTED` (default 80 MiB) and
+  `SYMBOL_MAX_ARCHIVE_FILES` (default 5000). Limit errors return
+  `413 Payload Too Large`.
 - Archive entries must be regular files. Unsafe traversal paths fail.
 - A single common archive root directory is stripped.
 - Known OS metadata (`__MACOSX`, AppleDouble, `.DS_Store`, Windows thumbnail
@@ -485,9 +489,9 @@ with no more than 1% suspicious ASCII controls. Redaction preserves the prefix
 and byte length, replacing the 64-byte payload with `*`.
 
 Large binary files are not scanned. A supported archive uploaded without
-`Unpack` is inspected through at most 80 MiB of uncompressed data and rejected
-with `400` if a token is found. Sanitization is therefore a narrow token leak
-barrier, not general secret detection.
+`Unpack` is inspected through at most `SYMBOL_MAX_ARCHIVE_EXTRACTED` bytes and
+rejected with `400` if a token is found. Sanitization is therefore a narrow
+token leak barrier, not general secret detection.
 
 ### `DELETE /{name}/{path...}`
 
@@ -601,7 +605,15 @@ Canonical client: `symbol undo [NAME [TOKEN]]`.
 ### `GET /{name}/EXPIRES`, `GET /{name}/EXPIRES/`, and
 `GET /{name}/{path...}/EXPIRES`
 
-Returns the effective expiry report. No authentication is required.
+The site-level route returns:
+
+```json
+{"site":"hello","entries":[{"target":{"site":"hello","path":null,"kind":"site"},"size":42,"refreshed_at":"2026-08-21T00:00:00Z","own_policy":{"mode":"relative","min_age_seconds":null,"max_age_seconds":null,"max_size_bytes":null,"power":null,"retention_seconds":3600,"expires_at":"2026-08-21T01:00:00Z"},"inherited_caps":[],"effective_expires_at":"2026-08-21T01:00:00Z","remaining_seconds":3600,"limited_by":null}]}
+```
+
+`entries` contains every stored site, folder, and file policy. The path-level
+route returns one effective expiry report for that target. No authentication
+is required.
 
 Success: `200`, `Cache-Control: no-cache`.
 
@@ -685,7 +697,7 @@ Requires one `Management-Action` value:
 
 `claim`
 : Converts an unmanaged site to managed. Authorization requires either the
-  matching creator claim or a matching trusted-proxy principal. Returns
+  matching creator claim or matching configured creator principal. Returns
   `{"managed":true}` and a one-time `Management-Token`.
 
 `rotate`

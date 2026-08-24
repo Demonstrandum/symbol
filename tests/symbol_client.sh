@@ -55,10 +55,10 @@ case "$method:$url" in
     location="http://mock${destination}/"
     body="moved $location"
     ;;
-  PUT:*/) status=201; location=http://mock/abcd/; body='created http://mock/abcd/' ;;
+  PUT:http://mock|PUT:*/) status=201; location=http://mock/abcd/; body='created http://mock/abcd/' ;;
   PUT:*) body=updated ;;
   EXPIRE:*|GET:*/EXPIRES)
-    body='{"mode":"decay","size":10,"effective_expires_at":"2027-01-01T00:00:00Z","remaining_seconds":100}'
+    body='{"site":"hello","entries":[{"mode":"decay","size":10,"inherited_caps":[{"kind":"site","path":null,"expires_at":"2027-01-01T00:00:00Z"}],"effective_expires_at":"2027-01-01T00:00:00Z","remaining_seconds":100}]}'
     ;;
   GET:*/UNDO)
     body='{"site":"hello","entries":[{"token":"tok1","description":"restore file","expires_at":"2027-01-01T00:00:00Z","remaining_seconds":100}]}'
@@ -122,11 +122,52 @@ else
   not_ok 'identity-collapsed ambiguity'
 fi
 
+registry='
+put:put push add
+pop:pop
+clone:clone pull
+get:get download
+copy:copy
+remix:remix x
+move:move rename
+stats:stats
+sync:sync
+undo:undo
+expire:expire
+manage:manage
+ls:ls list
+rm:rm delete
+url:url
+update:update upgrade
+help:help -h --help'
+registry_ok=1
+printf '%s\n' "$registry" | while IFS=: read -r canonical spellings; do
+  [ -n "$canonical" ] || continue
+  for spelling in $spellings; do
+    resolved=$(SYMBOL_TEST_RESOLVE_ONLY=1 "$CLIENT" "$spelling") || exit 1
+    [ "$resolved" = "$canonical" ] || exit 1
+  done
+done || registry_ok=0
+[ "$registry_ok" -eq 1 ] &&
+  ok 'all canonical commands and aliases resolve exactly' ||
+  not_ok 'all canonical commands and aliases resolve exactly'
+
+abbreviation_ok=1
+for pair in 'l:ls' 'del:rm' 'cl:clone' 'co:copy' 'ren:move' 'sy:sync' 'x:remix' 'own:get'; do
+  spelling=${pair%%:*}
+  canonical=${pair#*:}
+  resolved=$(SYMBOL_TEST_RESOLVE_ONLY=1 "$CLIENT" "$spelling") || abbreviation_ok=0
+  [ "$resolved" = "$canonical" ] || abbreviation_ok=0
+done
+[ "$abbreviation_ok" -eq 1 ] &&
+  ok 'prefix and substring abbreviations resolve to expected identities' ||
+  not_ok 'prefix and substring abbreviations resolve to expected identities'
+
 : > "$LOG"
 out=$("$CLIENT" co hello target)
 contains "$(cat "$LOG")" 'METHOD=COPY URL=http://mock/hello' &&
   contains "$(cat "$LOG")" 'Destination: /target' &&
-  contains "$out" 'copied http://mock/target/' &&
+  contains "$out" 'copied http://mock/hello/ -> http://mock/target/' &&
   ok 'copy uses COPY and Destination' || not_ok 'copy uses COPY and Destination'
 
 : > "$LOG"
@@ -145,10 +186,35 @@ out=$("$CLIENT" get hello -)
 printf '<h1>x</h1>' | "$CLIENT" -t explicit put >/dev/null
 log=$(cat "$LOG")
 contains "$log" 'METHOD=PUT URL=http://mock/' &&
+  contains "$log" 'UPLOAD=-' &&
   contains "$log" 'Authorization: Bearer explicit' &&
   contains "$log" 'Unpack: 1' &&
   contains "$log" 'ARCHIVE=./index.html' &&
   ok 'stdin put and explicit token' || not_ok 'stdin put and explicit token'
+
+: > "$LOG"
+printf '<h1>explicit</h1>\n' | "$CLIENT" put - >/dev/null
+contains "$(cat "$LOG")" 'METHOD=PUT URL=http://mock/' &&
+  contains "$(cat "$LOG")" 'UPLOAD=-' &&
+  contains "$(cat "$LOG")" 'ARCHIVE=./index.html' &&
+  ok 'explicit stdin dash publishes random index' ||
+  not_ok 'explicit stdin dash publishes random index'
+
+: > "$LOG"
+printf '<h1>implicit</h1>\n' | "$CLIENT" put >/dev/null
+contains "$(cat "$LOG")" 'METHOD=PUT URL=http://mock/' &&
+  contains "$(cat "$LOG")" 'UPLOAD=-' &&
+  contains "$(cat "$LOG")" 'ARCHIVE=./index.html' &&
+  ok 'implicit piped stdin publishes random index' ||
+  not_ok 'implicit piped stdin publishes random index'
+
+: > "$LOG"
+printf '<h1>slash</h1>\n' |
+  SYMBOL_HOST=http://mock/ "$CLIENT" put - >/dev/null
+contains "$(cat "$LOG")" 'METHOD=PUT URL=http://mock/' &&
+  ! contains "$(cat "$LOG")" 'URL=http://mock//' &&
+  ok 'trailing host slash is normalized for stdin put' ||
+  not_ok 'trailing host slash is normalized for stdin put'
 
 out=$("$CLIENT" expire)
 contains "$out" 'expiration is disabled until explicitly enabled.' &&
@@ -159,6 +225,7 @@ contains "$out" 'expiration is disabled until explicitly enabled.' &&
 out=$("$CLIENT" expire hello --show)
 contains "$(cat "$LOG")" 'METHOD=GET URL=http://mock/hello/EXPIRES' &&
   contains "$out" '2027-01-01T00:00:00Z (in 1m 40s)' &&
+  contains "$out" 'inherited cap:' &&
   ok 'expire show report' || not_ok 'expire show report'
 
 : > "$LOG"
@@ -226,6 +293,9 @@ sync_status=0
 (cd "$ROOT/work/sync" && "$CLIENT" sync >"$ROOT/sync.out" 2>"$ROOT/sync.err") || sync_status=$?
 [ "$sync_status" -ne 0 ] &&
   contains "$(cat "$ROOT/sync.err")" 'upstream changed since this checkout' &&
+  contains "$(cat "$ROOT/sync.err")" 'local changes:' &&
+  contains "$(cat "$ROOT/sync.err")" 'upstream changes:' &&
+  contains "$(cat "$ROOT/sync.err")" 'symbol clone hello ../hello-upstream' &&
   ! contains "$(cat "$LOG")" 'METHOD=PUT' &&
   ok 'sync drift aborts without writing' || not_ok 'sync drift aborts without writing'
 

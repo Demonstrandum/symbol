@@ -2,6 +2,7 @@
 use std::io::Cursor;
 use std::io::{BufRead, BufReader, Read, Seek, Write};
 use std::path::Path;
+use std::sync::OnceLock;
 
 use flate2::read::GzDecoder;
 
@@ -10,8 +11,32 @@ use crate::pathutil::is_junk;
 use crate::pathutil::{PathError, is_noise_path, looks_like_apple_fork, safe_rel_path};
 use crate::sanitize;
 
-const MAX_FILES: usize = 5000;
-const MAX_EXTRACTED: u64 = 80 * 1024 * 1024;
+const DEFAULT_MAX_FILES: usize = 5000;
+const DEFAULT_MAX_EXTRACTED: u64 = 80 * 1024 * 1024;
+static ARCHIVE_LIMITS: OnceLock<ArchiveLimits> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy)]
+pub struct ArchiveLimits {
+    pub max_files: usize,
+    pub max_extracted: u64,
+}
+
+impl Default for ArchiveLimits {
+    fn default() -> Self {
+        Self {
+            max_files: DEFAULT_MAX_FILES,
+            max_extracted: DEFAULT_MAX_EXTRACTED,
+        }
+    }
+}
+
+pub fn configure_archive_limits(limits: ArchiveLimits) -> Result<(), ArchiveLimits> {
+    ARCHIVE_LIMITS.set(limits)
+}
+
+fn archive_limits() -> ArchiveLimits {
+    ARCHIVE_LIMITS.get().copied().unwrap_or_default()
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum UploadError {
@@ -211,6 +236,7 @@ pub fn reject_secrets_in_opaque_archive(source: &Path, kind: Kind) -> Result<(),
 }
 
 fn zip_contains_secret(source: &Path) -> Result<bool, UploadError> {
+    let limits = archive_limits();
     let mut archive = zip::ZipArchive::new(std::fs::File::open(source)?)?;
     let mut total = 0_u64;
     for index in 0..archive.len() {
@@ -219,7 +245,7 @@ fn zip_contains_secret(source: &Path) -> Result<bool, UploadError> {
             continue;
         }
         total = total.saturating_add(entry.size());
-        if total > MAX_EXTRACTED {
+        if total > limits.max_extracted {
             return Err(UploadError::TooLarge);
         }
         if sanitize::count_reader(&mut entry)?.total() > 0 {
@@ -230,6 +256,7 @@ fn zip_contains_secret(source: &Path) -> Result<bool, UploadError> {
 }
 
 fn tar_contains_secret(reader: impl Read) -> Result<bool, UploadError> {
+    let limits = archive_limits();
     let mut archive = tar::Archive::new(reader);
     let mut total = 0_u64;
     for entry in archive.entries()? {
@@ -238,7 +265,7 @@ fn tar_contains_secret(reader: impl Read) -> Result<bool, UploadError> {
             continue;
         }
         total = total.saturating_add(entry.header().size()?);
-        if total > MAX_EXTRACTED {
+        if total > limits.max_extracted {
             return Err(UploadError::TooLarge);
         }
         if sanitize::count_reader(&mut entry)?.total() > 0 {
@@ -249,12 +276,13 @@ fn tar_contains_secret(reader: impl Read) -> Result<bool, UploadError> {
 }
 
 fn gzip_contains_secret(source: &Path) -> Result<bool, UploadError> {
+    let limits = archive_limits();
     let decoder = GzDecoder::new(std::fs::File::open(source)?);
     let mut reader = BufReader::new(decoder);
     if looks_like_tar(reader.fill_buf()?) {
         return tar_contains_secret(reader);
     }
-    let mut limited = reader.take(MAX_EXTRACTED + 1);
+    let mut limited = reader.take(limits.max_extracted + 1);
     let found = sanitize::count_reader(&mut limited)?.total() > 0;
     if limited.limit() == 0 {
         return Err(UploadError::TooLarge);
@@ -306,6 +334,7 @@ fn extract_gzip_reader(
     source: &Path,
     filename: Option<&str>,
 ) -> Result<usize, UploadError> {
+    let limits = archive_limits();
     let decoder = GzDecoder::new(std::fs::File::open(source)?);
     let mut reader = BufReader::new(decoder);
     let prefix = reader.fill_buf()?;
@@ -324,8 +353,8 @@ fn extract_gzip_reader(
         std::fs::create_dir_all(parent)?;
     }
     let mut output = std::fs::File::create(path)?;
-    let copied = std::io::copy(&mut reader.take(MAX_EXTRACTED + 1), &mut output)?;
-    if copied > MAX_EXTRACTED {
+    let copied = std::io::copy(&mut reader.take(limits.max_extracted + 1), &mut output)?;
+    if copied > limits.max_extracted {
         return Err(UploadError::TooLarge);
     }
     Ok(1)
@@ -344,6 +373,7 @@ fn strip_gz_name(name: &str) -> Option<&str> {
 
 #[cfg(test)]
 fn gunzip(bytes: &[u8]) -> Result<Vec<u8>, UploadError> {
+    let limits = archive_limits();
     let mut dec = GzDecoder::new(Cursor::new(bytes));
     let mut out = Vec::new();
     let mut buf = [0u8; 64 * 1024];
@@ -353,7 +383,7 @@ fn gunzip(bytes: &[u8]) -> Result<Vec<u8>, UploadError> {
             break;
         }
         out.extend_from_slice(&buf[..n]);
-        if out.len() as u64 > MAX_EXTRACTED {
+        if out.len() as u64 > limits.max_extracted {
             return Err(UploadError::TooLarge);
         }
     }
@@ -366,6 +396,7 @@ fn extract_zip(dest: &Path, bytes: &[u8]) -> Result<usize, UploadError> {
 }
 
 fn extract_zip_reader<R: Read + Seek>(dest: &Path, reader: R) -> Result<usize, UploadError> {
+    let limits = archive_limits();
     let mut archive = zip::ZipArchive::new(reader)?;
     let mut files = 0usize;
     let mut total = 0u64;
@@ -383,7 +414,7 @@ fn extract_zip_reader<R: Read + Seek>(dest: &Path, reader: R) -> Result<usize, U
         let rel = safe_rel_path(&enclosed.to_string_lossy())?;
         let size = file.size();
         total = total.saturating_add(size);
-        if total > MAX_EXTRACTED {
+        if total > limits.max_extracted {
             return Err(UploadError::TooLarge);
         }
         if !write_kept_file(dest, &rel, &mut file)? {
@@ -391,7 +422,7 @@ fn extract_zip_reader<R: Read + Seek>(dest: &Path, reader: R) -> Result<usize, U
             continue;
         }
         files += 1;
-        if files > MAX_FILES {
+        if files > limits.max_files {
             return Err(UploadError::TooManyFiles);
         }
     }
@@ -403,6 +434,7 @@ fn extract_zip_reader<R: Read + Seek>(dest: &Path, reader: R) -> Result<usize, U
 }
 
 fn extract_tar<R: Read>(dest: &Path, reader: R) -> Result<usize, UploadError> {
+    let limits = archive_limits();
     let mut archive = tar::Archive::new(reader);
     let mut files = 0usize;
     let mut total = 0u64;
@@ -418,7 +450,7 @@ fn extract_tar<R: Read>(dest: &Path, reader: R) -> Result<usize, UploadError> {
         let rel = safe_rel_path(&path.to_string_lossy())?;
         let size = entry.header().size()?;
         total = total.saturating_add(size);
-        if total > MAX_EXTRACTED {
+        if total > limits.max_extracted {
             return Err(UploadError::TooLarge);
         }
         if !write_kept_file(dest, &rel, &mut entry)? {
@@ -426,7 +458,7 @@ fn extract_tar<R: Read>(dest: &Path, reader: R) -> Result<usize, UploadError> {
             continue;
         }
         files += 1;
-        if files > MAX_FILES {
+        if files > limits.max_files {
             return Err(UploadError::TooManyFiles);
         }
     }

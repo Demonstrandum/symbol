@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+
+cd "$(dirname "$0")"
+
+./check
+cargo build --release --locked
+sudo -n nix build path:. --cores "${NIX_CORES:-8}" --max-jobs "${NIX_MAX_JOBS:-4}"
+
+if [ "${SYMBOL_DEPLOY_CHECK:-0}" = 1 ]; then
+  ./ops/restart.sh
+  curl -fsS http://127.0.0.1:4340/STATS |
+    python3 -c 'import json,sys; assert isinstance(json.load(sys.stdin), dict)'
+  curl -fsS -o /dev/null http://symbol/
+fi
+
+printf 'release gate passed\n'

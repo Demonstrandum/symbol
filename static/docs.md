@@ -32,6 +32,7 @@ symbol pop hello             # download and remove
 symbol rm hello              # remove without backup
 symbol undo --stack hello    # changes that can be undone
 symbol expire                # expiry help and retention graph
+symbol manage hello --status # show write protection
 symbol update                # reinstall this client
 ```
 
@@ -125,3 +126,6 @@ delete a file, or pop a site (DELETE returns the site as tar.gz)
 curl -X DELETE {host}/hello/style.css
 curl -OJ -X DELETE {host}/hello  # removes, saves locally as hello.tar.gz
 ```
+
+full request and response details are in
+[API.md](https://github.com/Demonstrandum/symbol/blob/main/API.md).

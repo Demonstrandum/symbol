@@ -235,6 +235,12 @@ pub struct ExpiryReport {
     pub limited_by: Option<ExpiryLimit>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExpirySiteReport {
+    pub site: String,
+    pub entries: Vec<ExpiryReport>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExpiryLimit {
     pub kind: ExpiryTargetKind,
