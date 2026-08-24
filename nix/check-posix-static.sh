@@ -6,9 +6,12 @@ cp -R "$src/." .
 failed=0
 
 for script in \
+  check \
   ops/restart.sh \
+  release-check \
   static/install.sh \
   static/symbol.sh \
+  tests/concurrency_soak.sh \
   tests/lifecycle_e2e.sh \
   tests/symbol_client.sh
 do

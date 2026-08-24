@@ -4,9 +4,12 @@ let
   src = lib.fileset.toSource {
     inherit root;
     fileset = lib.fileset.unions [
+      (root + "/check")
       (root + "/ops/restart.sh")
+      (root + "/release-check")
       (root + "/static/install.sh")
       (root + "/static/symbol.sh")
+      (root + "/tests/concurrency_soak.sh")
       (root + "/tests/lifecycle_e2e.sh")
       (root + "/tests/symbol_client.sh")
     ];
