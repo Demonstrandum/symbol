@@ -876,6 +876,14 @@ mod tests {
     }
 
     #[test]
+    fn html_code_blocks_are_not_horizontally_indented() {
+        assert!(
+            !STYLE.contains(".row pre { margin-left:"),
+            "code blocks should align with the content column"
+        );
+    }
+
+    #[test]
     fn markdown_links() {
         assert_eq!(
             inline_plain("see [a](b) and [c](c)", false),

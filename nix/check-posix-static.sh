@@ -11,6 +11,7 @@ for script in \
   release-check \
   static/install.sh \
   static/symbol.sh \
+  tests/alias_transfer_e2e.sh \
   tests/concurrency_soak.sh \
   tests/lifecycle_e2e.sh \
   tests/production_guard.sh \

@@ -9,6 +9,7 @@ let
       (root + "/release-check")
       (root + "/static/install.sh")
       (root + "/static/symbol.sh")
+      (root + "/tests/alias_transfer_e2e.sh")
       (root + "/tests/concurrency_soak.sh")
       (root + "/tests/lifecycle_e2e.sh")
       (root + "/tests/production_guard.sh")

@@ -202,10 +202,21 @@ approved_extra = next(
     for endpoint in freeze.approved_additions.endpoint_contracts
     if endpoint.name == "api version"
 )
-validate_contract(freeze, (*contract, approved_extra))
+contract_without_extra = tuple(
+    endpoint for endpoint in contract if endpoint.name != approved_extra.name
+)
+validate_contract(freeze, (*contract_without_extra, approved_extra))
 try:
     validate_contract(
-        freeze, (*contract, dataclasses.replace(approved_extra, path="/unapproved"))
+        freeze,
+        (
+            *contract,
+            dataclasses.replace(
+                approved_extra,
+                name="unapproved endpoint",
+                path="/unapproved",
+            ),
+        ),
     )
 except AssertionError:
     pass

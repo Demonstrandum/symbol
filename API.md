@@ -16,9 +16,17 @@ and status inventory used by conformance tests for this document.
 - File paths are slash-separated relative paths. Empty and `..` paths are
   rejected. Backslashes normalize to slashes; empty and `.` components are
   removed.
+- `FILES`, `UNDO`, and `EXPIRES` reserve their whole top-level virtual
+  namespace: a mutation path whose first component is one of those names is
+  rejected, including the name itself and every descendant.
 - `FILES`, `HASH`, `UNDO`, `EXPIRES`, `symbol.toml`, `.symbol-token`, and
-  `.symbol-claim` are reserved as the final component of any uploaded or
-  deleted path.
+  `.symbol-claim` are also reserved as the final component of any mutation
+  path.
+- After managed-site authentication, `POST`, `ALIAS`, `REPLACE`, `PATCH`,
+  `PUT`, `DELETE`, and `EXPIRE` apply both rules uniformly and return
+  `400 Bad Request` with the frozen plain-text body
+  `error: path is reserved by symbol\n`. Authentication failure takes
+  precedence and returns `401`.
 - Plain responses are UTF-8 text with a trailing newline.
 - JSON responses use `application/json`.
 - Timestamps are RFC 3339. HTTP `Expires` uses an RFC-compatible GMT date.
@@ -85,16 +93,19 @@ their socket address.
   is managed.
 
 `If-Match`
-: One quoted or unquoted `blake3:<64 hex>` site tree hash. Accepted on PUT.
+: One quoted or unquoted `blake3:<64 hex>` site tree hash. Accepted on PUT,
+  ALIAS, POST, REPLACE, and PATCH.
   Lists and `*` are rejected. A mismatch returns `412` without writing.
 
 `Idempotency-Key`
-: 1–256 visible ASCII characters (`0x21`–`0x7e`). Implemented only for unnamed
-  PUT, generated-destination COPY, management claim, and management rotate.
+: 1–256 visible ASCII characters (`0x21`–`0x7e`). Implemented for unnamed
+  PUT, generated-destination COPY, management claim/rotate, ALIAS, allocated
+  POST workflows, REPLACE, and PATCH.
   Records live four hours. Reuse with the same operation and fingerprint
   replays the stored generated name and mutation metadata; reuse for a
-  different request returns `409`. Named PUT, named COPY, MOVE, DELETE, EXPIRE,
-  UNDO, status, and release do not implement idempotency.
+  different request, including a changed `If-Match`, returns `409`. Named PUT,
+  named COPY, MOVE, DELETE, EXPIRE, UNDO, status, and release do not implement
+  idempotency.
 
   Replays return `Idempotency-Replayed: true` and the original resource/status
   metadata. They never return or re-expose management or creator secrets.
@@ -787,6 +798,96 @@ valid.
 Canonical client:
 `symbol manage NAME --claim|--status|--rotate|--release`.
 
+<!-- contract:alias batch -->
+<!-- contract:alias file -->
+### `ALIAS /{name}/` and `ALIAS /{name}/{path...}`
+
+Creates or retargets live aliases without dereferencing them. A single-path
+request uses `Alias-Target`; the root batch form uses
+`Content-Type: application/json` and
+`{"aliases":[{"path":"current","target":"assets/app.js"}]}`. Both accept
+`Authorization`, `If-Match`, and `Idempotency-Key`. Targets are site-relative;
+absolute/external targets, root escapes, prefix shadowing, and cycles fail
+atomically. Batch limits are 4096 entries, 1 MiB JSON, and 4096 bytes per
+target.
+
+Success is `201` when every changed row was newly created, otherwise `200`.
+Responses are JSON and include `Location`, `ETag`, `Content-Revision`,
+optional `Undo-Token`/`Undo-Expires`, and `Idempotency-Replayed` on exact
+replay. Stored receipt rows are replayed unchanged even if an alias is later
+retargeted.
+
+```http
+ALIAS /hello/current HTTP/1.1
+Alias-Target: assets/app.js
+If-Match: "blake3:<tree hash>"
+Idempotency-Key: alias-current-v1
+```
+
+<!-- contract:allocated file -->
+### `POST /{name}/{folder...}/`
+
+Creates a content-addressed file under a server-selected name. The default
+action (`Allocation-Action: create`) accepts `File-Prefix`, `File-Suffix`,
+`File-Extension`, `Content-Type`, expiry headers (`Expiry-Mode`, `Expiry-In`,
+`Expiry-At`, `Expiry-Min-Age`, `Expiry-Max-Age`, `Expiry-Max-Size`,
+`Expiry-Power`), `Authorization`, `If-Match`, and `Idempotency-Key`.
+
+Two-phase custom naming uses `Allocation-Action: propose` with the body and an
+optional `File-Extension`, then `Allocation-Action: finalize` with an empty
+body, `Allocation-Token`, and `File-Name`. `Allocation-Action: cancel` uses an
+empty body and `Allocation-Token`. Proposal hints, media type, expiry,
+authorization identity, and `If-Match` are bound to idempotency. Cancellation
+performs its tree CAS and pending-row deletion in one transaction.
+
+Create/finalize return `200` or `201`; propose returns `202`; cancel returns
+`200`. JSON responses include `Location`, `ETag`, `Content-Revision`, and,
+where applicable, `Content-Location`, `Undo-Token`, `Undo-Expires`, and
+`Idempotency-Replayed`.
+
+```sh
+curl -X POST -H 'Content-Type: image/png' \
+  -H 'File-Prefix: avatar-' -H 'File-Extension: png' \
+  -H 'Idempotency-Key: avatar-v1' --data-binary @avatar.png \
+  "$SYMBOL_BASE/hello/uploads/"
+```
+
+<!-- contract:file replace -->
+### `REPLACE /{name}/{path...}`
+
+Atomically replaces a regular or allocated file. `If-Content-Match` supplies
+the required raw or `blake3:` content hash; `If-Match` guards the site tree.
+`Content-Type`, `Authorization`, and `Idempotency-Key` are accepted. Allocated
+files may relocate according to their stored naming rule. Success is `200`
+JSON with `Location`, `ETag`, `Content-Revision`, optional
+`Undo-Token`/`Undo-Expires`, and `Idempotency-Replayed`.
+
+```http
+REPLACE /hello/data.bin HTTP/1.1
+If-Content-Match: blake3:<file hash>
+If-Match: "blake3:<tree hash>"
+Content-Type: application/octet-stream
+Idempotency-Key: replace-data-v2
+
+<replacement bytes>
+```
+
+<!-- contract:file splice -->
+### `PATCH /{name}/{path...}`
+
+Applies ordered byte splices with `If-Content-Match`, optional `If-Match`,
+`Authorization`, and `Idempotency-Key`. The header form uses one or more
+`Splice: offset=<n>,delete=<n>,insert=<n>` descriptors followed by the exact
+concatenated insertion bytes (at most 64 descriptors and 8192 aggregate header
+bytes). Binary frame v1 uses case-insensitive media type
+`Content-Type: application/vnd.symbol.splice; version=1`, magic `SYMSPL1\0`,
+big-endian count/flags/descriptor table, at most 4096 descriptors and 96 KiB
+metadata, then exact insertion bytes with no trailing data.
+
+Success is `200` JSON with `Location`, `ETag`, `Content-Revision`, optional
+`Undo-Token`/`Undo-Expires`, and `Idempotency-Replayed`. Malformed/range/size
+errors are `400`, `416`, or `413`; stale content or tree guards return `412`.
+
 ## Generated `symbol.toml`
 
 Every site contains a server-generated `symbol.toml` and archives include it.
@@ -889,14 +990,14 @@ The current service does **not** implement:
 - a versioned `/api` namespace, OpenAPI endpoint, or JSON error envelope;
 - access-controlled reads or private sites;
 - listing pagination, search, quotas, or per-site upload limits;
-- PATCH, WebDAV PROPFIND, multi-range responses, resumable upload sessions, or
-  server-side multipart upload;
+- WebDAV PROPFIND, multi-range responses, resumable multipart upload sessions,
+  or server-side multipart upload;
 - replacement semantics for directory/archive PUT (PUT is merge-only);
 - automatic remote deletion from `symbol sync`;
 - server-side conflict merging;
 - recovery of a lost management token through a public HTTP admin endpoint;
-- idempotency for named writes or lifecycle methods other than generated COPY,
-  claim, and rotate;
+- idempotency for named PUT, named COPY, MOVE, DELETE, EXPIRE, UNDO, management
+  status, or management release;
 - conditional `If-None-Match` handling for inventory JSON, stats, hash
   endpoints, expiry reports, undo stacks, or management status;
 - gzip response compression in the application itself (the sample Caddy proxy

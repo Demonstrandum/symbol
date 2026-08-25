@@ -8,6 +8,7 @@ import sys
 
 root = pathlib.Path(__file__).resolve().parent.parent
 api = (root / "API.md").read_text()
+freeze = json.loads((root / "public-api-freeze.json").read_text())
 contract = json.loads(
     subprocess.check_output([root / "target/debug/symbol", "contract"], text=True)
 )
@@ -29,6 +30,18 @@ common = api[: api.find("## Route inventory")]
 errors = api[api.find("## Status and error mapping") :]
 failures = []
 names = set()
+normalized_api = re.sub(r"\s+", " ", api)
+for required_reserved_rule in (
+    "`FILES`, `UNDO`, and `EXPIRES` reserve their whole top-level virtual namespace",
+    "`FILES`, `HASH`, `UNDO`, `EXPIRES`, `symbol.toml`, `.symbol-token`, and `.symbol-claim` are also reserved as the final component of any mutation path",
+    "`POST`, `ALIAS`, `REPLACE`, `PATCH`, `PUT`, `DELETE`, and `EXPIRE` apply both rules uniformly",
+    "`error: path is reserved by symbol\\n`",
+    "Authentication failure takes precedence and returns `401`",
+):
+    if required_reserved_rule not in normalized_api:
+        failures.append(
+            f"missing exact reserved mutation rule: {required_reserved_rule}"
+        )
 for endpoint in contract:
     name = endpoint["name"]
     if name in names:

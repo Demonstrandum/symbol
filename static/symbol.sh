@@ -102,6 +102,7 @@ usage:
   symbol copy [--managed] SRC [DST]
   symbol remix [--managed] SRC [DST]
   symbol move SRC DST
+  symbol alias SITE PATH TARGET [PATH TARGET ...]
   symbol sync [--check]
   symbol undo [--stack] [NAME [TOKEN]]
   symbol expire [NAME [PATH]] [POLICY]
@@ -369,6 +370,11 @@ print_links() {
       }
 
       name = names[NR]
+      arrow = index(name, " -> ")
+      if (arrow) {
+        alias_target[NR] = substr(name, arrow)
+        name = substr(name, 1, arrow - 1)
+      }
       if (name == "") {
         links[NR] = ""
       } else if (nested && NR == 1) {
@@ -379,6 +385,7 @@ print_links() {
         sub(/\/$/, "", name)
         links[NR] = base "/" name
       }
+      links[NR] = links[NR] alias_target[NR]
       if (length(links[NR]) > link_width) link_width = length(links[NR])
       lines = NR
     }
@@ -387,9 +394,9 @@ print_links() {
         if (metadata[i] == "") {
           print links[i]
         } else {
-          printf "%-*s  %s%s\n",
-            link_width,
+          printf "%s%s  %s%s\n",
             links[i],
+            spaces(link_width - length(links[i])),
             spaces(starts[i] - minimum_start),
             metadata[i]
         }
@@ -678,6 +685,7 @@ get get download
 copy copy
 remix remix x
 move move rename
+alias alias
 stats stats
 sync sync
 undo undo
@@ -845,10 +853,13 @@ content_type() {
 validate_remote_path() {
   remote=$1
   [ -n "${remote}" ] || return 0
+  case "${remote}" in
+    /*|*\\*) usage_error "invalid remote path: ${remote}" ;;
+  esac
   case "/${remote}/" in
     */../*|*/./*|*'//'*) usage_error "invalid remote path: ${remote}" ;;
   esac
-  terminal=$(basename "${remote}")
+  terminal=$(basename "./${remote}")
   case "${terminal}" in
     symbol.toml|.symbol-token|.symbol-claim|FILES|HASH|UNDO|EXPIRES)
       usage_error "reserved remote path: ${remote}"
@@ -856,26 +867,273 @@ validate_remote_path() {
   esac
 }
 
+canonical_alias_target() (
+  alias_path=$1
+  alias_target=$2
+  LC_ALL=C
+  export LC_ALL
+  printf '%s\t%s\n' "${alias_path}" "${alias_target}" | awk -F '\t' '
+    function reserved(path, count, parts, terminal) {
+      count = split(path, parts, "/")
+      terminal = parts[count]
+      return terminal == "symbol.toml" || terminal == ".symbol-token" ||
+        terminal == ".symbol-claim" || terminal == "FILES" ||
+        terminal == "HASH" || terminal == "UNDO" || terminal == "EXPIRES"
+    }
+    function noise(path, count, parts, i, part, lower) {
+      count = split(path, parts, "/")
+      for (i = 1; i <= count; i++) {
+        part = parts[i]
+        lower = tolower(part)
+        if (substr(part, 1, 2) == "._" || part == "Icon\r" ||
+            lower == "__macosx" || lower == ".appledouble" ||
+            lower == ".ds_store" || lower == ".lsoverride" ||
+            lower == "thumbs.db" || lower == "ehthumbs.db" ||
+            lower == "desktop.ini") return 1
+      }
+      return 0
+    }
+    function external(target, lower) {
+      lower = tolower(target)
+      return index(lower, "://") ||
+        lower ~ /^(data|file|ftp|ftps|git|http|https|javascript|mailto|ssh|ws|wss):/
+    }
+    {
+      path = $1
+      target = $2
+      if (NF != 2 || path == "" || target == "" ||
+          length(target) > 4096 || target ~ /^\// ||
+          target ~ /\\/ || target ~ /[[:cntrl:]]/ ||
+          path ~ /\\/ || path ~ /[[:cntrl:]]/ || external(target)) exit 1
+      count = split(path, path_parts, "/")
+      depth = 0
+      for (i = 1; i < count; i++) {
+        if (path_parts[i] == "" || path_parts[i] == "." ||
+            path_parts[i] == "..") exit 1
+        parts[++depth] = path_parts[i]
+      }
+      count = split(target, target_parts, "/")
+      for (i = 1; i <= count; i++) {
+        part = target_parts[i]
+        if (part == "" || part == ".") continue
+        if (part == "..") {
+          if (depth == 0) exit 1
+          delete parts[depth--]
+        } else {
+          parts[++depth] = part
+        }
+      }
+      if (depth == 0) exit 1
+      canonical = parts[1]
+      for (i = 2; i <= depth; i++) canonical = canonical "/" parts[i]
+      if (reserved(canonical) || noise(canonical)) exit 1
+      print canonical
+    }
+  '
+)
+
+relative_alias_target() (
+  alias_path=$1
+  canonical_target=$2
+  printf '%s\t%s\n' "${alias_path}" "${canonical_target}" | awk -F '\t' '
+    {
+      path_count = split($1, path_parts, "/")
+      from_count = path_count - 1
+      to_count = split($2, target_parts, "/")
+      common = 0
+      while (common < from_count && common < to_count &&
+             path_parts[common + 1] == target_parts[common + 1]) common++
+      out = ""
+      for (i = common + 1; i <= from_count; i++)
+        out = out (out == "" ? "" : "/") ".."
+      for (i = common + 1; i <= to_count; i++)
+        out = out (out == "" ? "" : "/") target_parts[i]
+      print out == "" ? "." : out
+    }
+  '
+)
+
+safe_symlink() {
+  symlink_target=$1
+  symlink_path=$2
+  case "${symlink_target}" in
+    -*) symlink_target=./${symlink_target} ;;
+  esac
+  ln -s "${symlink_target}" "${symlink_path}"
+}
+
+validate_alias_map() (
+  alias_map=$1
+  awk -F '\t' '
+    function beneath(path, parent) {
+      return index(path, parent "/") == 1
+    }
+    function substitution(path, best, candidate) {
+      best = ""
+      for (candidate in target) {
+        if ((path == candidate || beneath(path, candidate)) &&
+            length(candidate) > length(best)) best = candidate
+      }
+      matched = best
+      return best == "" ? "" : target[best] substr(path, length(best) + 1)
+    }
+    {
+      if (NF != 2 || $1 == "" || $2 == "") exit 1
+      if (($1 in target) && target[$1] != $2) exit 1
+      target[$1] = $2
+    }
+    END {
+      if (NR == 0) exit 0
+      for (path in target) {
+        for (ancestor in target)
+          if (path != ancestor && beneath(path, ancestor)) exit 1
+        if (beneath(path, target[path])) exit 1
+        current = path
+        for (seen_path in seen) delete seen[seen_path]
+        complete = 0
+        for (hop = 0; hop <= NR; hop++) {
+          if (current in seen) exit 1
+          seen[current] = 1
+          resolved = substitution(current)
+          if (matched == "") {
+            complete = 1
+            break
+          }
+          current = resolved
+        }
+        if (!complete || beneath(path, current)) exit 1
+      }
+    }
+  ' "${alias_map}"
+)
+
+path_covered_by_alias() (
+  covered_path=$1
+  covered_aliases=$2
+  awk -F '\t' -v path="${covered_path}" '
+    $1 == path || index(path, $1 "/") == 1 { found = 1; exit }
+    END { exit !found }
+  ' "${covered_aliases}"
+)
+
+path_below_alias() (
+  covered_path=$1
+  covered_aliases=$2
+  awk -F '\t' -v path="${covered_path}" '
+    index(path, $1 "/") == 1 { found = 1; exit }
+    END { exit !found }
+  ' "${covered_aliases}"
+)
+
+local_alias_map() (
+  alias_root=$1
+  alias_manifest=${2:-}
+  alias_work=$(mktemp -d) || exit 1
+  trap 'rm -rf "${alias_work}"' EXIT HUP INT TERM
+  alias_baseline=${alias_work}/baseline
+  alias_detected=${alias_work}/detected
+  alias_combined=${alias_work}/combined
+  : > "${alias_baseline}"
+  : > "${alias_detected}"
+  if [ -n "${alias_manifest}" ] && [ -f "${alias_manifest}" ]; then
+    manifest_aliases "${alias_manifest}" > "${alias_baseline}"
+  fi
+  (
+    cd "${alias_root}"
+    find . -type l ! -path './.git/*' ! -name .git \
+      ! -name '.symbol-token' ! -name '.symbol-claim' \
+      ! -name 'symbol.toml' -print | LC_ALL=C sort
+  ) | while IFS= read -r alias_source; do
+    alias_relative=${alias_source#./}
+    if path_below_alias "${alias_relative}" "${alias_baseline}"; then
+      continue
+    fi
+    alias_link=$(readlink "${alias_root}/${alias_relative}") ||
+      die "could not read symlink: ${alias_root}/${alias_relative}"
+    alias_canonical=$(canonical_alias_target "${alias_relative}" "${alias_link}") ||
+      die "unsafe symlink target: ${alias_relative} -> ${alias_link}"
+    printf '%s\t%s\n' "${alias_relative}" "${alias_canonical}"
+  done > "${alias_detected}"
+  {
+    cat "${alias_baseline}"
+    cat "${alias_detected}"
+  } | awk -F '\t' '{ targets[$1] = $2 } END {
+    for (path in targets) print path "\t" targets[path]
+  }' | LC_ALL=C sort > "${alias_combined}"
+  validate_alias_map "${alias_combined}" ||
+    die "unsafe symlink graph: alias cycle or write through alias"
+  cat "${alias_combined}"
+)
+
 stage_upload_directory() {
   source=$1
+  stage_manifest=
+  [ ! -f "${source}/symbol.toml" ] || stage_manifest=${source}/symbol.toml
+  stage_aliases=$(mktemp) || exit 1
+  local_alias_map "${source}" "${stage_manifest}" > "${stage_aliases}"
   STAGE_ROOT=$(mktemp -d) || exit 1
   (
     cd "${source}"
-    find . -type f ! -path './.git/*' \
+    find . \( -type f -o -type l \) ! -path './.git/*' ! -name .git \
       ! -name '.symbol-token' ! -name '.symbol-claim' \
       ! -name 'symbol.toml' -print
   ) | while IFS= read -r path; do
     relative=${path#./}
-    mkdir -p "${STAGE_ROOT}/$(dirname "${relative}")"
-    cp "${source}/${relative}" "${STAGE_ROOT}/${relative}"
+    path_covered_by_alias "${relative}" "${stage_aliases}" && continue
+    mkdir -p "${STAGE_ROOT}/$(dirname "./${relative}")"
+    cp -P "${source}/${relative}" "${STAGE_ROOT}/${relative}"
   done
+  while IFS='	' read -r stage_alias_path stage_alias_target; do
+    [ -n "${stage_alias_path}" ] || continue
+    mkdir -p "${STAGE_ROOT}/$(dirname "./${stage_alias_path}")"
+    stage_relative_target=$(relative_alias_target \
+      "${stage_alias_path}" "${stage_alias_target}")
+    safe_symlink "${stage_relative_target}" "${STAGE_ROOT}/${stage_alias_path}"
+  done < "${stage_aliases}"
+  rm -f "${stage_aliases}"
+  stage_aliases=
+  staged_alias_check=$(mktemp) || exit 1
+  local_alias_map "${STAGE_ROOT}" "" > "${staged_alias_check}"
+  rm -f "${staged_alias_check}"
+}
+
+make_archive_from_symlink() {
+  symlink_source=$1
+  symlink_remote=$2
+  symlink_directory=$(CDPATH='' cd "$(dirname "${symlink_source}")" && pwd) ||
+    die "symlink parent does not exist: ${symlink_source}"
+  symlink_name=$(basename "${symlink_source}")
+  symlink_local_path=${symlink_name}
+  symlink_checkout_manifest=$(manifest_find "${symlink_directory}" 2>/dev/null || true)
+  if [ -n "${symlink_checkout_manifest}" ]; then
+    symlink_checkout=$(dirname "${symlink_checkout_manifest}")
+    case "${symlink_directory}/${symlink_name}" in
+      "${symlink_checkout}"/*)
+        symlink_local_path=${symlink_directory}/${symlink_name}
+        symlink_local_path=${symlink_local_path#"${symlink_checkout}"/}
+        ;;
+    esac
+  fi
+  symlink_value=$(readlink "${symlink_source}") ||
+    die "could not read symlink: ${symlink_source}"
+  canonical_alias_target "${symlink_local_path}" "${symlink_value}" >/dev/null ||
+    die "unsafe symlink target: ${symlink_source} -> ${symlink_value}"
+  canonical_alias_target "${symlink_remote}" "${symlink_value}" >/dev/null ||
+    die "symlink target escapes remote root: ${symlink_remote} -> ${symlink_value}"
+  STAGE_ROOT=$(mktemp -d) || exit 1
+  mkdir -p "${STAGE_ROOT}/$(dirname "./${symlink_remote}")"
+  safe_symlink "${symlink_value}" "${STAGE_ROOT}/${symlink_remote}"
+  ARCHIVE_FILE=$(mktemp) || exit 1
+  tar -czf "${ARCHIVE_FILE}" -C "${STAGE_ROOT}" -- .
+  rm -rf "${STAGE_ROOT}"
+  STAGE_ROOT=
 }
 
 make_archive_from_directory() {
   source=$1
   stage_upload_directory "${source}"
   ARCHIVE_FILE=$(mktemp) || exit 1
-  tar -czf "${ARCHIVE_FILE}" -C "${STAGE_ROOT}" .
+  tar -czf "${ARCHIVE_FILE}" -C "${STAGE_ROOT}" -- .
   rm -rf "${STAGE_ROOT}"
   STAGE_ROOT=
 }
@@ -1166,8 +1424,7 @@ put_file_request() {
     usage_error "invalid site name: ${site}"
   auth=$(mktemp) || exit 1
   auth_args_file "${auth}"
-  idempotency_key=$(random_key)
-  set -- -H "Idempotency-Key: ${idempotency_key}"
+  set --
   while IFS= read -r arg; do set -- "$@" "${arg}"; done < "${auth}"
   rm -f "${auth}"
   [ -z "${conditional}" ] || set -- "$@" -H "If-Match: ${conditional}"
@@ -1179,29 +1436,22 @@ put_file_request() {
       claim_manifest=${source}/symbol.toml
     fi
   fi
-  claim=
-  claim_generated=0
-  if [ -n "${claim_manifest}" ] && manifest_value claim "${claim_manifest}" >/dev/null 2>&1; then
-    claim=$(claim_from_manifest "${claim_manifest}")
-  fi
-  if [ -z "${claim}" ]; then
-    claim="sym_claim_$(random_key)$(random_key)"
-    claim_generated=1
-    [ -z "${claim_manifest}" ] || write_secret_sidecar claim "${claim}" "${claim_manifest}"
-  fi
-  PENDING_CLAIM_DIR=
-  persist_pending_claim "${idempotency_key}" "${claim}"
-  set -- "$@" -H "Creator-Claim: ${claim}"
-  if [ "${managed}" -eq 1 ]; then
-    set -- "$@" -H 'Management-Action: claim'
-  fi
   request_unpack=${unpack}
-  if [ "${generated}" -eq 1 ] && [ -n "${remote}" ]; then
+  expected_alias_target=
+  if [ -L "${source}" ]; then
+    [ -n "${remote}" ] || remote=$(basename "./${source}")
+    expected_alias_target=$(readlink "${source}")
+    make_archive_from_symlink "${source}" "${remote}"
+    source=${ARCHIVE_FILE}
+    ctype=application/gzip
+    request_unpack=1
+    set -- "$@" -H 'Content-Type: application/gzip' -H 'Unpack: 1'
+  elif [ "${generated}" -eq 1 ] && [ -n "${remote}" ]; then
     upload_stage=$(mktemp -d) || exit 1
-    mkdir -p "${upload_stage}/$(dirname "${remote}")"
-    cp "${source}" "${upload_stage}/${remote}"
+    mkdir -p "${upload_stage}/$(dirname "./${remote}")"
+    cp -P "${source}" "${upload_stage}/${remote}"
     ARCHIVE_FILE=$(mktemp) || exit 1
-    tar -czf "${ARCHIVE_FILE}" -C "${upload_stage}" .
+    tar -czf "${ARCHIVE_FILE}" -C "${upload_stage}" -- .
     rm -rf "${upload_stage}"
     source=${ARCHIVE_FILE}
     ctype=application/gzip
@@ -1217,7 +1467,7 @@ put_file_request() {
     [ -f "${source}" ] || die "not a file or directory: ${source}"
     if [ -n "${remote}" ]; then
       ctype=$(content_type "${remote}")
-      set -- "$@" -H "Content-Disposition: attachment; filename=\"$(basename "${remote}")\""
+      set -- "$@" -H "Content-Disposition: attachment; filename=\"$(basename "./${remote}")\""
     else
       ctype=$(content_type "${source}")
     fi
@@ -1231,6 +1481,85 @@ put_file_request() {
     url="${base}/${site}/${encoded}"
   else
     url="${base}/${site}"
+  fi
+  if [ "${generated}" -eq 0 ] && [ -n "${remote}" ]; then
+    file_put_failed=0
+    if ! http_request PUT "${url}" "$@" -T "${source}"; then
+      if [ -z "${HTTP_STATUS:-}" ] || [ "${HTTP_STATUS}" = 000 ]; then
+        verified=0
+        verify_file=$(mktemp) || exit 1
+        if [ "${request_unpack}" -eq 0 ] &&
+          curl -fsS "${url}" -o "${verify_file}" &&
+          cmp -s "${source}" "${verify_file}"; then
+          verified=1
+        elif [ -n "${expected_alias_target}" ]; then
+          verify_manifest=$(mktemp) || exit 1
+          if curl -fsS "${base}/${site}/symbol.toml" -o "${verify_manifest}" &&
+            manifest_aliases "${verify_manifest}" |
+              awk -F '	' -v path="${remote}" -v target="${expected_alias_target}" '
+                $1 == path && $2 == target { found=1 }
+                END { exit !found }
+              '; then
+            verified=1
+          fi
+          rm -f "${verify_manifest}"
+        fi
+        rm -f "${verify_file}"
+        if [ "${verified}" -eq 1 ]; then
+          printf 'verified committed update %s after response loss\n' "${url}"
+          printf 'warning: response and any one-time creator claim were lost; no undo token is available\n' >&2
+          local_manifest=$(matching_manifest "${base}" "${site}" 2>/dev/null || true)
+          [ -z "${local_manifest}" ] ||
+            refresh_local_manifest "${local_manifest}" "${base}" "${site}"
+        else
+          printf 'error: response lost after file PUT; not retried because this endpoint does not support Idempotency-Key\n' >&2
+          printf 'verify the remote file before retrying: %s\n' "${url}" >&2
+          file_put_failed=1
+        fi
+      else
+        file_put_failed=1
+      fi
+    else
+      if awk 'index($0, "changed: false") { found=1 } END { exit !found }' "${HTTP_BODY}"; then
+        printf 'already up to date %s/%s/\n' "${base}" "${site}"
+      elif [ "${HTTP_STATUS}" = 201 ]; then
+        printf 'created %s/%s/\n' "${base}" "${site}"
+      elif [ "${HTTP_STATUS}" = 200 ]; then
+        printf 'updated %s/%s/\n' "${base}" "${site}"
+      fi
+      print_mutation_result "${site}" 1
+      save_response_secrets "${base}" "${site}"
+      local_manifest=$(matching_manifest "${base}" "${site}" 2>/dev/null || true)
+      response_claim=$(header_value Creator-Claim)
+      if [ "${HTTP_STATUS}" = 201 ] && [ -n "${response_claim}" ] &&
+        [ -z "${local_manifest}" ]; then
+        save_claim_recovery "${site}" "${response_claim}"
+      fi
+      [ -z "${local_manifest}" ] ||
+        refresh_local_manifest "${local_manifest}" "${base}" "${site}"
+    fi
+    [ -z "${ARCHIVE_FILE:-}" ] || rm -f "${ARCHIVE_FILE}"
+    ARCHIVE_FILE=
+    [ "${file_put_failed}" -eq 0 ]
+    return
+  fi
+  idempotency_key=$(random_key)
+  set -- "$@" -H "Idempotency-Key: ${idempotency_key}"
+  claim=
+  claim_generated=0
+  if [ -n "${claim_manifest}" ] && manifest_value claim "${claim_manifest}" >/dev/null 2>&1; then
+    claim=$(claim_from_manifest "${claim_manifest}")
+  fi
+  if [ -z "${claim}" ]; then
+    claim="sym_claim_$(random_key)$(random_key)"
+    claim_generated=1
+    [ -z "${claim_manifest}" ] || write_secret_sidecar claim "${claim}" "${claim_manifest}"
+  fi
+  PENDING_CLAIM_DIR=
+  persist_pending_claim "${idempotency_key}" "${claim}"
+  set -- "$@" -H "Creator-Claim: ${claim}"
+  if [ "${managed}" -eq 1 ]; then
+    set -- "$@" -H 'Management-Action: claim'
   fi
   persist_pending_request PUT "${base}" "${remote}" "${site}" "${managed}" \
     "${source}" "${ctype}" "${request_unpack}" "${url}"
@@ -1430,6 +1759,179 @@ copy_or_move_request() {
   fi
 }
 
+checkout_path_safe() (
+  checkout_path=$1
+  [ -n "${checkout_path}" ] || exit 1
+  case "${checkout_path}" in
+    /*|*\\*) exit 1 ;;
+  esac
+  case "/${checkout_path}/" in
+    */../*|*/./*|*'//'*) exit 1 ;;
+  esac
+  printf '%s\n' "${checkout_path}" |
+    awk '/[[:cntrl:]]/ { exit 1 }'
+)
+
+validate_manifest_alias_map() (
+  checkout_aliases=$1
+  while IFS='	' read -r checkout_alias_path checkout_alias_target; do
+    [ -n "${checkout_alias_path}" ] || continue
+    checkout_path_safe "${checkout_alias_path}" || exit 1
+    checkout_relative=$(relative_alias_target \
+      "${checkout_alias_path}" "${checkout_alias_target}") || exit 1
+    checkout_canonical=$(canonical_alias_target \
+      "${checkout_alias_path}" "${checkout_relative}") || exit 1
+    [ "${checkout_canonical}" = "${checkout_alias_target}" ] || exit 1
+  done < "${checkout_aliases}"
+  validate_alias_map "${checkout_aliases}"
+)
+
+resolved_alias_map() (
+  checkout_aliases=$1
+  awk -F '\t' '
+    function beneath(path, parent) {
+      return index(path, parent "/") == 1
+    }
+    function substitution(path, best, candidate) {
+      best = ""
+      for (candidate in target) {
+        if ((path == candidate || beneath(path, candidate)) &&
+            length(candidate) > length(best)) best = candidate
+      }
+      matched = best
+      return best == "" ? "" : target[best] substr(path, length(best) + 1)
+    }
+    { target[$1] = $2 }
+    END {
+      for (path in target) {
+        current = target[path]
+        for (hop = 0; hop <= NR; hop++) {
+          resolved = substitution(current)
+          if (matched == "") break
+          current = resolved
+        }
+        print path "\t" current
+      }
+    }
+  ' "${checkout_aliases}" | LC_ALL=C sort
+)
+
+create_checkout_symlinks() {
+  checkout_root=$1
+  checkout_aliases=$2
+  while IFS='	' read -r checkout_alias_path checkout_alias_target; do
+    [ -n "${checkout_alias_path}" ] || continue
+    mkdir -p "${checkout_root}/$(dirname "./${checkout_alias_path}")"
+    checkout_relative=$(relative_alias_target \
+      "${checkout_alias_path}" "${checkout_alias_target}")
+    safe_symlink "${checkout_relative}" \
+      "${checkout_root}/${checkout_alias_path}"
+  done < "${checkout_aliases}"
+}
+
+materialize_checkout_aliases() {
+  checkout_root=$1
+  checkout_aliases=$2
+  checkout_resolved=$(mktemp) || exit 1
+  resolved_alias_map "${checkout_aliases}" > "${checkout_resolved}"
+  while IFS='	' read -r checkout_alias_path checkout_alias_target; do
+    [ -n "${checkout_alias_path}" ] || continue
+    checkout_source=${checkout_root}/${checkout_alias_target}
+    checkout_destination=${checkout_root}/${checkout_alias_path}
+    if [ -f "${checkout_source}" ] && [ ! -L "${checkout_source}" ]; then
+      mkdir -p "$(dirname "${checkout_destination}")"
+      cp -P "${checkout_source}" "${checkout_destination}"
+    fi
+  done < "${checkout_resolved}"
+  checkout_passes=$(awk 'END { print NR + 1 }' "${checkout_resolved}")
+  while [ "${checkout_passes}" -gt 0 ]; do
+    while IFS='	' read -r checkout_alias_path checkout_alias_target; do
+      [ -n "${checkout_alias_path}" ] || continue
+      checkout_source=${checkout_root}/${checkout_alias_target}
+      checkout_destination=${checkout_root}/${checkout_alias_path}
+      if [ -d "${checkout_source}" ] && [ ! -L "${checkout_source}" ]; then
+        rm -rf "${checkout_destination}"
+        mkdir -p "${checkout_destination}"
+        cp -RP "${checkout_source}/." "${checkout_destination}/"
+      fi
+    done < "${checkout_resolved}"
+    checkout_passes=$((checkout_passes - 1))
+  done
+  rm -f "${checkout_resolved}"
+}
+
+extract_clone_archive() {
+  clone_archive=$1
+  clone_extract=$2
+  clone_work=$3
+  clone_manifest=${clone_work}/symbol.toml
+  clone_members=${clone_work}/members
+  clone_files=${clone_work}/files
+  clone_aliases=${clone_work}/aliases
+  if ! tar -tzf "${clone_archive}" > "${clone_members}"; then
+    return 1
+  fi
+  if ! awk '
+    {
+      path = $0
+      while (substr(path, 1, 2) == "./") path = substr(path, 3)
+      sub(/\/$/, "", path)
+      if (path == "") next
+      if (path ~ /^\// || path ~ /\\/ ||
+          ("/" path "/") ~ /\/\.\.?\// ||
+          path ~ /[[:cntrl:]]/) exit 1
+    }
+  ' "${clone_members}"; then
+    printf 'error: archive contains an unsafe path\n' >&2
+    return 1
+  fi
+  if ! tar -xzOf "${clone_archive}" -- symbol.toml > "${clone_manifest}"; then
+    printf 'error: archive has no readable symbol.toml\n' >&2
+    return 1
+  fi
+  manifest_files "${clone_manifest}" > "${clone_files}"
+  manifest_aliases "${clone_manifest}" > "${clone_aliases}"
+  validate_manifest_alias_map "${clone_aliases}" || {
+    printf 'error: archive contains an unsafe alias\n' >&2
+    return 1
+  }
+  mkdir "${clone_extract}"
+  while IFS='	' read -r clone_path _clone_hash; do
+    [ -n "${clone_path}" ] || continue
+    if ! checkout_path_safe "${clone_path}"; then
+      printf 'error: archive manifest contains an unsafe path\n' >&2
+      return 1
+    fi
+    clone_output=${clone_extract}/${clone_path}
+    mkdir -p "$(dirname "${clone_output}")"
+    clone_temporary=${clone_output}.symbol-tmp
+    if ! tar -xzOf "${clone_archive}" -- "${clone_path}" > "${clone_temporary}"; then
+      rm -f "${clone_temporary}"
+      printf 'error: archive member is missing: %s\n' "${clone_path}" >&2
+      return 1
+    fi
+    mv "${clone_temporary}" "${clone_output}"
+  done < "${clone_files}"
+  cp "${clone_manifest}" "${clone_extract}/symbol.toml"
+  case "${SYMBOL_FORCE_NO_SYMLINKS:-0}" in
+    0)
+      clone_probe=${clone_extract}/.symbol-symlink-probe
+      if safe_symlink probe-target "${clone_probe}" 2>/dev/null &&
+        [ -L "${clone_probe}" ]; then
+        rm -f "${clone_probe}"
+        create_checkout_symlinks "${clone_extract}" "${clone_aliases}"
+      else
+        rm -f "${clone_probe}"
+        materialize_checkout_aliases "${clone_extract}" "${clone_aliases}"
+      fi
+      ;;
+    1)
+      materialize_checkout_aliases "${clone_extract}" "${clone_aliases}"
+      ;;
+    *) usage_error "SYMBOL_FORCE_NO_SYMLINKS must be 0 or 1" ;;
+  esac
+}
+
 clone_site() {
   name=$1
   destination=${2:-${name}}
@@ -1439,21 +1941,23 @@ clone_site() {
     [ -d "${destination}" ] && [ -z "$(ls -A "${destination}")" ] ||
       die "clone destination exists and is not empty: ${destination}"
   fi
-  work=$(mktemp -d) || exit 1
+  destination_parent=$(dirname "${destination}")
+  [ -d "${destination_parent}" ] ||
+    die "clone destination parent does not exist: ${destination_parent}"
+  work=$(mktemp -d "${destination_parent}/.symbol-clone.XXXXXX") || exit 1
   archive=${work}/site.tar.gz
   extract=${work}/extract
-  mkdir "${extract}"
   if ! archive_transfer GET "${HOST}" "${name}" "${archive}"; then
     rm -rf "${work}"
     return 1
   fi
-  if ! tar -xzf "${archive}" -C "${extract}"; then
+  if ! extract_clone_archive "${archive}" "${extract}" "${work}"; then
     rm -rf "${work}"
     printf 'error: could not extract archive\n' >&2
     return 1
   fi
   if [ -e "${destination}" ]; then
-    cp -R "${extract}"/. "${destination}"/
+    cp -RP "${extract}"/. "${destination}"/
   else
     mv "${extract}" "${destination}"
   fi
@@ -1862,56 +2366,129 @@ manifest_files() {
   ' "$1"
 }
 
-blake3_file() {
-  if command -v b3sum >/dev/null 2>&1; then
-    b3sum "$1" | awk '{print "blake3:" $1}'
-  elif command -v blake3 >/dev/null 2>&1; then
-    blake3 "$1" | awk '{print "blake3:" $1}'
-  else
-    die "sync requires b3sum (or blake3)"
-  fi
+manifest_aliases() {
+  awk '
+    /^[[:space:]]*\[aliases\][[:space:]]*$/ { in_aliases=1; next }
+    /^[[:space:]]*\[/ { in_aliases=0 }
+    in_aliases {
+      line=$0
+      eq=index(line, "=")
+      if (!eq) next
+      path=substr(line, 1, eq-1)
+      target=substr(line, eq+1)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", path)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", target)
+      if (path ~ /^".*"$/ && target ~ /^".*"$/) {
+        path=substr(path,2,length(path)-2)
+        target=substr(target,2,length(target)-2)
+        print path "\t" target
+      }
+    }
+  ' "$1"
 }
 
-local_file_map() {
-  root=$1
-  baseline=$2
-  base=$3
-  site=$4
-  if command -v b3sum >/dev/null 2>&1; then
-    hash_mode=b3sum
-  elif command -v blake3 >/dev/null 2>&1; then
-    hash_mode=blake3
-  else
-    hash_mode=remote
-  fi
+baseline_entry_map() {
+  baseline_manifest=$1
+  manifest_files "${baseline_manifest}" |
+    awk -F '\t' '{ print $1 "\tF\t" $2 }'
+  manifest_aliases "${baseline_manifest}" |
+    awk -F '\t' '{ print $1 "\tA\t" $2 }'
+}
+
+filtered_local_files() (
+  filtered_root=$1
+  filtered_aliases=$2
+  filtered_candidates=$(mktemp) || exit 1
+  trap 'rm -f "${filtered_candidates}"' EXIT HUP INT TERM
   (
-    cd "${root}"
+    cd "${filtered_root}"
     find . -type f ! -path './.git/*' ! -name symbol.toml \
       ! -name .symbol-token ! -name .symbol-claim -print | LC_ALL=C sort
-  ) | while IFS= read -r path; do
-    relative=${path#./}
-    if [ "${hash_mode}" = remote ]; then
-      hash=$(awk -F '\t' -v wanted="${relative}" '$1 == wanted { print $2; exit }' "${baseline}")
-      if [ -z "${hash}" ]; then
-        hash="new:${relative}"
-      else
-        remote=$(mktemp) || exit 1
-        encoded=$(urlencode_path "${relative}")
-        curl -fsS "${base}/${site}/${encoded}" -o "${remote}" ||
-          die "could not compare local file with upstream: ${relative}"
-        if ! cmp -s "${root}/${relative}" "${remote}"; then
-          hash="changed:${relative}"
-        fi
-        rm -f "${remote}"
-      fi
-    else
-      hash=$(blake3_file "${root}/${relative}")
-    fi
-    printf '%s\t%s\n' "${relative}" "${hash}"
-  done
-}
+  ) | while IFS= read -r filtered_path; do
+    printf '%s\n' "${filtered_path#./}"
+  done > "${filtered_candidates}"
+  awk -F '\t' '
+    FILENAME == ARGV[1] { aliases[$1] = 1; next }
+    {
+      for (alias in aliases)
+        if ($0 == alias || index($0, alias "/") == 1) next
+      print
+    }
+  ' "${filtered_aliases}" "${filtered_candidates}"
+)
 
-upstream_file_map() {
+local_file_map_b3sum() (
+  local_root=$1
+  local_aliases=$2
+  filtered_local_files "${local_root}" "${local_aliases}" |
+  while IFS= read -r local_relative; do
+    local_hash=$(b3sum "${local_root}/${local_relative}" |
+      awk '{print "blake3:" $1}')
+    printf '%s\tF\t%s\n' "${local_relative}" "${local_hash}"
+  done
+)
+
+local_file_map_blake3() (
+  local_root=$1
+  local_aliases=$2
+  filtered_local_files "${local_root}" "${local_aliases}" |
+  while IFS= read -r local_relative; do
+    local_hash=$(blake3 "${local_root}/${local_relative}" |
+      awk '{print "blake3:" $1}')
+    printf '%s\tF\t%s\n' "${local_relative}" "${local_hash}"
+  done
+)
+
+local_file_map_remote() (
+  local_root=$1
+  local_aliases=$2
+  local_baseline=$3
+  local_base=$4
+  local_site=$5
+  filtered_local_files "${local_root}" "${local_aliases}" |
+  while IFS= read -r local_relative; do
+    local_hash=$(awk -F '\t' -v wanted="${local_relative}" \
+      '$1 == wanted && $2 == "F" { print $3; exit }' "${local_baseline}")
+    if [ -z "${local_hash}" ]; then
+      local_hash="new:${local_relative}"
+    else
+      local_remote=$(mktemp) || exit 1
+      local_encoded=$(urlencode_path "${local_relative}")
+      curl -fsS "${local_base}/${local_site}/${local_encoded}" \
+        -o "${local_remote}" ||
+        die "could not compare local file with upstream: ${local_relative}"
+      if ! cmp -s "${local_root}/${local_relative}" "${local_remote}"; then
+        local_hash="changed:${local_relative}"
+      fi
+      rm -f "${local_remote}"
+    fi
+    printf '%s\tF\t%s\n' "${local_relative}" "${local_hash}"
+  done
+)
+
+local_entry_map() (
+  local_root=$1
+  local_manifest=$2
+  local_baseline=$3
+  local_base=$4
+  local_site=$5
+  local_aliases=$(mktemp) || exit 1
+  local_files=$(mktemp) || exit 1
+  trap 'rm -f "${local_aliases}" "${local_files}"' EXIT HUP INT TERM
+  local_alias_map "${local_root}" "${local_manifest}" > "${local_aliases}"
+  if command -v b3sum >/dev/null 2>&1; then
+    local_file_map_b3sum "${local_root}" "${local_aliases}" > "${local_files}"
+  elif command -v blake3 >/dev/null 2>&1; then
+    local_file_map_blake3 "${local_root}" "${local_aliases}" > "${local_files}"
+  else
+    local_file_map_remote "${local_root}" "${local_aliases}" \
+      "${local_baseline}" "${local_base}" "${local_site}" > "${local_files}"
+  fi
+  cat "${local_files}"
+  awk -F '\t' '{ print $1 "\tA\t" $2 }' "${local_aliases}"
+)
+
+upstream_entry_map() {
   awk '
     {
       text=text $0
@@ -1926,11 +2503,140 @@ upstream_file_map() {
         hash=object
         sub(/^.*"hash"[[:space:]]*:[[:space:]]*"/,"",hash)
         sub(/".*$/,"",hash)
-        if (path != "symbol.toml") print path "\t" hash
+        if (path != "symbol.toml") print path "\tF\t" hash
+        rest=substr(rest,RSTART+RLENGTH)
+      }
+      rest=text
+      while (match(rest, /\{"path"[[:space:]]*:[[:space:]]*"[^"]*"[^}]*"target"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        object=substr(rest,RSTART,RLENGTH)
+        path=object
+        sub(/^.*"path"[[:space:]]*:[[:space:]]*"/,"",path)
+        sub(/".*$/,"",path)
+        target=object
+        sub(/^.*"target"[[:space:]]*:[[:space:]]*"/,"",target)
+        sub(/".*$/,"",target)
+        print path "\tA\t" target
+        rest=substr(rest,RSTART+RLENGTH)
+      }
+      rest=text
+      while (match(rest, /\{"path"[[:space:]]*:[[:space:]]*"[^"]*"[^}]*"canonical_target"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
+        object=substr(rest,RSTART,RLENGTH)
+        path=object
+        sub(/^.*"path"[[:space:]]*:[[:space:]]*"/,"",path)
+        sub(/".*$/,"",path)
+        target=object
+        sub(/^.*"canonical_target"[[:space:]]*:[[:space:]]*"/,"",target)
+        sub(/".*$/,"",target)
+        print path "\tA\t" target
         rest=substr(rest,RSTART+RLENGTH)
       }
     }
   ' "$1" | LC_ALL=C sort
+}
+
+json_quote() (
+  LC_ALL=C
+  export LC_ALL
+  awk '
+    {
+      value = $0
+      gsub(/\\/, "\\\\", value)
+      gsub(/"/, "\\\"", value)
+      printf "\"%s\"", value
+    }
+  '
+)
+
+put_alias_request() {
+  alias_site=$1
+  shift
+  is_site_name "${alias_site}" ||
+    usage_error "invalid site name: ${alias_site}"
+  [ "$#" -ge 2 ] && [ $(( $# % 2 )) -eq 0 ] ||
+    usage_error "usage: symbol alias SITE PATH TARGET [PATH TARGET ...]"
+  alias_work=$(mktemp -d) || exit 1
+  alias_specs=${alias_work}/specs
+  alias_graph=${alias_work}/graph
+  : > "${alias_specs}"
+  : > "${alias_graph}"
+  alias_count=0
+  while [ "$#" -gt 0 ]; do
+    alias_path=$1
+    alias_target=$2
+    shift 2
+    validate_remote_path "${alias_path}"
+    alias_canonical=$(canonical_alias_target "${alias_path}" "${alias_target}") ||
+      usage_error "invalid alias target: ${alias_path} -> ${alias_target}"
+    printf '%s\t%s\n' "${alias_path}" "${alias_target}" >> "${alias_specs}"
+    printf '%s\t%s\n' "${alias_path}" "${alias_canonical}" >> "${alias_graph}"
+    alias_count=$((alias_count + 1))
+  done
+  validate_alias_map "${alias_graph}" ||
+    usage_error "alias batch contains a cycle or write through alias"
+  alias_manifest=$(matching_manifest "${HOST}" "${alias_site}" 2>/dev/null || true)
+  alias_conditional=
+  if [ -n "${alias_manifest}" ]; then
+    alias_conditional=$(manifest_value tree_hash "${alias_manifest}" 2>/dev/null || true)
+  fi
+  alias_idempotency=$(random_key)
+  alias_auth=$(mktemp) || exit 1
+  auth_args_file "${alias_auth}"
+  set -- -H "Idempotency-Key: ${alias_idempotency}"
+  [ -z "${alias_conditional}" ] ||
+    set -- "$@" -H "If-Match: ${alias_conditional}"
+  while IFS= read -r alias_arg; do set -- "$@" "${alias_arg}"; done < "${alias_auth}"
+  rm -f "${alias_auth}"
+  if [ "${alias_count}" -eq 1 ]; then
+    IFS='	' read -r alias_path alias_target < "${alias_specs}"
+    alias_encoded=$(urlencode_path "${alias_path}")
+    alias_url=${HOST}/${alias_site}/${alias_encoded}
+    set -- "$@" -H "Alias-Target: ${alias_target}"
+    alias_attempt() {
+      http_request ALIAS "${alias_url}" "$@"
+    }
+  else
+    alias_body=${alias_work}/aliases.json
+    {
+      printf '{"aliases":['
+      alias_separator=
+      while IFS='	' read -r alias_path alias_target; do
+        printf '%s{"path":%s,"target":%s}' "${alias_separator}" \
+          "$(printf '%s\n' "${alias_path}" | json_quote)" \
+          "$(printf '%s\n' "${alias_target}" | json_quote)"
+        alias_separator=,
+      done < "${alias_specs}"
+      printf ']}\n'
+    } > "${alias_body}"
+    alias_url=${HOST}/${alias_site}/
+    set -- "$@" -H 'Content-Type: application/json'
+    alias_attempt() {
+      http_request ALIAS "${alias_url}" "$@" \
+        --data-binary "@${alias_body}"
+    }
+  fi
+  alias_failed=0
+  if ! alias_attempt "$@"; then
+    if [ -z "${HTTP_STATUS:-}" ] || [ "${HTTP_STATUS}" = 000 ]; then
+      alias_attempt "$@" || alias_failed=1
+    else
+      alias_failed=1
+    fi
+  fi
+  if [ "${alias_failed}" -eq 1 ]; then
+    rm -rf "${alias_work}"
+    return 1
+  fi
+  print_mutation_result "${alias_site}" 1
+  if [ "${alias_count}" -eq 1 ]; then
+    printf 'aliased %s/%s/%s -> %s\n' \
+      "${HOST}" "${alias_site}" "${alias_path}" "${alias_target}"
+  else
+    printf 'aliased %s paths atomically in %s/%s/\n' \
+      "${alias_count}" "${HOST}" "${alias_site}"
+  fi
+  rm -rf "${alias_work}"
+  [ -z "${alias_manifest}" ] ||
+    refresh_local_manifest "${alias_manifest}" "${HOST}" "${alias_site}"
 }
 
 sync_project() {
@@ -1945,30 +2651,51 @@ sync_project() {
   localmap=${work}/local
   upstream=${work}/upstream
   changed=${work}/changed
-  manifest_files "${MANIFEST}" | LC_ALL=C sort > "${baseline}"
-  local_file_map "${MANIFEST_DIR}" "${baseline}" "${MANIFEST_HOST}" "${MANIFEST_NAME}" > "${localmap}"
+  baseline_entry_map "${MANIFEST}" | LC_ALL=C sort > "${baseline}"
+  local_entry_map "${MANIFEST_DIR}" "${MANIFEST}" "${baseline}" \
+    "${MANIFEST_HOST}" "${MANIFEST_NAME}" | LC_ALL=C sort > "${localmap}"
   if ! http_request GET "${MANIFEST_HOST}/${MANIFEST_NAME}/FILES" -H 'Accept: application/json'; then
     rm -rf "${work}"
     return 1
   fi
   upstream_tree=$(json_string tree_hash < "${HTTP_BODY}")
   upstream_revision=$(json_string content_revision < "${HTTP_BODY}")
-  upstream_file_map "${HTTP_BODY}" > "${upstream}"
+  upstream_entry_map "${HTTP_BODY}" > "${upstream}"
   if [ "${upstream_tree}" != "${baseline_tree}" ] || ! cmp -s "${baseline}" "${upstream}"; then
     printf 'error: upstream changed since this checkout\n\n' >&2
     printf 'checkout base: revision %s  %s\n' "${baseline_revision}" "${baseline_tree}" >&2
     printf 'upstream now:  revision %s  %s\n' "${upstream_revision}" "${upstream_tree}" >&2
     printf '\nlocal changes:\n' >&2
     awk -F '\t' '
-      NR==FNR { base[$1]=$2; next }
-      { local[$1]=$2; if (!($1 in base)) print "  + " $1; else if (base[$1] != $2) print "  M " $1 }
-      END { for (path in base) if (!(path in local)) print "  - " path }
+      function label(path, kind, value) {
+        return kind == "A" ? path " -> " value : path
+      }
+      NR==FNR { base[$1]=$2 "\t" $3; base_kind[$1]=$2; base_value[$1]=$3; next }
+      {
+        local[$1]=$2 "\t" $3
+        if (!($1 in base)) print "  + " label($1,$2,$3)
+        else if (base[$1] != local[$1]) print "  M " label($1,$2,$3)
+      }
+      END {
+        for (path in base) if (!(path in local))
+          print "  - " label(path,base_kind[path],base_value[path])
+      }
     ' "${baseline}" "${localmap}" | LC_ALL=C sort -k2,2 >&2
     printf '\nupstream changes:\n' >&2
     awk -F '\t' '
-      NR==FNR { base[$1]=$2; next }
-      { remote[$1]=$2; if (!($1 in base)) print "  + " $1; else if (base[$1] != $2) print "  M " $1 }
-      END { for (path in base) if (!(path in remote)) print "  - " path }
+      function label(path, kind, value) {
+        return kind == "A" ? path " -> " value : path
+      }
+      NR==FNR { base[$1]=$2 "\t" $3; base_kind[$1]=$2; base_value[$1]=$3; next }
+      {
+        remote[$1]=$2 "\t" $3
+        if (!($1 in base)) print "  + " label($1,$2,$3)
+        else if (base[$1] != remote[$1]) print "  M " label($1,$2,$3)
+      }
+      END {
+        for (path in base) if (!(path in remote))
+          print "  - " label(path,base_kind[path],base_value[path])
+      }
     ' "${baseline}" "${upstream}" | LC_ALL=C sort -k2,2 >&2
     printf 'refusing to modify %s/%s/\n' "${MANIFEST_HOST}" "${MANIFEST_NAME}" >&2
     printf 'resolve manually with:\n' >&2
@@ -1979,24 +2706,45 @@ sync_project() {
     return 1
   fi
   awk -F '\t' '
-    NR==FNR { base[$1]=$2; next }
-    { local[$1]=$2; if (!($1 in base)) print "+\t" $1; else if (base[$1] != $2) print "M\t" $1 }
-    END { for (path in base) if (!(path in local)) print "-\t" path }
+    NR==FNR {
+      base[$1]=$2 "\t" $3
+      base_kind[$1]=$2
+      base_value[$1]=$3
+      next
+    }
+    {
+      local[$1]=$2 "\t" $3
+      if (!($1 in base)) print "+\t" $1 "\t" $2 "\t" $3
+      else if (base[$1] != local[$1]) print "M\t" $1 "\t" $2 "\t" $3
+    }
+    END {
+      for (path in base) if (!(path in local))
+        print "-\t" path "\t" base_kind[path] "\t" base_value[path]
+    }
   ' "${baseline}" "${localmap}" | LC_ALL=C sort -k2,2 > "${changed}"
   printf 'upstream: unchanged @ revision %s\n\n' "${upstream_revision}"
   additions=$(awk -F '\t' '$1=="+" || $1=="M" {n++} END {print n+0}' "${changed}")
   added=$(awk -F '\t' '$1=="+" {n++} END {print n+0}' "${changed}")
   modified=$(awk -F '\t' '$1=="M" {n++} END {print n+0}' "${changed}")
+  alias_changes=$(awk -F '\t' \
+    '($1=="+" || $1=="M") && $3=="A" {n++} END {print n+0}' "${changed}")
   if [ "${additions}" -gt 0 ]; then
     [ "${check}" -eq 0 ] && printf 'local changes:\n' || printf 'would sync:\n'
-    awk -F '\t' '$1=="+" || $1=="M" {printf "  %s %s\n",$1,$2}' "${changed}"
+    awk -F '\t' '
+      $1=="+" || $1=="M" {
+        printf "  %s %s%s\n",$1,$2,($3=="A" ? " -> " $4 : "")
+      }
+    ' "${changed}"
   fi
   deletions=$(awk -F '\t' '$1=="-" {n++} END {print n+0}' "${changed}")
   if [ "${deletions}" -gt 0 ]; then
     printf '\n'
     [ "${check}" -eq 0 ] && printf 'local deletions ignored:\n' || printf 'would ignore local deletion:\n'
     awk -F '\t' -v name="${MANIFEST_NAME}" \
-      '$1=="-" {printf "  - %s  (use: symbol rm %s %s)\n",$2,name,$2}' "${changed}"
+      '$1=="-" {
+        printf "  - %s%s  (use: symbol rm %s %s)\n",
+          $2,($3=="A" ? " -> " $4 : ""),name,$2
+      }' "${changed}"
   fi
   if [ "${check}" -eq 1 ]; then
     printf '\nno changes made\n'
@@ -2010,44 +2758,117 @@ sync_project() {
   fi
   stage=${work}/stage
   mkdir "${stage}"
-  awk -F '\t' '$1=="+" || $1=="M" {print $2}' "${changed}" |
+  awk -F '\t' '($1=="+" || $1=="M") && $3=="F" {print $2}' "${changed}" |
   while IFS= read -r path; do
-    mkdir -p "${stage}/$(dirname "${path}")"
-    cp "${MANIFEST_DIR}/${path}" "${stage}/${path}"
+    mkdir -p "${stage}/$(dirname "./${path}")"
+    cp -P "${MANIFEST_DIR}/${path}" "${stage}/${path}"
   done
+  awk -F '\t' '($1=="+" || $1=="M") && $3=="A" {print $2 "\t" $4}' \
+    "${changed}" |
+  while IFS='	' read -r path target; do
+    mkdir -p "${stage}/$(dirname "./${path}")"
+    relative_target=$(relative_alias_target "${path}" "${target}")
+    safe_symlink "${relative_target}" "${stage}/${path}"
+  done
+  sync_single_root=$(awk -F '\t' '
+    ($1=="+" || $1=="M") && $3=="F" {
+      slash=index($2,"/")
+      if (!slash) safe=1
+      else roots[substr($2,1,slash-1)]=1
+    }
+    END {
+      for (root in roots) { count++; only=root }
+      if (!safe && count==1) print only
+    }
+  ' "${changed}")
+  if [ -n "${sync_single_root}" ]; then
+    printf '# partial sync root anchor\n' > "${stage}/symbol.toml"
+  fi
   archive=${work}/changed.tar.gz
-  tar -czf "${archive}" -C "${stage}" .
-  printf '\nsyncing %s files (%s added, %s modified)...\n' \
-    "${additions}" "${added}" "${modified}"
+  tar -czf "${archive}" -C "${stage}" -- .
+  printf '\nsyncing %s entries (%s added, %s modified, %s aliases)...\n' \
+    "${additions}" "${added}" "${modified}" "${alias_changes}"
   auth=$(mktemp) || exit 1
   auth_args_file "${auth}"
   set -- -H 'Content-Type: application/gzip' -H 'Unpack: 1' \
     -H "If-Match: ${baseline_tree}" -H "Idempotency-Key: $(random_key)"
   while IFS= read -r arg; do set -- "$@" "${arg}"; done < "${auth}"
   rm -f "${auth}"
+  sync_failed=0
+  sync_response_lost=0
+  sync_verified=0
+  sync_retry_error=${work}/retry-error
   if ! http_request PUT "${MANIFEST_HOST}/${MANIFEST_NAME}" "$@" -T "${archive}"; then
-    if [ "${HTTP_STATUS}" = 412 ]; then
+    if [ -z "${HTTP_STATUS:-}" ] || [ "${HTTP_STATUS}" = 000 ]; then
+      sync_response_lost=1
+      http_request PUT "${MANIFEST_HOST}/${MANIFEST_NAME}" "$@" \
+        -T "${archive}" 2>"${sync_retry_error}" || sync_failed=1
+    else
+      sync_failed=1
+    fi
+  fi
+  if [ "${sync_failed}" -eq 1 ] && [ "${sync_response_lost}" -eq 1 ] &&
+    [ "${HTTP_STATUS:-}" = 412 ]; then
+    recovered_upstream=${work}/recovered-upstream
+    if http_request GET "${MANIFEST_HOST}/${MANIFEST_NAME}/FILES" \
+      -H 'Accept: application/json'; then
+      upstream_entry_map "${HTTP_BODY}" | LC_ALL=C sort > "${recovered_upstream}"
+      sync_verify_failed=0
+      while IFS='	' read -r sync_action sync_path sync_kind sync_value; do
+        [ "${sync_action}" != "-" ] || continue
+        case "${sync_kind}" in
+          F)
+            sync_remote=$(mktemp) || exit 1
+            sync_encoded=$(urlencode_path "${sync_path}")
+            if ! curl -fsS \
+              "${MANIFEST_HOST}/${MANIFEST_NAME}/${sync_encoded}" \
+              -o "${sync_remote}"; then
+              printf 'error: could not verify synced path after response loss: %s\n' \
+                "${sync_path}" >&2
+              sync_verify_failed=1
+            elif ! cmp -s "${MANIFEST_DIR}/${sync_path}" "${sync_remote}"; then
+              printf 'error: synced path differs after response loss: %s\n' \
+                "${sync_path}" >&2
+              sync_verify_failed=1
+            fi
+            rm -f "${sync_remote}"
+            ;;
+          A)
+            if ! awk -F '	' -v path="${sync_path}" -v target="${sync_value}" '
+              $1 == path && $2 == "A" && $3 == target { found=1 }
+              END { exit !found }
+            ' "${recovered_upstream}"; then
+              sync_verify_failed=1
+            fi
+            ;;
+        esac
+      done < "${changed}"
+      if [ "${sync_verify_failed}" -eq 0 ]; then
+        sync_failed=0
+        sync_verified=1
+      else
+        printf 'error: changed entries after response loss do not match the checkout\n' >&2
+      fi
+    fi
+  fi
+  if [ "${sync_failed}" -eq 1 ]; then
+    [ ! -s "${sync_retry_error}" ] || cat "${sync_retry_error}" >&2
+    if [ "${HTTP_STATUS:-}" = 412 ]; then
       printf 'error: upstream changed during sync; nothing was written\n' >&2
     fi
     rm -rf "${work}"
     return 1
   fi
-  print_mutation_result "${MANIFEST_NAME}"
-  preserved=${work}/preserved
-  awk '/^[[:space:]]*(token|claim)[[:space:]]*=/{print}' "${MANIFEST}" > "${preserved}"
-  fresh=${work}/symbol.toml
-  curl -sS -f "${MANIFEST_HOST}/${MANIFEST_NAME}/symbol.toml" -o "${fresh}" ||
-    die "sync succeeded, but could not refresh local symbol.toml"
-  if [ -s "${preserved}" ]; then
-    merged=${work}/merged
-    awk 'BEGIN{done=0} /^[[:space:]]*\[/ && !done {while((getline l < p)>0) print l; done=1} {print}
-      END{if(!done) while((getline l < p)>0) print l}' p="${preserved}" "${fresh}" > "${merged}"
-    mv "${merged}" "${fresh}"
+  if [ "${sync_verified}" -eq 1 ]; then
+    printf 'warning: sync response was lost; remote tree verified, but no undo token is available\n' >&2
+  else
+    print_mutation_result "${MANIFEST_NAME}"
   fi
-  mv "${fresh}" "${MANIFEST}"
+  sync_work=${work}
+  refresh_local_manifest "${MANIFEST}" "${MANIFEST_HOST}" "${MANIFEST_NAME}"
   printf 'synced %s/%s/ (%s added, %s modified)\n' \
     "${MANIFEST_HOST}" "${MANIFEST_NAME}" "${added}" "${modified}"
-  rm -rf "${work}"
+  rm -rf "${sync_work}"
 }
 
 if [ "${cmd}" != recover ]; then
@@ -2157,10 +2978,12 @@ case "${cmd}" in
       [ -z "${forced}" ] || usage_error "-f requires piped input"
       site=$1; source=$2
       is_site_name "${site}" || usage_error "invalid site name: ${site}"
-      if [ -d "${source}" ] || [ "${unpack}" -eq 1 ]; then
+      if [ -L "${source}" ]; then
+        remote=$(basename "./${source}")
+      elif [ -d "${source}" ] || [ "${unpack}" -eq 1 ]; then
         remote=
       else
-        remote=$(basename "${source}")
+        remote=$(basename "./${source}")
         case "${source}" in *.html|*.htm) remote=index.html ;; esac
       fi
       put_file_request "${HOST}" "${site}" "${source}" "${remote}" "${unpack}" "${managed}"
@@ -2251,6 +3074,9 @@ case "${cmd}" in
   move)
     [ "$#" -eq 2 ] || usage_error "usage: symbol move SRC DST"
     copy_or_move_request MOVE "$1" "$2" 0
+    ;;
+  alias)
+    put_alias_request "$@"
     ;;
   sync)
     check=0

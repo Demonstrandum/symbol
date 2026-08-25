@@ -8,7 +8,7 @@ use symbol_contract::{Listing, ListingEntry, ListingKind};
 
 use crate::http_cache::{self, Representation};
 use crate::page;
-use crate::store::{DirList, EntryKind, SiteList};
+use crate::store::{AliasResolvedKind, DirList, EntryKind, SiteList};
 
 pub fn sites(headers: &HeaderMap, list: &SiteList) -> Response {
     if wants_json(headers) {
@@ -20,6 +20,9 @@ pub fn sites(headers: &HeaderMap, list: &SiteList) -> Response {
                 name: entry.name.clone(),
                 files: Some(entry.files),
                 bytes: entry.bytes,
+                target: None,
+                target_kind: None,
+                dangling: None,
             })
             .collect();
         return json_response(
@@ -27,6 +30,7 @@ pub fn sites(headers: &HeaderMap, list: &SiteList) -> Response {
             &Listing {
                 path: "/".to_string(),
                 files: list.files,
+                aliases: list.alias_count,
                 bytes: list.bytes,
                 entries,
             },
@@ -53,7 +57,7 @@ pub fn listing(
     files_view: bool,
 ) -> Response {
     if wants_json(headers) {
-        let entries = list
+        let mut entries = list
             .entries
             .iter()
             .map(|entry| ListingEntry {
@@ -64,13 +68,31 @@ pub fn listing(
                 name: entry.name.clone(),
                 files: (entry.kind == EntryKind::Directory).then_some(entry.files),
                 bytes: entry.bytes,
+                target: None,
+                target_kind: None,
+                dangling: None,
             })
-            .collect();
+            .collect::<Vec<_>>();
+        entries.extend(list.aliases.iter().filter_map(|alias| {
+            direct_alias_name(rel, &alias.path).map(|name| ListingEntry {
+                kind: ListingKind::Alias,
+                name: name.to_string(),
+                files: alias.resolved_files,
+                bytes: alias.resolved_size.unwrap_or(0),
+                target: Some(alias.canonical_target.clone()),
+                target_kind: alias.resolved_kind.map(|kind| match kind {
+                    AliasResolvedKind::File => symbol_contract::AliasTargetKind::File,
+                    AliasResolvedKind::Directory => symbol_contract::AliasTargetKind::Directory,
+                }),
+                dangling: Some(alias.resolved_kind.is_none()),
+            })
+        }));
         return json_response(
             headers,
             &Listing {
                 path: display_path(site, rel),
                 files: list.files,
+                aliases: list.alias_count,
                 bytes: list.bytes,
                 entries,
             },
@@ -208,6 +230,11 @@ fn render_plain(site: &str, rel: &str, list: &DirList) -> String {
         let files = (entry.kind == EntryKind::Directory).then_some(entry.files);
         push_listing_row(&mut out, &name, files, entry.bytes, layout, "");
     }
+    for alias in &list.aliases {
+        if let Some(name) = direct_alias_name(rel, &alias.path) {
+            writeln!(out, "{name} -> {}", alias.canonical_target).unwrap();
+        }
+    }
     out
 }
 
@@ -269,10 +296,35 @@ fn render_html(site: &str, rel: &str, list: &DirList, files_view: bool) -> Strin
                         }
                     }
                 }
+                @for alias in &list.aliases {
+                    @if let Some(name) = direct_alias_name(rel, &alias.path) {
+                        a.row href=(format!("/{site}/{}", alias.path)) {
+                            span.name { (name) " -> " (&alias.canonical_target) }
+                            span.meta {
+                                @if alias.resolved_kind.is_none() {
+                                    "dangling alias"
+                                } @else if let Some(files) = alias.resolved_files {
+                                    (files) " files · " (size_label(alias.resolved_size.unwrap_or(0)))
+                                } @else {
+                                    "alias"
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
     .into_string()
+}
+
+fn direct_alias_name<'a>(rel: &str, path: &'a str) -> Option<&'a str> {
+    let suffix = if rel.is_empty() {
+        path
+    } else {
+        path.strip_prefix(rel)?.strip_prefix('/')?
+    };
+    (!suffix.is_empty() && !suffix.contains('/')).then_some(suffix)
 }
 
 fn display_path(site: &str, rel: &str) -> String {
@@ -483,7 +535,7 @@ const STYLE: &str = static_asset!("browse.css");
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{DirEnt, SiteEnt};
+    use crate::store::{AliasEntry, DirEnt, SiteEnt};
     use axum::body::to_bytes;
     use axum::http::{HeaderValue, StatusCode};
 
@@ -502,6 +554,7 @@ mod tests {
     fn plain_site_sizes_align_ones_places_and_units() {
         let list = SiteList {
             files: 11,
+            alias_count: 0,
             bytes: 4_194_304,
             entries: vec![
                 SiteEnt {
@@ -567,6 +620,7 @@ mod tests {
     async fn files_responses_negotiate_json_and_html() {
         let list = SiteList {
             files: 1,
+            alias_count: 0,
             bytes: 512,
             entries: vec![SiteEnt {
                 name: "hello".to_string(),
@@ -579,7 +633,7 @@ mod tests {
         assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
         assert_eq!(
             body_text(response).await,
-            r#"{"path":"/","files":1,"bytes":512,"entries":[{"kind":"site","name":"hello","files":1,"bytes":512}]}"#
+            r#"{"path":"/","files":1,"aliases":0,"bytes":512,"entries":[{"kind":"site","name":"hello","files":1,"bytes":512}]}"#
         );
 
         let response = sites(&accept("text/html"), &list);
@@ -594,6 +648,7 @@ mod tests {
     fn listing_etag_revalidates_and_changes_with_content() {
         let mut list = SiteList {
             files: 1,
+            alias_count: 0,
             bytes: 5,
             entries: vec![SiteEnt {
                 name: "hello".to_string(),
@@ -655,5 +710,34 @@ mod tests {
 
         let body = render_html("hello", "docs", &list, false);
         assert!(!body.contains(r#"class="see-site""#));
+    }
+
+    #[tokio::test]
+    async fn aliases_render_as_arrows_and_typed_nullable_json_entries() {
+        let list = DirList {
+            files: 0,
+            bytes: 0,
+            alias_count: 1,
+            aliases: vec![AliasEntry {
+                path: "latest".to_string(),
+                canonical_target: "releases/current".to_string(),
+                resolved_kind: None,
+                resolved_hash: None,
+                resolved_size: None,
+                resolved_files: None,
+            }],
+            entries: Vec::new(),
+        };
+        assert!(render_plain("hello", "", &list).contains("latest -> releases/current"));
+        assert!(render_html("hello", "", &list, true).contains("latest -&gt; releases/current"));
+
+        let response = listing(&accept("application/json"), "hello", "", &list, true);
+        let value: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+        assert_eq!(value["aliases"], 1);
+        assert_eq!(value["entries"][0]["kind"], "alias");
+        assert_eq!(value["entries"][0]["target"], "releases/current");
+        assert_eq!(value["entries"][0]["target_kind"], serde_json::Value::Null);
+        assert_eq!(value["entries"][0]["files"], serde_json::Value::Null);
+        assert_eq!(value["entries"][0]["bytes"], serde_json::Value::Null);
     }
 }

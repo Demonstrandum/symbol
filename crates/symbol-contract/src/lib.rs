@@ -48,11 +48,15 @@ pub const IMMUTABLE_BLOB: &str = "/.blob/{name}/{hash}";
 pub const SITE_PATH: &str = "/{name}/{*path}";
 pub const SITE: &str = "/{name}";
 
+pub const METHOD_ALIAS: &str = "ALIAS";
 pub const METHOD_COPY: &str = "COPY";
+pub const METHOD_REPLACE: &str = "REPLACE";
 pub const METHOD_MOVE: &str = "MOVE";
 pub const METHOD_UNDO: &str = "UNDO";
 pub const METHOD_EXPIRE: &str = "EXPIRE";
 pub const METHOD_MANAGE: &str = "MANAGE";
+pub const RESERVED_MUTATION_ERROR: &str = "error: path is reserved by symbol";
+pub const SPLICE_MEDIA_TYPE: &str = "application/vnd.symbol.splice; version=1";
 
 const READ_ERRORS: &[u16] = &[304, 400, 404, 416];
 const MUTATION_ERRORS: &[u16] = &[400, 401, 403, 404, 409, 412, 413, 500];
@@ -479,7 +483,269 @@ pub static ENDPOINTS: &[EndpointContract] = &[
             "Cache-Control"
         ]
     ),
+    endpoint!(
+        "alias batch",
+        "ALIAS",
+        false,
+        "/{name}/",
+        &[200, 201],
+        &[400, 401, 403, 404, 409, 412, 413, 500],
+        &[
+            "Alias-Target",
+            "Authorization",
+            "Content-Type",
+            "Idempotency-Key",
+            "If-Match"
+        ],
+        &[
+            "Content-Revision",
+            "Content-Type",
+            "ETag",
+            "Idempotency-Replayed",
+            "Location",
+            "Undo-Expires",
+            "Undo-Token"
+        ]
+    ),
+    endpoint!(
+        "alias file",
+        "ALIAS",
+        false,
+        "/{name}/{path...}",
+        &[200, 201],
+        &[400, 401, 403, 404, 409, 412, 413, 500],
+        &[
+            "Alias-Target",
+            "Authorization",
+            "Idempotency-Key",
+            "If-Match"
+        ],
+        &[
+            "Content-Revision",
+            "Content-Type",
+            "ETag",
+            "Idempotency-Replayed",
+            "Location",
+            "Undo-Expires",
+            "Undo-Token"
+        ]
+    ),
+    endpoint!(
+        "allocated file",
+        "POST",
+        false,
+        "/{name}/{folder...}/",
+        &[200, 201, 202],
+        &[400, 401, 403, 404, 409, 412, 413, 500],
+        &[
+            "Allocation-Action",
+            "Allocation-Token",
+            "Authorization",
+            "Content-Type",
+            "Expiry-At",
+            "Expiry-In",
+            "Expiry-Max-Age",
+            "Expiry-Max-Size",
+            "Expiry-Min-Age",
+            "Expiry-Mode",
+            "Expiry-Power",
+            "File-Extension",
+            "File-Name",
+            "File-Prefix",
+            "File-Suffix",
+            "Idempotency-Key",
+            "If-Match"
+        ],
+        &[
+            "Content-Location",
+            "Content-Revision",
+            "Content-Type",
+            "ETag",
+            "Idempotency-Replayed",
+            "Location",
+            "Undo-Expires",
+            "Undo-Token"
+        ]
+    ),
+    endpoint!(
+        "file replace",
+        "REPLACE",
+        false,
+        "/{name}/{path...}",
+        &[200],
+        &[400, 401, 403, 404, 409, 412, 413, 500],
+        &[
+            "Authorization",
+            "Content-Type",
+            "Idempotency-Key",
+            "If-Content-Match",
+            "If-Match"
+        ],
+        &[
+            "Content-Revision",
+            "Content-Type",
+            "ETag",
+            "Idempotency-Replayed",
+            "Location",
+            "Undo-Expires",
+            "Undo-Token"
+        ]
+    ),
+    endpoint!(
+        "file splice",
+        "PATCH",
+        false,
+        "/{name}/{path...}",
+        &[200],
+        &[400, 401, 403, 404, 409, 412, 413, 416, 500],
+        &[
+            "Authorization",
+            "Content-Type",
+            "Idempotency-Key",
+            "If-Content-Match",
+            "If-Match",
+            "Splice"
+        ],
+        &[
+            "Content-Revision",
+            "Content-Type",
+            "ETag",
+            "Idempotency-Replayed",
+            "Location",
+            "Undo-Expires",
+            "Undo-Token"
+        ]
+    ),
 ];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WireBody {
+    Empty,
+    Json,
+    PlainText,
+    Binary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct OutcomeContract {
+    pub status: u16,
+    pub body: WireBody,
+    pub required_headers: &'static [&'static str],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct EndpointOutcomes {
+    pub name: &'static str,
+    pub success: &'static [OutcomeContract],
+    pub errors: &'static [OutcomeContract],
+}
+
+const JSON_MUTATION_HEADERS: &[&str] = &["Content-Type", "Location", "ETag", "Content-Revision"];
+const PLAIN_ERROR: WireBody = WireBody::PlainText;
+const MUTATION_ERROR_OUTCOMES: &[OutcomeContract] = &[
+    error_outcome(400),
+    error_outcome(401),
+    error_outcome(403),
+    error_outcome(404),
+    error_outcome(409),
+    error_outcome(412),
+    error_outcome(413),
+    error_outcome(500),
+];
+const SPLICE_ERROR_OUTCOMES: &[OutcomeContract] = &[
+    error_outcome(400),
+    error_outcome(401),
+    error_outcome(403),
+    error_outcome(404),
+    error_outcome(409),
+    error_outcome(412),
+    error_outcome(413),
+    error_outcome(416),
+    error_outcome(500),
+];
+
+pub static EXACT_OUTCOMES: &[EndpointOutcomes] = &[
+    EndpointOutcomes {
+        name: "alias batch",
+        success: &[
+            OutcomeContract {
+                status: 200,
+                body: WireBody::Json,
+                required_headers: JSON_MUTATION_HEADERS,
+            },
+            OutcomeContract {
+                status: 201,
+                body: WireBody::Json,
+                required_headers: JSON_MUTATION_HEADERS,
+            },
+        ],
+        errors: MUTATION_ERROR_OUTCOMES,
+    },
+    EndpointOutcomes {
+        name: "alias file",
+        success: &[
+            OutcomeContract {
+                status: 200,
+                body: WireBody::Json,
+                required_headers: JSON_MUTATION_HEADERS,
+            },
+            OutcomeContract {
+                status: 201,
+                body: WireBody::Json,
+                required_headers: JSON_MUTATION_HEADERS,
+            },
+        ],
+        errors: MUTATION_ERROR_OUTCOMES,
+    },
+    EndpointOutcomes {
+        name: "allocated file",
+        success: &[
+            OutcomeContract {
+                status: 200,
+                body: WireBody::Json,
+                required_headers: JSON_MUTATION_HEADERS,
+            },
+            OutcomeContract {
+                status: 201,
+                body: WireBody::Json,
+                required_headers: JSON_MUTATION_HEADERS,
+            },
+            OutcomeContract {
+                status: 202,
+                body: WireBody::Json,
+                required_headers: &["Content-Type", "Location", "ETag", "Content-Revision"],
+            },
+        ],
+        errors: MUTATION_ERROR_OUTCOMES,
+    },
+    EndpointOutcomes {
+        name: "file replace",
+        success: &[OutcomeContract {
+            status: 200,
+            body: WireBody::Json,
+            required_headers: JSON_MUTATION_HEADERS,
+        }],
+        errors: MUTATION_ERROR_OUTCOMES,
+    },
+    EndpointOutcomes {
+        name: "file splice",
+        success: &[OutcomeContract {
+            status: 200,
+            body: WireBody::Json,
+            required_headers: JSON_MUTATION_HEADERS,
+        }],
+        errors: SPLICE_ERROR_OUTCOMES,
+    },
+];
+
+const fn error_outcome(status: u16) -> OutcomeContract {
+    OutcomeContract {
+        status,
+        body: PLAIN_ERROR,
+        required_headers: &["Content-Type"],
+    }
+}
 
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct ServingStats {
@@ -518,6 +784,7 @@ pub struct SizeDistribution {
 pub struct Stats {
     pub sites: u64,
     pub files: u64,
+    pub aliases: u64,
     pub blobs: u64,
     pub bytes: u64,
     pub logical_bytes: u64,
@@ -540,12 +807,30 @@ pub struct InventoryFile {
     pub size: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AliasTargetKind {
+    File,
+    Directory,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct InventoryAlias {
+    pub path: String,
+    pub target: String,
+    pub target_kind: Option<AliasTargetKind>,
+    pub dangling: bool,
+    pub resolved_hash: Option<String>,
+    pub size: Option<u64>,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SiteInventory {
     pub site: String,
     pub content_revision: u64,
     pub tree_hash: String,
     pub files: Vec<InventoryFile>,
+    pub aliases: Vec<InventoryAlias>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -635,30 +920,220 @@ pub enum ListingKind {
     Site,
     Directory,
     File,
+    Alias,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone)]
 pub struct ListingEntry {
     pub kind: ListingKind,
     pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub files: Option<u64>,
     pub bytes: u64,
+    pub target: Option<String>,
+    pub target_kind: Option<AliasTargetKind>,
+    pub dangling: Option<bool>,
+}
+
+impl serde::Serialize for ListingEntry {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct as _;
+
+        match self.kind {
+            ListingKind::Site | ListingKind::Directory => {
+                let mut entry = serializer.serialize_struct("ListingEntry", 4)?;
+                entry.serialize_field("kind", &self.kind)?;
+                entry.serialize_field("name", &self.name)?;
+                entry.serialize_field("files", &self.files)?;
+                entry.serialize_field("bytes", &self.bytes)?;
+                entry.end()
+            }
+            ListingKind::File => {
+                let mut entry = serializer.serialize_struct("ListingEntry", 3)?;
+                entry.serialize_field("kind", &self.kind)?;
+                entry.serialize_field("name", &self.name)?;
+                entry.serialize_field("bytes", &self.bytes)?;
+                entry.end()
+            }
+            ListingKind::Alias => {
+                let dangling = self.dangling.unwrap_or(true);
+                let bytes = (!dangling).then_some(self.bytes);
+                let mut entry = serializer.serialize_struct("ListingEntry", 7)?;
+                entry.serialize_field("kind", &self.kind)?;
+                entry.serialize_field("name", &self.name)?;
+                entry.serialize_field("target", &self.target)?;
+                entry.serialize_field("target_kind", &self.target_kind)?;
+                entry.serialize_field("dangling", &dangling)?;
+                entry.serialize_field("files", &self.files)?;
+                entry.serialize_field("bytes", &bytes)?;
+                entry.end()
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Listing {
     pub path: String,
     pub files: u64,
+    pub aliases: u64,
     pub bytes: u64,
     pub entries: Vec<ListingEntry>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AliasDefinition {
+    pub path: String,
+    pub target: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AliasBatchRequest {
+    pub aliases: Vec<AliasDefinition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct UndoReceipt {
+    pub token: String,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MutationReceipt {
+    pub changed: bool,
+    pub replayed: bool,
+    pub idempotency_key: String,
+    pub location: String,
+    pub etag: String,
+    pub content_revision: u64,
+    pub sanitized_management_tokens: u64,
+    pub sanitized_creator_claims: u64,
+    pub undo: Option<UndoReceipt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AliasReceipt {
+    pub path: String,
+    pub target: String,
+    pub target_kind: Option<AliasTargetKind>,
+    pub dangling: bool,
+    pub resolved_hash: Option<String>,
+    pub size: Option<u64>,
+    #[serde(flatten)]
+    pub mutation: MutationReceipt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AliasBatchReceipt {
+    pub aliases: Vec<InventoryAlias>,
+    #[serde(flatten)]
+    pub mutation: MutationReceipt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AllocationOutcome {
+    Created,
+    Existing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "mode", rename_all = "lowercase")]
+pub enum AllocationNaming {
+    Generated {
+        prefix: String,
+        extension: String,
+        suffix: String,
+    },
+    Custom,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AllocatedFileReceipt {
+    pub outcome: AllocationOutcome,
+    pub site: String,
+    pub path: String,
+    pub name: String,
+    pub url: String,
+    pub hash: String,
+    pub size: u64,
+    pub blob_url: String,
+    pub naming: AllocationNaming,
+    #[serde(flatten)]
+    pub mutation: MutationReceipt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ProposedFileName {
+    pub folder: String,
+    pub default_name: String,
+    pub hash: String,
+    pub size: u64,
+    pub media_type: String,
+    pub inferred_extension: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AllocationProposalReceipt {
+    pub allocation_token: String,
+    pub expires_at: String,
+    pub proposal: ProposedFileName,
+    pub idempotency_key: String,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AllocationCancellationReceipt {
+    pub allocation_token: String,
+    pub cancelled: bool,
+    pub idempotency_key: String,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReplacementOutcome {
+    Replaced,
+    Relocated,
+    Unchanged,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct FileReplaceReceipt {
+    pub outcome: ReplacementOutcome,
+    pub old_path: String,
+    pub new_path: String,
+    pub relocated: bool,
+    pub old_hash: String,
+    pub new_hash: String,
+    pub size: u64,
+    #[serde(flatten)]
+    pub mutation: MutationReceipt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SpliceReceipt {
+    pub old_path: String,
+    pub new_path: String,
+    pub relocated: bool,
+    pub old_hash: String,
+    pub new_hash: String,
+    pub old_size: u64,
+    pub new_size: u64,
+    pub splices: usize,
+    #[serde(flatten)]
+    pub mutation: MutationReceipt,
+}
+
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{BTreeSet, HashSet};
 
-    use super::ENDPOINTS;
+    use super::{ENDPOINTS, EXACT_OUTCOMES};
 
     #[test]
     fn endpoint_names_are_unique_and_shapes_are_well_formed() {
@@ -681,6 +1156,52 @@ mod tests {
                     .iter()
                     .chain(endpoint.response_headers)
                     .all(|header| !header.is_empty())
+            );
+        }
+    }
+
+    #[test]
+    fn every_installed_frozen_addition_has_exact_outcomes() {
+        let expected = [
+            "alias batch",
+            "alias file",
+            "allocated file",
+            "file replace",
+            "file splice",
+        ];
+        assert_eq!(
+            EXACT_OUTCOMES
+                .iter()
+                .map(|endpoint| endpoint.name)
+                .collect::<BTreeSet<_>>(),
+            expected.into_iter().collect()
+        );
+        for outcomes in EXACT_OUTCOMES {
+            let endpoint = ENDPOINTS
+                .iter()
+                .find(|endpoint| endpoint.name == outcomes.name)
+                .expect("exact outcomes name a frozen endpoint");
+            let success = outcomes
+                .success
+                .iter()
+                .map(|outcome| outcome.status)
+                .collect::<BTreeSet<_>>();
+            let errors = outcomes
+                .errors
+                .iter()
+                .map(|outcome| outcome.status)
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                success,
+                endpoint.success_statuses.iter().copied().collect(),
+                "{} success outcomes",
+                endpoint.name
+            );
+            assert_eq!(
+                errors,
+                endpoint.error_statuses.iter().copied().collect(),
+                "{} error outcomes",
+                endpoint.name
             );
         }
     }

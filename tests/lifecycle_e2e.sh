@@ -5,6 +5,8 @@ ROOT=$(mktemp -d)
 PORT=$((20000 + ($$ % 20000)))
 BASE="http://127.0.0.1:${PORT}"
 SERVER=${SERVER:-target/debug/symbol}
+CLIENT_SOURCE=${CLIENT:-$(pwd)/static/symbol.sh}
+CLIENT_SOURCE=$(CDPATH='' cd "$(dirname "${CLIENT_SOURCE}")" && pwd)/$(basename "${CLIENT_SOURCE}")
 SERVER_PID=
 
 cleanup() {
@@ -45,6 +47,17 @@ site_from_put() {
   '
 }
 
+revision() {
+  awk '
+    match($0, /"content_revision":[0-9]+/) {
+      value = substr($0, RSTART, RLENGTH)
+      sub(/^.*:/, "", value)
+      print value
+      exit
+    }
+  '
+}
+
 tests=0
 mkdir -p "${ROOT}/server" "${ROOT}/bin" "${ROOT}/work"
 
@@ -67,13 +80,15 @@ ok "isolated server starts"
 
 curl -fsS "${BASE}/install.sh" |
   PREFIX="${ROOT}/bin" SYMBOL_HOST="${BASE}" sh >/dev/null
+cp "${CLIENT_SOURCE}" "${ROOT}/bin/symbol"
 CLIENT=${ROOT}/bin/symbol
 [ -x "${CLIENT}" ] || fail "client installs"
 ok "client installs"
-export XDG_STATE_HOME="${ROOT}/state"
+export SYMBOL_HOST="${BASE}" XDG_STATE_HOME="${ROOT}/state"
 
 REAL_CURL=$(command -v curl)
-export REAL_CURL
+DROP_LOG=${ROOT}/drop.log
+export REAL_CURL DROP_LOG
 mkdir "${ROOT}/drop-bin" "${ROOT}/drop-state"
 cat >"${ROOT}/drop-bin/curl" <<'DROP_CURL'
 #!/bin/sh
@@ -102,6 +117,12 @@ for argument do
     next_is_output=1
   fi
 done
+{
+  printf 'METHOD=%s\n' "$method"
+  for argument do
+    printf 'ARG=%s\n' "$argument"
+  done
+} >>"${DROP_LOG}"
 if [ "${DROP_ALWAYS_METHOD:-}" = "$method" ]; then
   if ! ls "$XDG_STATE_HOME/symbol/claims"/pending-* >/dev/null 2>&1; then
     : >"${DROP_STATE}/missing-pending-$method"
@@ -180,11 +201,19 @@ ok "new client process recovers committed PUT after repeated loss"
 
 printf '<h1>named drop</h1>\n' >"${ROOT}/work/named-drop.html"
 rm -f "${DROP_STATE}/PUT" "${DROP_STATE}/missing-pending-PUT"
-DROP_METHOD=PUT "${CLIENT}" put e2e-named-drop "${ROOT}/work/named-drop.html" >/dev/null
-[ -s "${XDG_STATE_HOME}/symbol/claims/e2e-named-drop" ] &&
-  [ "$(curl -fsS "${BASE}/e2e-named-drop/index.html")" = '<h1>named drop</h1>' ] ||
-  fail "named first-create response loss preserves creator claim"
-ok "named first-create response loss preserves creator claim"
+: >"${DROP_LOG}"
+DROP_METHOD=PUT "${CLIENT}" put e2e-named-drop \
+  "${ROOT}/work/named-drop.html" >"${ROOT}/named-drop.out" \
+  2>"${ROOT}/named-drop.err"
+named_drop_puts=$(awk '$0=="METHOD=PUT"{n++} END{print n+0}' "${DROP_LOG}")
+[ "${named_drop_puts}" -eq 1 ] &&
+  ! awk 'index($0, "Idempotency-Key:"){found=1} END{exit !found}' \
+    "${DROP_LOG}" &&
+  [ ! -e "${XDG_STATE_HOME}/symbol/claims/e2e-named-drop" ] &&
+  [ "$(curl -fsS "${BASE}/e2e-named-drop/index.html")" = '<h1>named drop</h1>' ] &&
+  contains "$(cat "${ROOT}/named-drop.err")" 'one-time creator claim were lost' ||
+  fail "named file creation reports irrecoverable dropped claim"
+ok "named file creation reports irrecoverable dropped claim"
 
 printf '<h1>main</h1>\n' >"${ROOT}/work/index.html"
 printf 'body{}\n' >"${ROOT}/work/style.css"
@@ -197,6 +226,26 @@ contains "${inventory}" '"path":"index.html"' &&
     awk '$1 == "content_revision" { found=1 } END { exit !found }' ||
   fail "named puts merge and generate manifest"
 ok "named puts merge and generate manifest"
+
+printf 'committed once\n' >"${ROOT}/work/drop-file.txt"
+before_file_drop=$(curl -fsS -H 'Accept: application/json' \
+  "${BASE}/e2e-main/FILES" | revision)
+rm -f "${DROP_STATE}/PUT"
+: >"${DROP_LOG}"
+file_drop_result=$(DROP_METHOD=PUT "${CLIENT}" put e2e-main \
+  "${ROOT}/work/drop-file.txt" drop-file.txt)
+after_file_drop=$(curl -fsS -H 'Accept: application/json' \
+  "${BASE}/e2e-main/FILES" | revision)
+file_drop_puts=$(awk '$0=="METHOD=PUT"{n++} END{print n+0}' "${DROP_LOG}")
+[ "${file_drop_puts}" -eq 1 ] &&
+  ! awk 'index($0, "Idempotency-Key:"){found=1} END{exit !found}' \
+    "${DROP_LOG}" &&
+  [ "${after_file_drop}" -eq "$((before_file_drop + 1))" ] &&
+  [ "$(curl -fsS "${BASE}/e2e-main/drop-file.txt")" = 'committed once' ] &&
+  contains "${file_drop_result}" \
+    "verified committed update ${BASE}/e2e-main/drop-file.txt after response loss" ||
+  fail "dropped file PUT verifies one commit without unsupported replay"
+ok "dropped file PUT verifies one commit without unsupported replay"
 
 printf '<h1>api example</h1>\n' >"${ROOT}/work/api.html"
 "${CLIENT}" put hello "${ROOT}/work/api.html" >/dev/null
@@ -234,6 +283,69 @@ contains "${sync_check}" '+ about.txt' || fail "sync check reports local additio
 [ "$(curl -fsS "${BASE}/e2e-main/about.txt")" = new ] ||
   fail "sync conditionally publishes additions"
 ok "clone and strict sync publish additions"
+
+printf 'sync once\n' >"${ROOT}/work/checkout/drop-sync.txt"
+before_sync_drop=$(curl -fsS -H 'Accept: application/json' \
+  "${BASE}/e2e-main/FILES" | revision)
+rm -f "${DROP_STATE}/PUT"
+: >"${DROP_LOG}"
+sync_drop_result=$(cd "${ROOT}/work/checkout" &&
+  DROP_METHOD=PUT "${CLIENT}" sync 2>"${ROOT}/sync-drop.err")
+after_sync_drop=$(curl -fsS -H 'Accept: application/json' \
+  "${BASE}/e2e-main/FILES" | revision)
+sync_drop_puts=$(awk '$0=="METHOD=PUT"{n++} END{print n+0}' "${DROP_LOG}")
+sync_drop_keys=$(awk -F 'Idempotency-Key: ' \
+  'index($0, "Idempotency-Key:"){print $2}' "${DROP_LOG}" |
+  LC_ALL=C sort -u | awk 'END{print NR+0}')
+sync_drop_matches=$(awk 'index($0, "ARG=If-Match:"){n++} END{print n+0}' \
+  "${DROP_LOG}")
+[ "${sync_drop_puts}" -eq 2 ] &&
+  [ "${sync_drop_keys}" -eq 1 ] &&
+  [ "${sync_drop_matches}" -eq 2 ] &&
+  [ "${after_sync_drop}" -eq "$((before_sync_drop + 1))" ] &&
+  [ "$(curl -fsS "${BASE}/e2e-main/drop-sync.txt")" = 'sync once' ] &&
+  contains "$(cat "${ROOT}/sync-drop.err")" \
+    'sync response was lost; remote tree verified' &&
+  ! contains "$(cat "${ROOT}/sync-drop.err")" \
+    'upstream changed; nothing was written' &&
+  contains "${sync_drop_result}" "synced ${BASE}/e2e-main/" ||
+  fail "dropped sync replays one conditional site PUT"
+ok "dropped sync replays one conditional site PUT"
+
+mkdir -p "${ROOT}/work/rooted-source/assets"
+printf 'before\n' >"${ROOT}/work/rooted-source/assets/file.txt"
+"${CLIENT}" put e2e-rooted "${ROOT}/work/rooted-source/assets/file.txt" \
+  assets/file.txt >/dev/null
+(
+  cd "${ROOT}/work"
+  "${CLIENT}" clone e2e-rooted rooted-checkout >/dev/null
+)
+printf 'after\n' >"${ROOT}/work/rooted-checkout/assets/file.txt"
+(cd "${ROOT}/work/rooted-checkout" && "${CLIENT}" sync >/dev/null)
+root_file_status=$(curl -sS -o /dev/null -w '%{http_code}' \
+  "${BASE}/e2e-rooted/file.txt")
+rooted_sync_manifest=$(curl -fsS "${BASE}/e2e-rooted/symbol.toml")
+[ "$(curl -fsS "${BASE}/e2e-rooted/assets/file.txt")" = after ] &&
+  [ "${root_file_status}" = 404 ] &&
+  contains "${rooted_sync_manifest}" 'version = 1' &&
+  ! contains "${rooted_sync_manifest}" 'partial sync root anchor' ||
+  fail "single-root partial sync keeps assets/file.txt in place"
+ok "single-root partial sync keeps assets/file.txt in place"
+
+mkdir "${ROOT}/work/rooted-checkout/links"
+ln -s ../assets/file.txt "${ROOT}/work/rooted-checkout/links/current"
+ln -s ../assets/file.txt "${ROOT}/work/rooted-checkout/links/next"
+(cd "${ROOT}/work/rooted-checkout" && "${CLIENT}" sync >/dev/null)
+root_alias_status=$(curl -sS -o /dev/null -w '%{http_code}' \
+  "${BASE}/e2e-rooted/current")
+rooted_manifest=$(curl -fsS "${BASE}/e2e-rooted/symbol.toml")
+[ "$(curl -fsS "${BASE}/e2e-rooted/links/current")" = after ] &&
+  [ "$(curl -fsS "${BASE}/e2e-rooted/links/next")" = after ] &&
+  [ "${root_alias_status}" = 404 ] &&
+  contains "${rooted_manifest}" '"links/current" = "assets/file.txt"' &&
+  contains "${rooted_manifest}" '"links/next" = "assets/file.txt"' ||
+  fail "alias-only common-root sync keeps full alias paths"
+ok "alias-only common-root sync keeps full alias paths"
 
 "${CLIENT}" copy e2e-main e2e-copy >/dev/null
 "${CLIENT}" move e2e-copy e2e-moved >/dev/null
@@ -490,6 +602,7 @@ ok "pop dash keeps binary stdout clean"
   rm e2e-managed-remix >/dev/null
 "${CLIENT}" -t "${managed_loss_token}" rm e2e-managed-loss >/dev/null
 "${CLIENT}" rm e2e-main >/dev/null
+"${CLIENT}" rm e2e-rooted >/dev/null
 "${CLIENT}" rm e2e-claim >/dev/null
 "${CLIENT}" rm e2e-moved >/dev/null
 "${CLIENT}" rm e2e-secure >/dev/null
@@ -505,7 +618,7 @@ left=$(curl -fsS -H 'Accept: application/json' "${BASE}/FILES")
 for name in e2e-main e2e-moved e2e-remix e2e-secure "${explicit_name}" "${implicit_name}" \
   "${dropped_put_name}" "${dropped_copy_name}" "${restarted_put_name}" \
   "${restarted_copy_name}" e2e-drop-explicit e2e-named-drop e2e-managed-loss \
-  e2e-claim; do
+  e2e-claim e2e-rooted; do
   contains "${left}" "\"name\":\"${name}\"" && fail "cleanup removes all test sites"
 done
 ok "cleanup removes all test sites"

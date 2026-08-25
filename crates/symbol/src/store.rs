@@ -21,8 +21,8 @@ use diesel::upsert::excluded;
 use flate2::Compression;
 use flate2::write::GzEncoder;
 pub use symbol_contract::{
-    CacheStats, InventoryFile, ManagementStatus, ReaderStats, ServingStats, SiteInventory,
-    SizeDistribution, Stats, UndoEntry, UndoStack,
+    AliasTargetKind, CacheStats, InventoryAlias, InventoryFile, ManagementStatus, ReaderStats,
+    ServingStats, SiteInventory, SizeDistribution, Stats, UndoEntry, UndoStack,
 };
 
 use crate::blob_store::BlobFiles;
@@ -44,7 +44,10 @@ use crate::schema::{
 use crate::secrets::{ClaimToken, ClaimTokenHash, ManagementToken, ManagementTokenHash};
 #[cfg(test)]
 use crate::upload::write_payload;
-use crate::upload::{Kind, MAX_ALIAS_TARGET_BYTES, UploadError, write_payload_file};
+use crate::upload::{
+    ArchiveMember, ArchivePlan, Kind, MAX_ALIAS_TARGET_BYTES, UploadError, plan_archive,
+    write_payload_file,
+};
 
 #[cfg(test)]
 use std::io::Cursor;
@@ -190,7 +193,7 @@ struct UndoAliasRow {
     resolved_size: Option<i64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[repr(i64)]
 pub enum AllocatedNamingMode {
     ContentAddressed = 1,
@@ -227,6 +230,60 @@ struct PendingMetadata {
     size: i64,
     media_type: String,
     request_fingerprint: String,
+    expiry: FileExpiry,
+    authorization_hash: Option<String>,
+    extension: Option<String>,
+    expected_tree_hash: Option<String>,
+    legacy_fingerprint: bool,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct PendingRequestMetadata {
+    request_fingerprint: String,
+    expiry: FileExpiry,
+    #[serde(default)]
+    authorization_hash: Option<String>,
+    #[serde(default)]
+    extension: Option<String>,
+    #[serde(default)]
+    expected_tree_hash: Option<String>,
+    #[serde(default)]
+    legacy_fingerprint: bool,
+}
+
+#[derive(Clone, Copy)]
+struct PendingFingerprint<'a> {
+    site: &'a str,
+    folder: &'a str,
+    hash: &'a str,
+    content_size: u64,
+    media_type: &'a str,
+    expiry: FileExpiry,
+    authorization_hash: Option<&'a str>,
+    extension: Option<&'a str>,
+    expected_tree_hash: Option<&'a str>,
+}
+
+#[derive(Clone, Copy)]
+struct PendingFinalizeFingerprint<'a> {
+    site: &'a str,
+    token: &'a str,
+    folder: Option<&'a str>,
+    final_name: PendingFinalName<'a>,
+    expiry: FileExpiry,
+    authorization_hash: Option<&'a str>,
+    expected_tree_hash: Option<&'a str>,
+}
+
+#[derive(Clone, Copy)]
+struct AllocatedEntryFingerprint<'a> {
+    name: &'a str,
+    current_path: Option<&'a str>,
+    destination: &'a AllocationDestination,
+    hash: &'a str,
+    kind: UndoKind,
+    expiry: FileExpiry,
+    expected_tree_hash: Option<&'a str>,
 }
 
 struct AllocationDestination {
@@ -332,7 +389,9 @@ struct AliasUpdateCount {
 struct AliasDirectoryRowWork {
     resolution: u64,
     files: u64,
+    allocated: u64,
     aliases: u64,
+    aggregates: u64,
 }
 
 #[cfg(test)]
@@ -376,6 +435,18 @@ fn record_alias_listed_file_rows(rows: usize) {
 const fn record_alias_listed_file_rows(_: usize) {}
 
 #[cfg(test)]
+fn record_alias_listed_allocated_rows(rows: usize) {
+    ALIAS_DIRECTORY_ROW_WORK.with(|cell| {
+        let mut work = cell.get();
+        work.allocated += u64::try_from(rows).expect("row count fits in u64");
+        cell.set(work);
+    });
+}
+
+#[cfg(not(test))]
+const fn record_alias_listed_allocated_rows(_: usize) {}
+
+#[cfg(test)]
 fn record_alias_listed_rows(rows: usize) {
     ALIAS_DIRECTORY_ROW_WORK.with(|cell| {
         let mut work = cell.get();
@@ -386,6 +457,18 @@ fn record_alias_listed_rows(rows: usize) {
 
 #[cfg(not(test))]
 const fn record_alias_listed_rows(_: usize) {}
+
+#[cfg(test)]
+fn record_alias_aggregate_rows(rows: usize) {
+    ALIAS_DIRECTORY_ROW_WORK.with(|cell| {
+        let mut work = cell.get();
+        work.aggregates += u64::try_from(rows).expect("row count fits in u64");
+        cell.set(work);
+    });
+}
+
+#[cfg(not(test))]
+const fn record_alias_aggregate_rows(_: usize) {}
 
 struct BlobCache {
     capacity: usize,
@@ -452,11 +535,12 @@ pub struct SiteEnt {
 #[derive(Debug, Clone)]
 pub struct SiteList {
     pub files: u64,
+    pub alias_count: u64,
     pub bytes: u64,
     pub entries: Vec<SiteEnt>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum ArchiveFormat {
     Tar,
     TarGz,
@@ -521,6 +605,7 @@ impl Default for AllocationSpec<'_> {
 pub struct PendingAllocationSpec<'a> {
     pub folder: &'a str,
     pub media_type: &'a str,
+    pub extension: Option<&'a str>,
 }
 
 impl Default for PendingAllocationSpec<'_> {
@@ -528,6 +613,7 @@ impl Default for PendingAllocationSpec<'_> {
         Self {
             folder: "",
             media_type: "application/octet-stream",
+            extension: None,
         }
     }
 }
@@ -543,14 +629,38 @@ pub struct AllocatedFile {
     pub mutation: Option<MutationResult>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct PendingAllocation {
     pub token: String,
     pub folder: String,
     pub hash: String,
     pub size: u64,
     pub media_type: String,
+    #[serde(default)]
+    pub extension: Option<String>,
     pub expires_at: String,
+    #[serde(default)]
+    pub tree_hash: String,
+    #[serde(default)]
+    pub content_revision: u64,
+    #[serde(default)]
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct AllocationCancellation {
+    pub replayed: bool,
+    pub tree_hash: String,
+    pub content_revision: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileExpiry {
+    #[default]
+    Preserve,
+    Clear,
+    Policy(ExpiryPolicy),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -602,6 +712,12 @@ impl TemporaryDirectory {
     fn path(&self) -> &Path {
         &self.path
     }
+
+    fn persist(self) -> PathBuf {
+        let path = self.path.clone();
+        std::mem::forget(self);
+        path
+    }
 }
 
 impl Drop for TemporaryDirectory {
@@ -615,6 +731,7 @@ pub struct FileMutationOptions<'a> {
     pub expected_tree_hash: Option<&'a str>,
     pub idempotency: Option<&'a Idempotency>,
     pub authorization: Option<&'a ManagementToken>,
+    pub expiry: FileExpiry,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -623,20 +740,27 @@ pub struct AliasSpec<'a> {
     pub target: &'a str,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[repr(i64)]
 pub enum AliasResolvedKind {
     File = 0,
     Directory = 1,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct AliasEntry {
     pub path: String,
     pub canonical_target: String,
     pub resolved_kind: Option<AliasResolvedKind>,
     pub resolved_hash: Option<String>,
     pub resolved_size: Option<u64>,
+    pub resolved_files: Option<u64>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct AliasMutationResult {
+    pub mutation: MutationResult,
+    pub aliases: Vec<AliasEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1233,6 +1357,10 @@ impl Store {
             .collect::<Vec<_>>();
         blob_values.sort_unstable();
         let files = u64::try_from(file_values.len()).expect("file count fits in u64");
+        let aliases = aliases::table
+            .select(count_star())
+            .first::<i64>(&mut *db)?
+            .cast_unsigned();
         let blobs = u64::try_from(blob_values.len()).expect("blob count fits in u64");
         let logical_bytes = file_values.iter().sum();
         let bytes = blob_values.iter().sum();
@@ -1246,6 +1374,7 @@ impl Store {
         Ok(Stats {
             sites,
             files,
+            aliases,
             blobs,
             bytes,
             logical_bytes,
@@ -1284,8 +1413,13 @@ impl Store {
         }
         let files = entries.iter().map(|entry| entry.files).sum();
         let bytes = entries.iter().map(|entry| entry.bytes).sum();
+        let alias_count = aliases::table
+            .select(count_star())
+            .first::<i64>(&mut *db)?
+            .cast_unsigned();
         Ok(SiteList {
             files,
+            alias_count,
             bytes,
             entries,
         })
@@ -1321,24 +1455,30 @@ impl Store {
             return Err(StoreError::NotFound);
         }
         let mut db = self.inner.readers.get();
-        match node_locked(&mut db, name, &rel)? {
+        let mut snapshot = DbTransaction::begin(&mut db)?;
+        match node_locked(&mut snapshot, name, &rel)? {
             NodeKind::Dir => {}
             NodeKind::File { .. } | NodeKind::Missing => return Err(StoreError::NotFound),
         }
         let alias_target = if rel.is_empty() {
             None
         } else {
-            resolved_alias_directory_target_locked(&mut db, name, &rel)?
+            resolved_alias_directory_target_locked(&mut snapshot, name, &rel)?
         };
         let files = if let Some(ref target) = alias_target {
-            load_alias_directory_files(&mut db, name, &rel, target)?
+            load_alias_directory_files(&mut snapshot, name, &rel, target)?
         } else if rel.is_empty() {
-            load_root_files(&mut db, name)?
+            load_root_files(&mut snapshot, name)?
         } else {
-            load_descendant_files(&mut db, name, &rel)?
+            load_descendant_files(&mut snapshot, name, &rel)?
         };
-        let aliases =
-            load_directory_aliases(&mut db, name, &rel, alias_target.as_deref().unwrap_or(&rel))?;
+        let aliases = load_directory_aliases(
+            &mut snapshot,
+            name,
+            &rel,
+            alias_target.as_deref().unwrap_or(&rel),
+        )?;
+        snapshot.commit()?;
         let mut listing = dirents(&files, &rel);
         listing.alias_count =
             u64::try_from(aliases.len()).expect("directory alias count fits in u64");
@@ -1349,14 +1489,15 @@ impl Store {
     pub fn site_inventory(&self, name: &str) -> Result<SiteInventory, StoreError> {
         let name = parse_site_name(name)?;
         let mut db = self.inner.readers.get();
-        let (revision, tree_hash) = site_revision_locked(&mut db, name)?;
-        let site_id = site_id_locked(&mut db, name)?;
+        let mut snapshot = DbTransaction::begin(&mut db)?;
+        let (revision, tree_hash) = site_revision_locked(&mut snapshot, name)?;
+        let site_id = site_id_locked(&mut snapshot, name)?;
         let rows = files::table
             .filter(files::site_id.eq(site_id))
             .filter(files::path.ne(MANIFEST_PATH))
             .select((files::path, files::hash, files::size))
             .order(files::path)
-            .load::<(String, String, i64)>(&mut *db)?;
+            .load::<(String, String, i64)>(&mut *snapshot)?;
         let mut inventory = rows
             .into_iter()
             .map(|(path, hash, size)| InventoryFile {
@@ -1372,7 +1513,7 @@ impl Store {
                 allocated_entries::hash,
                 allocated_entries::size,
             ))
-            .load::<(String, String, i64)>(&mut *db)?;
+            .load::<(String, String, i64)>(&mut *snapshot)?;
         for (path, hash, size) in allocated {
             inventory.push(InventoryFile {
                 hash: format!("blake3:{hash}"),
@@ -1381,11 +1522,33 @@ impl Store {
             });
         }
         inventory.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+        let aliases = aliases::table
+            .filter(aliases::site_id.eq(site_id))
+            .select(AliasRow::as_select())
+            .order(aliases::path)
+            .load::<AliasRow>(&mut *snapshot)?
+            .into_iter()
+            .map(|row| {
+                alias_entry(row).map(|alias| InventoryAlias {
+                    path: alias.path,
+                    target: alias.canonical_target,
+                    target_kind: alias.resolved_kind.map(|kind| match kind {
+                        AliasResolvedKind::File => AliasTargetKind::File,
+                        AliasResolvedKind::Directory => AliasTargetKind::Directory,
+                    }),
+                    dangling: alias.resolved_kind.is_none(),
+                    resolved_hash: alias.resolved_hash.map(|hash| format!("blake3:{hash}")),
+                    size: alias.resolved_size,
+                })
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?;
+        snapshot.commit()?;
         Ok(SiteInventory {
             site: name.to_string(),
             content_revision: revision,
             tree_hash,
             files: inventory,
+            aliases,
         })
     }
 
@@ -1639,13 +1802,23 @@ impl Store {
         self.put_aliases(name, &[AliasSpec { path, target }], options)
     }
 
-    #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
     pub fn put_aliases(
         &self,
         name: &str,
         specs: &[AliasSpec<'_>],
         options: FileMutationOptions<'_>,
     ) -> Result<MutationResult, StoreError> {
+        self.put_aliases_with_receipt(name, specs, options)
+            .map(|result| result.mutation)
+    }
+
+    #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
+    pub fn put_aliases_with_receipt(
+        &self,
+        name: &str,
+        specs: &[AliasSpec<'_>],
+        options: FileMutationOptions<'_>,
+    ) -> Result<AliasMutationResult, StoreError> {
         let name = parse_site_name(name)?;
         if specs.is_empty() {
             return Err(StoreError::InvalidAliasTarget);
@@ -1669,7 +1842,7 @@ impl Store {
                 _ => {}
             }
         }
-        let fingerprint = alias_mutation_fingerprint(name, &requested);
+        let fingerprint = alias_mutation_fingerprint(name, &requested, options.expected_tree_hash);
         let now = self.now_millis();
         let mut db = self.inner.writer.lock().unwrap();
         let mut tx = DbTransaction::begin(&mut db)?;
@@ -1677,13 +1850,8 @@ impl Store {
         prune_idempotency_locked(&mut tx, now)?;
         if let Some(idempotency) = options.idempotency {
             validate_idempotency_key(&idempotency.key)?;
-            if let Some(replay) = idempotency_replay(
-                &mut tx,
-                &idempotency.key,
-                &fingerprint,
-                IdempotencyKind::AliasMutation,
-            )? {
-                return Ok(replay.mutation);
+            if let Some(replay) = alias_mutation_replay(&mut tx, idempotency, &fingerprint)? {
+                return Ok(replay);
             }
         }
         check_tree_precondition(&mut tx, name, options.expected_tree_hash)?;
@@ -1760,19 +1928,11 @@ impl Store {
                 undo: None,
                 sanitized: TokenCounts::default(),
             };
-            if let Some(idempotency) = options.idempotency {
-                store_idempotency(
-                    &mut tx,
-                    &idempotency.key,
-                    &fingerprint,
-                    IdempotencyKind::AliasMutation,
-                    &PublishedMutation {
-                        name: name.to_string(),
-                        mutation: result.clone(),
-                    },
-                    now,
-                )?;
-            }
+            let result = AliasMutationResult {
+                aliases: load_requested_aliases_locked(&mut tx, site_id, requested.keys())?,
+                mutation: result,
+            };
+            store_alias_mutation(&mut tx, options.idempotency, &fingerprint, &result, now)?;
             tx.commit()?;
             return Ok(result);
         }
@@ -1826,7 +1986,7 @@ impl Store {
         let (revision, _) = site_revision_locked(&mut tx, name)?;
         prune_undo_locked(&mut tx, now)?;
         let result = MutationResult {
-            created: created_paths > 0,
+            created: created_paths == changed_paths.len(),
             changed: true,
             replayed: false,
             files: changed_paths.len(),
@@ -1835,19 +1995,11 @@ impl Store {
             undo: Some(undo),
             sanitized: TokenCounts::default(),
         };
-        if let Some(idempotency) = options.idempotency {
-            store_idempotency(
-                &mut tx,
-                &idempotency.key,
-                &fingerprint,
-                IdempotencyKind::AliasMutation,
-                &PublishedMutation {
-                    name: name.to_string(),
-                    mutation: result.clone(),
-                },
-                now,
-            )?;
-        }
+        let result = AliasMutationResult {
+            aliases: load_requested_aliases_locked(&mut tx, site_id, requested.keys())?,
+            mutation: result,
+        };
+        store_alias_mutation(&mut tx, options.idempotency, &fingerprint, &result, now)?;
         tx.commit()?;
         Ok(result)
     }
@@ -1963,6 +2115,35 @@ impl Store {
         Ok(bytes)
     }
 
+    pub fn allocated_media_type(
+        &self,
+        name: &str,
+        rel: &str,
+    ) -> Result<Option<String>, StoreError> {
+        let name = parse_site_name(name)?;
+        let rel = normalize_rel(rel)?;
+        let mut db = self.inner.readers.get();
+        let site_id = site_id_locked(&mut db, name)?;
+        let direct = allocated_entries::table
+            .find((site_id, rel.as_str()))
+            .select(allocated_entries::media_type)
+            .first::<String>(&mut *db)
+            .optional()?;
+        if direct.is_some() {
+            return Ok(direct);
+        }
+        let (resolution, physical, used_alias) = resolve_db_path_final(&mut db, site_id, &rel)?;
+        if !used_alias || !matches!(resolution, GraphResolution::File(_)) {
+            return Ok(None);
+        }
+        allocated_entries::table
+            .find((site_id, physical))
+            .select(allocated_entries::media_type)
+            .first::<String>(&mut *db)
+            .optional()
+            .map_err(StoreError::from)
+    }
+
     pub fn site_references_blob(&self, name: &str, hash: &str) -> Result<bool, StoreError> {
         let name = parse_site_name(name)?;
         let mut db = self.inner.readers.get();
@@ -1996,12 +2177,24 @@ impl Store {
         let tmp = self.tmp_dir(wanted.unwrap_or("upload"));
         fs::create_dir_all(&tmp)?;
         let result = (|| {
-            write_payload_file(&tmp, source, kind, filename, true)?;
+            let plan = plan_archive(source, kind)?;
+            if plan
+                .members
+                .iter()
+                .any(|member| matches!(member, ArchiveMember::File { .. }))
+            {
+                write_payload_file(&tmp, source, kind, filename, true)?;
+            }
             let staged = stage_dir(&tmp)?;
-            if staged.is_empty() {
+            if staged.is_empty()
+                && !plan
+                    .members
+                    .iter()
+                    .any(|member| matches!(member, ArchiveMember::Alias { .. }))
+            {
                 return Err(StoreError::Upload(UploadError::EmptyArchive));
             }
-            self.publish_staged(wanted, &staged, options)
+            self.publish_archive_staged(wanted, &staged, &plan, options)
         })();
         let _ = fs::remove_dir_all(tmp);
         result
@@ -2176,6 +2369,7 @@ impl Store {
             &current_path,
             &staged.hash,
             None,
+            options.expected_tree_hash,
             UndoKind::Replace,
         );
         if let Some(replay) = self.replay_content_request(name, options, &request_fingerprint)? {
@@ -2203,22 +2397,78 @@ impl Store {
         spec: PendingAllocationSpec<'_>,
         authorization: Option<&ManagementToken>,
     ) -> Result<PendingAllocation, StoreError> {
+        self.propose_allocation_idempotent(
+            name,
+            source,
+            spec,
+            FileMutationOptions {
+                authorization,
+                ..FileMutationOptions::default()
+            },
+        )
+    }
+
+    pub fn propose_allocation_idempotent(
+        &self,
+        name: &str,
+        source: AllocationSource<'_>,
+        spec: PendingAllocationSpec<'_>,
+        options: FileMutationOptions<'_>,
+    ) -> Result<PendingAllocation, StoreError> {
         let name = parse_site_name(name)?;
         let staged = self.stage_allocation_source(source, "")?;
         reject_staged_secrets(&staged)?;
         let folder = normalize_folder(spec.folder)?;
         let media_type = normalize_media_type(spec.media_type)?;
+        let extension = spec
+            .extension
+            .map(normalize_allocated_extension)
+            .transpose()?;
+        let expiry = validate_file_expiry(options.expiry)?;
+        let authorization_hash = options.authorization.map(authorization_fingerprint);
+        let request_fingerprint = pending_fingerprint(&PendingFingerprint {
+            site: name,
+            folder: &folder,
+            hash: &staged.hash,
+            content_size: staged.size.cast_unsigned(),
+            media_type: &media_type,
+            expiry,
+            authorization_hash: authorization_hash.as_deref(),
+            extension: extension.as_deref(),
+            expected_tree_hash: options.expected_tree_hash,
+        });
         let now = self.now_millis();
         let expires = now + PENDING_RETENTION_MILLIS;
-        let token = undo_token()?;
         self.run_before_content_commit();
         let mut db = self.inner.writer.lock().unwrap();
         let mut tx = DbTransaction::begin(&mut db)?;
-        authorize_locked(&mut tx, name, authorization)?;
+        authorize_locked(&mut tx, name, options.authorization)?;
         let site_id = site_id_locked(&mut tx, name)?;
-        self.materialize(&staged)?;
+        prune_idempotency_locked(&mut tx, now)?;
         prune_pending_locked(&mut tx, now)?;
+        if let Some(replay) = pending_allocation_replay(
+            &mut tx,
+            options.idempotency,
+            &request_fingerprint,
+            site_id,
+            now,
+        )? {
+            tx.commit()?;
+            return Ok(replay);
+        }
+        check_tree_precondition(&mut tx, name, options.expected_tree_hash)?;
+        let token = undo_token()?;
+        self.materialize(&staged)?;
         ensure_blob_locked(&mut tx, &staged)?;
+        let request_metadata = serde_json::to_string(&PendingRequestMetadata {
+            request_fingerprint: request_fingerprint.clone(),
+            expiry,
+            authorization_hash,
+            extension: extension.clone(),
+            expected_tree_hash: options.expected_tree_hash.map(str::to_string),
+            legacy_fingerprint: false,
+        })
+        .map_err(|error| StoreError::Io(io::Error::new(io::ErrorKind::InvalidData, error)))?;
         diesel::insert_into(pending_allocations::table)
             .values((
                 pending_allocations::token.eq(&token),
@@ -2227,27 +2477,34 @@ impl Store {
                 pending_allocations::hash.eq(&staged.hash),
                 pending_allocations::size.eq(staged.size),
                 pending_allocations::media_type.eq(&media_type),
-                pending_allocations::request_fingerprint.eq(pending_fingerprint(
-                    name,
-                    &folder,
-                    &staged.hash,
-                    staged.size.cast_unsigned(),
-                    &media_type,
-                )),
+                pending_allocations::request_fingerprint.eq(request_metadata),
                 pending_allocations::created.eq(now),
                 pending_allocations::expires.eq(expires),
             ))
             .execute(&mut *tx)?;
-        tx.commit()?;
-        drop(db);
-        Ok(PendingAllocation {
+        let (content_revision, tree_hash) = site_revision_locked(&mut tx, name)?;
+        let result = PendingAllocation {
             token,
             folder,
             hash: staged.hash.clone(),
             size: staged.size.cast_unsigned(),
             media_type,
+            extension,
             expires_at: format_timestamp(expires),
-        })
+            tree_hash,
+            content_revision,
+            replayed: false,
+        };
+        store_pending_allocation(
+            &mut tx,
+            options.idempotency,
+            &request_fingerprint,
+            &result,
+            now,
+        )?;
+        tx.commit()?;
+        drop(db);
+        Ok(result)
     }
 
     pub fn finalize_allocation(
@@ -2257,7 +2514,13 @@ impl Store {
         naming: AllocatedName<'_>,
         options: FileMutationOptions<'_>,
     ) -> Result<AllocatedFile, StoreError> {
-        self.finalize_pending(name, token, PendingFinalName::Generated(naming), options)
+        self.finalize_pending(
+            name,
+            token,
+            None,
+            PendingFinalName::Generated(naming),
+            options,
+        )
     }
 
     pub fn finalize_allocation_custom(
@@ -2267,13 +2530,38 @@ impl Store {
         basename: &str,
         options: FileMutationOptions<'_>,
     ) -> Result<AllocatedFile, StoreError> {
-        self.finalize_pending(name, token, PendingFinalName::Custom(basename), options)
+        self.finalize_pending(
+            name,
+            token,
+            None,
+            PendingFinalName::Custom(basename),
+            options,
+        )
     }
 
+    pub fn finalize_allocation_custom_in_folder(
+        &self,
+        name: &str,
+        token: &str,
+        folder: &str,
+        basename: &str,
+        options: FileMutationOptions<'_>,
+    ) -> Result<AllocatedFile, StoreError> {
+        self.finalize_pending(
+            name,
+            token,
+            Some(folder),
+            PendingFinalName::Custom(basename),
+            options,
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
     fn finalize_pending(
         &self,
         name: &str,
         token: &str,
+        expected_folder: Option<&str>,
         final_name: PendingFinalName<'_>,
         options: FileMutationOptions<'_>,
     ) -> Result<AllocatedFile, StoreError> {
@@ -2282,7 +2570,17 @@ impl Store {
         let mut db = self.inner.writer.lock().unwrap();
         let mut tx = DbTransaction::begin(&mut db)?;
         authorize_locked(&mut tx, name, options.authorization)?;
-        let finalize_fingerprint = pending_finalize_fingerprint(name, token, final_name);
+        let expected_folder = expected_folder.map(normalize_folder).transpose()?;
+        let authorization_hash = options.authorization.map(authorization_fingerprint);
+        let finalize_fingerprint = pending_finalize_fingerprint(&PendingFinalizeFingerprint {
+            site: name,
+            token,
+            folder: expected_folder.as_deref(),
+            final_name,
+            expiry: options.expiry,
+            authorization_hash: authorization_hash.as_deref(),
+            expected_tree_hash: options.expected_tree_hash,
+        });
         prune_idempotency_locked(&mut tx, now)?;
         if let Some(replay) =
             entry_mutation_replay(&mut tx, options.idempotency, &finalize_fingerprint)?
@@ -2304,25 +2602,70 @@ impl Store {
             ))
             .first::<(String, String, i64, String, String)>(&mut *tx)
             .optional()?
-            .map(|row| PendingMetadata {
-                folder: row.0,
-                hash: row.1,
-                size: row.2,
-                media_type: row.3,
-                request_fingerprint: row.4,
+            .map(|row| {
+                let request = parse_pending_request_metadata(&row.4)?;
+                Ok::<_, StoreError>(PendingMetadata {
+                    folder: row.0,
+                    hash: row.1,
+                    size: row.2,
+                    media_type: row.3,
+                    request_fingerprint: request.request_fingerprint,
+                    expiry: request.expiry,
+                    authorization_hash: request.authorization_hash,
+                    extension: request.extension,
+                    expected_tree_hash: request.expected_tree_hash,
+                    legacy_fingerprint: request.legacy_fingerprint,
+                })
             })
+            .transpose()?
             .ok_or(StoreError::InvalidPendingAllocation)?;
-        if pending.request_fingerprint
-            != pending_fingerprint(
+        if expected_folder
+            .as_deref()
+            .is_some_and(|expected| expected != pending.folder)
+        {
+            return Err(StoreError::InvalidPendingAllocation);
+        }
+        let expected_pending_fingerprint = if pending.legacy_fingerprint {
+            legacy_pending_fingerprint(
                 name,
                 &pending.folder,
                 &pending.hash,
                 pending.size.cast_unsigned(),
                 &pending.media_type,
             )
-        {
+        } else {
+            pending_fingerprint(&PendingFingerprint {
+                site: name,
+                folder: &pending.folder,
+                hash: &pending.hash,
+                content_size: pending.size.cast_unsigned(),
+                media_type: &pending.media_type,
+                expiry: pending.expiry,
+                authorization_hash: pending.authorization_hash.as_deref(),
+                extension: pending.extension.as_deref(),
+                expected_tree_hash: pending.expected_tree_hash.as_deref(),
+            })
+        };
+        if pending.request_fingerprint != expected_pending_fingerprint {
             return Err(StoreError::InvalidPendingAllocation);
         }
+        if !pending.legacy_fingerprint && pending.authorization_hash != authorization_hash {
+            return Err(StoreError::Unauthorized);
+        }
+        if pending.expiry != FileExpiry::Preserve
+            && options.expiry != FileExpiry::Preserve
+            && options.expiry != pending.expiry
+        {
+            return Err(StoreError::IdempotencyConflict);
+        }
+        let options = FileMutationOptions {
+            expiry: validate_file_expiry(if pending.expiry == FileExpiry::Preserve {
+                options.expiry
+            } else {
+                pending.expiry
+            })?,
+            ..options
+        };
         let destination = match final_name {
             PendingFinalName::Generated(naming) => allocation_destination(
                 &pending.hash,
@@ -2375,26 +2718,135 @@ impl Store {
         token: &str,
         authorization: Option<&ManagementToken>,
     ) -> Result<(), StoreError> {
+        if self.cancel_allocation_in_folder(name, token, None, authorization)? {
+            Ok(())
+        } else {
+            Err(StoreError::InvalidPendingAllocation)
+        }
+    }
+
+    pub fn cancel_allocation_idempotent_for_folder(
+        &self,
+        name: &str,
+        token: &str,
+        folder: &str,
+        options: FileMutationOptions<'_>,
+    ) -> Result<AllocationCancellation, StoreError> {
         let name = parse_site_name(name)?;
+        let folder = normalize_folder(folder)?;
+        let authorization_hash = options.authorization.map(authorization_fingerprint);
+        let fingerprint = cancellation_fingerprint(
+            name,
+            token,
+            &folder,
+            options.expected_tree_hash,
+            authorization_hash.as_deref(),
+        );
         let now = self.now_millis();
         let mut db = self.inner.writer.lock().unwrap();
         let mut tx = DbTransaction::begin(&mut db)?;
-        authorize_locked(&mut tx, name, authorization)?;
+        authorize_locked(&mut tx, name, options.authorization)?;
+        prune_idempotency_locked(&mut tx, now)?;
+        if let Some(replay) = cancellation_replay(&mut tx, options.idempotency, &fingerprint)? {
+            return Ok(replay);
+        }
+        check_tree_precondition(&mut tx, name, options.expected_tree_hash)?;
         let site_id = site_id_locked(&mut tx, name)?;
+        let pending = pending_allocations::table
+            .find(token)
+            .select((
+                pending_allocations::site_id,
+                pending_allocations::folder,
+                pending_allocations::request_fingerprint,
+            ))
+            .first::<(i64, String, String)>(&mut *tx)
+            .optional()?
+            .ok_or(StoreError::InvalidPendingAllocation)?;
+        if pending.0 != site_id || pending.1 != folder {
+            return Err(StoreError::InvalidPendingAllocation);
+        }
+        let request = parse_pending_request_metadata(&pending.2)?;
+        if !request.legacy_fingerprint && request.authorization_hash != authorization_hash {
+            return Err(StoreError::Unauthorized);
+        }
         let deleted = diesel::delete(
             pending_allocations::table
                 .find(token)
                 .filter(pending_allocations::site_id.eq(site_id)),
         )
         .execute(&mut *tx)?;
-        if deleted == 0 {
+        if deleted != 1 {
             return Err(StoreError::InvalidPendingAllocation);
         }
+        let (revision, tree_hash) = sites::table
+            .find(site_id)
+            .select((sites::content_revision, sites::tree_hash))
+            .first::<(i64, String)>(&mut *tx)?;
+        let result = AllocationCancellation {
+            replayed: false,
+            tree_hash,
+            content_revision: revision.cast_unsigned(),
+        };
+        store_cancellation(&mut tx, options.idempotency, &fingerprint, &result, now)?;
         let removed = gc_blobs(&mut tx, now)?;
         tx.commit()?;
         drop(db);
         self.remove_blob_files(&removed);
-        Ok(())
+        Ok(result)
+    }
+
+    fn cancel_allocation_in_folder(
+        &self,
+        name: &str,
+        token: &str,
+        folder: Option<&str>,
+        authorization: Option<&ManagementToken>,
+    ) -> Result<bool, StoreError> {
+        let name = parse_site_name(name)?;
+        let folder = folder.map(normalize_folder).transpose()?;
+        let now = self.now_millis();
+        let mut db = self.inner.writer.lock().unwrap();
+        let mut tx = DbTransaction::begin(&mut db)?;
+        authorize_locked(&mut tx, name, authorization)?;
+        let site_id = site_id_locked(&mut tx, name)?;
+        let pending = pending_allocations::table
+            .find(token)
+            .select((
+                pending_allocations::site_id,
+                pending_allocations::folder,
+                pending_allocations::request_fingerprint,
+            ))
+            .first::<(i64, String, String)>(&mut *tx)
+            .optional()?;
+        let Some((stored_site_id, stored_folder, request_metadata)) = pending else {
+            return Ok(false);
+        };
+        if stored_site_id != site_id {
+            return Err(StoreError::InvalidPendingAllocation);
+        }
+        if folder
+            .as_deref()
+            .is_some_and(|expected| expected != stored_folder)
+        {
+            return Err(StoreError::InvalidPendingAllocation);
+        }
+        let request = parse_pending_request_metadata(&request_metadata)?;
+        if !request.legacy_fingerprint
+            && request.authorization_hash != authorization.map(authorization_fingerprint)
+        {
+            return Err(StoreError::Unauthorized);
+        }
+        diesel::delete(
+            pending_allocations::table
+                .find(token)
+                .filter(pending_allocations::site_id.eq(site_id)),
+        )
+        .execute(&mut *tx)?;
+        let removed = gc_blobs(&mut tx, now)?;
+        tx.commit()?;
+        drop(db);
+        self.remove_blob_files(&removed);
+        Ok(true)
     }
 
     pub fn prune_pending_allocations(&self) -> Result<usize, StoreError> {
@@ -2428,6 +2880,7 @@ impl Store {
             &path,
             &staged.hash,
             Some(base_hash),
+            options.expected_tree_hash,
             UndoKind::Replace,
         );
         if let Some(replay) = self.replay_content_request(name, options, &request_fingerprint)? {
@@ -2483,13 +2936,39 @@ impl Store {
         splices: &[Splice<'_>],
         options: FileMutationOptions<'_>,
     ) -> Result<AllocatedFile, StoreError> {
+        self.splice_file_with_limit(
+            name,
+            path,
+            base_hash,
+            splices,
+            options,
+            MAX_SPLICE_RESULT_SIZE,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn splice_file_with_limit(
+        &self,
+        name: &str,
+        path: &str,
+        base_hash: &str,
+        splices: &[Splice<'_>],
+        options: FileMutationOptions<'_>,
+        maximum_result_size: u64,
+    ) -> Result<AllocatedFile, StoreError> {
         let name = parse_site_name(name)?;
         let path = normalize_rel(path)?;
         reject_reserved_path(&path)?;
         let temporary = TemporaryDirectory::create(self.tmp_dir("splice"))?;
         let output = temporary.path().join("result");
-        let prepared = prepare_splices(splices, temporary.path(), MAX_SPLICE_RESULT_SIZE)?;
-        let request_fingerprint = splice_request_fingerprint(name, &path, base_hash, &prepared);
+        let prepared = prepare_splices(splices, temporary.path(), maximum_result_size)?;
+        let request_fingerprint = splice_request_fingerprint(
+            name,
+            &path,
+            base_hash,
+            &prepared,
+            options.expected_tree_hash,
+        );
         if let Some(replay) = self.replay_content_request(name, options, &request_fingerprint)? {
             return Ok(replay);
         }
@@ -2513,6 +2992,7 @@ impl Store {
             old_size,
             &prepared,
             &output,
+            maximum_result_size,
         )?;
         let staged = StagedFile {
             path: path.clone(),
@@ -3056,12 +3536,49 @@ impl Store {
         files: &[StagedFile],
         options: PublishOptions<'_>,
     ) -> Result<(String, MutationResult), StoreError> {
+        self.publish_staged_entries(wanted, files, &[], options)
+    }
+
+    #[allow(clippy::large_types_passed_by_value)]
+    fn publish_archive_staged(
+        &self,
+        wanted: Option<&str>,
+        files: &[StagedFile],
+        plan: &ArchivePlan,
+        options: PublishOptions<'_>,
+    ) -> Result<(String, MutationResult), StoreError> {
+        let aliases = plan
+            .members
+            .iter()
+            .filter_map(|member| match member {
+                ArchiveMember::Alias {
+                    path,
+                    canonical_target,
+                } => Some(ArchiveAlias {
+                    path: path.as_str(),
+                    target: canonical_target.as_str(),
+                }),
+                ArchiveMember::File { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        self.publish_staged_entries(wanted, files, &aliases, options)
+    }
+
+    #[allow(clippy::large_types_passed_by_value)]
+    fn publish_staged_entries(
+        &self,
+        wanted: Option<&str>,
+        files: &[StagedFile],
+        archive_aliases: &[ArchiveAlias<'_>],
+        options: PublishOptions<'_>,
+    ) -> Result<(String, MutationResult), StoreError> {
         let wanted = wanted.filter(|name| !name.is_empty());
         if let Some(name) = wanted {
             let name = parse_site_name(name)?.to_string();
-            let mutation = self.merge_staged_conditional(
+            let mutation = self.merge_staged_entries_conditional(
                 &name,
                 files,
+                archive_aliases,
                 UndoKind::Put,
                 options.expected_tree_hash,
                 options.creation,
@@ -3079,13 +3596,13 @@ impl Store {
             .iter()
             .filter(|file| file.path != MANIFEST_PATH)
             .collect::<Vec<_>>();
-        if files.is_empty() {
+        if files.is_empty() && archive_aliases.is_empty() {
             return Err(StoreError::Upload(UploadError::EmptyArchive));
         }
         for file in &files {
             reject_reserved_path(&file.path)?;
         }
-        let fingerprint = staged_fingerprint(&files);
+        let fingerprint = staged_entries_fingerprint(&files, archive_aliases);
         let now = self.now_millis();
         let mut db = self.inner.writer.lock().unwrap();
         let mut tx = DbTransaction::begin(&mut db)?;
@@ -3117,6 +3634,7 @@ impl Store {
                 now,
                 creation: options.creation,
                 authorization: None,
+                archive_aliases,
             },
         )?;
         let published = PublishedMutation {
@@ -3159,11 +3677,33 @@ impl Store {
         creation: CreationSecurity,
         authorization: Option<&ManagementToken>,
     ) -> Result<MutationResult, StoreError> {
+        self.merge_staged_entries_conditional(
+            name,
+            files,
+            &[],
+            kind,
+            expected_tree_hash,
+            creation,
+            authorization,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn merge_staged_entries_conditional(
+        &self,
+        name: &str,
+        files: &[StagedFile],
+        archive_aliases: &[ArchiveAlias<'_>],
+        kind: UndoKind,
+        expected_tree_hash: Option<&str>,
+        creation: CreationSecurity,
+        authorization: Option<&ManagementToken>,
+    ) -> Result<MutationResult, StoreError> {
         let files = files
             .iter()
             .filter(|file| file.path != MANIFEST_PATH)
             .collect::<Vec<_>>();
-        if files.is_empty() {
+        if files.is_empty() && archive_aliases.is_empty() {
             return Err(StoreError::Upload(UploadError::EmptyArchive));
         }
         for file in &files {
@@ -3182,6 +3722,7 @@ impl Store {
                 now,
                 creation,
                 authorization,
+                archive_aliases,
             },
         )?;
         let removed = gc_blobs(&mut tx, now)?;
@@ -3205,6 +3746,7 @@ impl Store {
             now,
             creation,
             authorization,
+            archive_aliases,
         } = context;
         let existed = site_exists_locked(tx, name)?;
         if existed {
@@ -3235,6 +3777,7 @@ impl Store {
                 files.iter().map(|file| file.path.as_str()),
                 false,
             )?;
+            validate_archive_alias_conflicts_locked(tx, site_id, archive_aliases)?;
         }
         let mut changed = false;
         for file in files {
@@ -3249,13 +3792,25 @@ impl Store {
             };
             changed |= current.as_deref() != Some(file.hash.as_str());
         }
+        if let Some(site_id) = existing_site_id {
+            for alias in archive_aliases {
+                let current = aliases::table
+                    .find((site_id, alias.path))
+                    .select(aliases::canonical_target)
+                    .first::<String>(tx)
+                    .optional()?;
+                changed |= current.as_deref() != Some(alias.target);
+            }
+        } else {
+            changed |= !archive_aliases.is_empty();
+        }
         if !changed {
             let (revision, tree_hash) = site_revision_locked(tx, name)?;
             return Ok(MutationResult {
                 created: false,
                 changed: false,
                 replayed: false,
-                files: files.len(),
+                files: files.len() + archive_aliases.len(),
                 revision,
                 tree_hash,
                 undo: None,
@@ -3263,7 +3818,7 @@ impl Store {
             });
         }
         if let Some(site_id) = existing_site_id {
-            validate_alias_graph_with_staged(tx, site_id, files)?;
+            validate_alias_graph_with_staged(tx, site_id, files, archive_aliases)?;
         }
         for file in files {
             self.materialize(file)?;
@@ -3276,6 +3831,7 @@ impl Store {
         let changed_paths = files
             .iter()
             .map(|file| file.path.as_str())
+            .chain(archive_aliases.iter().map(|alias| alias.path))
             .collect::<Vec<_>>();
         let undo = if existed {
             snapshot_entry_deltas(tx, name, kind, &description, &changed_paths, now)?
@@ -3339,6 +3895,35 @@ impl Store {
                 i64::from(previous_size.is_none()),
             )?;
         }
+        for alias in archive_aliases {
+            diesel::insert_into(site_entries::table)
+                .values((
+                    site_entries::site_id.eq(site_id),
+                    site_entries::path.eq(alias.path),
+                    site_entries::kind.eq(database::schema::ALIAS_ENTRY_KIND),
+                ))
+                .on_conflict_do_nothing()
+                .execute(tx)?;
+            diesel::insert_into(aliases::table)
+                .values((
+                    aliases::site_id.eq(site_id),
+                    aliases::path.eq(alias.path),
+                    aliases::kind.eq(database::schema::ALIAS_ENTRY_KIND),
+                    aliases::canonical_target.eq(alias.target),
+                    aliases::resolved_kind.eq(Option::<i64>::None),
+                    aliases::resolved_hash.eq(Option::<String>::None),
+                    aliases::resolved_size.eq(Option::<i64>::None),
+                ))
+                .on_conflict((aliases::site_id, aliases::path))
+                .do_update()
+                .set((
+                    aliases::canonical_target.eq(excluded(aliases::canonical_target)),
+                    aliases::resolved_kind.eq(Option::<i64>::None),
+                    aliases::resolved_hash.eq(Option::<String>::None),
+                    aliases::resolved_size.eq(Option::<i64>::None),
+                ))
+                .execute(tx)?;
+        }
         let revision = if existed {
             sites::table
                 .find(site_id)
@@ -3357,7 +3942,7 @@ impl Store {
             created: !existed,
             changed: true,
             replayed: false,
-            files: files.len(),
+            files: files.len() + archive_aliases.len(),
             revision: revision.cast_unsigned(),
             tree_hash,
             undo: Some(undo),
@@ -3395,7 +3980,14 @@ impl Store {
         kind: UndoKind,
     ) -> Result<AllocatedFile, StoreError> {
         let now = self.now_millis();
-        let fingerprint = entry_mutation_fingerprint(name, Some(path), path, &staged.hash, kind);
+        let fingerprint = entry_mutation_fingerprint(
+            name,
+            Some(path),
+            path,
+            &staged.hash,
+            kind,
+            options.expected_tree_hash,
+        );
         let computed_request_fingerprint;
         let request_fingerprint = if let Some(request_fingerprint) = request_fingerprint {
             request_fingerprint
@@ -3405,6 +3997,7 @@ impl Store {
                 path,
                 &staged.hash,
                 expected_content_hash,
+                options.expected_tree_hash,
                 kind,
             );
             &computed_request_fingerprint
@@ -3431,13 +4024,23 @@ impl Store {
             return Err(StoreError::StaleContentHash(current_hash));
         }
         if current_hash == staged.hash {
+            let (revision, tree_hash) = site_revision_locked(&mut tx, name)?;
             let result = AllocatedFile {
                 path: path.to_string(),
                 hash: current_hash,
                 size: current_size.cast_unsigned(),
                 changed: false,
                 replayed: false,
-                mutation: None,
+                mutation: Some(MutationResult {
+                    created: false,
+                    changed: false,
+                    replayed: false,
+                    files: 1,
+                    revision,
+                    tree_hash,
+                    undo: None,
+                    sanitized: TokenCounts::default(),
+                }),
             };
             store_entry_mutation_with_request(
                 &mut tx,
@@ -3518,13 +4121,19 @@ impl Store {
         kind: UndoKind,
     ) -> Result<AllocatedFile, StoreError> {
         let now = self.now_millis();
-        let fingerprint = allocated_entry_mutation_fingerprint(
+        let options = FileMutationOptions {
+            expiry: validate_file_expiry(options.expiry)?,
+            ..options
+        };
+        let fingerprint = allocated_entry_mutation_fingerprint(&AllocatedEntryFingerprint {
             name,
             current_path,
             destination,
-            &staged.hash,
+            hash: &staged.hash,
             kind,
-        );
+            expiry: options.expiry,
+            expected_tree_hash: options.expected_tree_hash,
+        });
         let computed_request_fingerprint;
         let request_fingerprint = if let Some(request_fingerprint) = request_fingerprint {
             request_fingerprint
@@ -3534,6 +4143,7 @@ impl Store {
                 current_path.unwrap_or(""),
                 &staged.hash,
                 expected_content_hash,
+                options.expected_tree_hash,
                 kind,
             );
             &computed_request_fingerprint
@@ -3597,7 +4207,7 @@ impl Store {
         destination: &AllocationDestination,
         staged: &StagedFile,
         expected_content_hash: Option<&str>,
-        _options: FileMutationOptions<'_>,
+        options: FileMutationOptions<'_>,
         kind: UndoKind,
         now: i64,
     ) -> Result<AllocatedFile, StoreError> {
@@ -3619,13 +4229,23 @@ impl Store {
                 return Err(StoreError::StaleContentHash(current_hash));
             }
             if current_hash == staged.hash {
+                let (revision, tree_hash) = site_revision_locked(tx, name)?;
                 return Ok(AllocatedFile {
                     path: current_path.to_string(),
                     hash: current_hash,
                     size: current_size.cast_unsigned(),
                     changed: false,
                     replayed: false,
-                    mutation: None,
+                    mutation: Some(MutationResult {
+                        created: false,
+                        changed: false,
+                        replayed: false,
+                        files: 1,
+                        revision,
+                        tree_hash,
+                        undo: None,
+                        sanitized: TokenCounts::default(),
+                    }),
                 });
             }
         }
@@ -3657,13 +4277,61 @@ impl Store {
         if current_path.is_none()
             && let Some(size) = reused_size
         {
+            if file_expiry_change_required(tx, site_id, &destination.path, options.expiry)? {
+                let changed_paths = [destination.path.as_str()];
+                let undo = snapshot_entry_deltas(
+                    tx,
+                    name,
+                    kind,
+                    &format!("restore previous allocated entry in {name}"),
+                    &changed_paths,
+                    now,
+                )?;
+                apply_file_expiry(
+                    tx,
+                    site_id,
+                    &destination.path,
+                    size.cast_unsigned(),
+                    options.expiry,
+                    now,
+                )?;
+                finish_entry_mutation(tx, &self.inner.blob_files, site_id, &changed_paths, now)?;
+                let (revision, tree_hash) = site_revision_locked(tx, name)?;
+                return Ok(AllocatedFile {
+                    path: destination.path.clone(),
+                    hash: staged.hash.clone(),
+                    size: size.cast_unsigned(),
+                    changed: true,
+                    replayed: false,
+                    mutation: Some(MutationResult {
+                        created: false,
+                        changed: true,
+                        replayed: false,
+                        files: 1,
+                        revision,
+                        tree_hash,
+                        undo: Some(undo),
+                        sanitized: TokenCounts::default(),
+                    }),
+                });
+            }
+            let (revision, tree_hash) = site_revision_locked(tx, name)?;
             return Ok(AllocatedFile {
                 path: destination.path.clone(),
                 hash: staged.hash.clone(),
                 size: size.cast_unsigned(),
                 changed: false,
                 replayed: false,
-                mutation: None,
+                mutation: Some(MutationResult {
+                    created: false,
+                    changed: false,
+                    replayed: false,
+                    files: 1,
+                    revision,
+                    tree_hash,
+                    undo: None,
+                    sanitized: TokenCounts::default(),
+                }),
             });
         }
         let mut changed_paths = Vec::with_capacity(2);
@@ -3721,6 +4389,14 @@ impl Store {
                 .execute(tx)?;
             adjust_aggregates_locked(tx, site_id, &destination.path, staged.size, 1)?;
         }
+        apply_file_expiry(
+            tx,
+            site_id,
+            &destination.path,
+            reused_size.unwrap_or(staged.size).cast_unsigned(),
+            options.expiry,
+            now,
+        )?;
         finish_entry_mutation(tx, &self.inner.blob_files, site_id, &changed_paths, now)?;
         let (revision, tree_hash) = site_revision_locked(tx, name)?;
         Ok(AllocatedFile {
@@ -3766,17 +4442,18 @@ impl Store {
                 sanitized: TokenCounts::default(),
             }),
             AllocationSource::File(source) => {
-                let temporary = self.tmp_dir("source");
-                fs::create_dir_all(&temporary)?;
-                let copied = temporary.join("content");
+                let temporary = TemporaryDirectory::create(self.tmp_dir("source"))?;
+                let copied = temporary.path().join("content");
                 let mut input = fs::File::open(source)?;
                 let mut output = fs::File::create(&copied)?;
                 let mut hasher = blake3::Hasher::new();
                 let size = copy_all_hashed(&mut input, &mut output, &mut hasher)?;
                 output.sync_all()?;
+                let size = i64::try_from(size).map_err(|_| StoreError::SpliceResultTooLarge)?;
+                temporary.persist();
                 Ok(StagedFile {
                     path: path.to_string(),
-                    size: i64::try_from(size).map_err(|_| StoreError::SpliceResultTooLarge)?,
+                    size,
                     hash: hasher.finalize().to_hex().to_string(),
                     source: StagedSource::Temporary(copied),
                     sanitized: TokenCounts::default(),
@@ -4745,6 +5422,8 @@ enum IdempotencyKind {
     AutoCopy = 2,
     EntryMutation = 3,
     AliasMutation = 4,
+    PendingAllocation = 5,
+    AllocationCancellation = 6,
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -4768,6 +5447,13 @@ struct MergeContext<'a> {
     now: i64,
     creation: CreationSecurity,
     authorization: Option<&'a ManagementToken>,
+    archive_aliases: &'a [ArchiveAlias<'a>],
+}
+
+#[derive(Clone, Copy)]
+struct ArchiveAlias<'a> {
+    path: &'a str,
+    target: &'a str,
 }
 
 struct SiteSnapshot {
@@ -4944,17 +5630,52 @@ fn join_folder(folder: &str, basename: &str) -> String {
 
 fn normalize_media_type(media_type: &str) -> Result<String, StoreError> {
     let media_type = media_type.trim();
-    if media_type.is_empty()
-        || media_type
-            .bytes()
-            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
-    {
-        return Err(StoreError::InvalidAllocatedName);
-    }
-    Ok(media_type.to_ascii_lowercase())
+    media_type
+        .parse::<mime_guess::mime::Mime>()
+        .map(|media_type| media_type.to_string())
+        .map_err(|_| StoreError::InvalidAllocatedName)
 }
 
-fn pending_fingerprint(
+fn pending_fingerprint(input: &PendingFingerprint<'_>) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"symbol-pending-allocation-v1\0");
+    for value in [input.site, input.folder, input.hash, input.media_type] {
+        hasher.update(&(value.len() as u64).to_le_bytes());
+        hasher.update(value.as_bytes());
+    }
+    hasher.update(&input.content_size.to_le_bytes());
+    hash_file_expiry(&mut hasher, input.expiry);
+    hasher.update(input.authorization_hash.unwrap_or("").as_bytes());
+    for value in [
+        input.extension.unwrap_or(""),
+        input.expected_tree_hash.unwrap_or(""),
+    ] {
+        hasher.update(&(value.len() as u64).to_le_bytes());
+        hasher.update(value.as_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn parse_pending_request_metadata(value: &str) -> Result<PendingRequestMetadata, StoreError> {
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Ok(PendingRequestMetadata {
+            request_fingerprint: value.to_string(),
+            expiry: FileExpiry::Preserve,
+            authorization_hash: None,
+            extension: None,
+            expected_tree_hash: None,
+            legacy_fingerprint: true,
+        });
+    }
+    serde_json::from_str(value)
+        .map_err(|error| StoreError::Io(io::Error::new(io::ErrorKind::InvalidData, error)))
+}
+
+fn legacy_pending_fingerprint(
     site: &str,
     folder: &str,
     hash: &str,
@@ -4971,18 +5692,84 @@ fn pending_fingerprint(
     hasher.finalize().to_hex().to_string()
 }
 
-fn pending_finalize_fingerprint(
+fn validate_file_expiry(expiry: FileExpiry) -> Result<FileExpiry, StoreError> {
+    match expiry {
+        FileExpiry::Policy(policy) => policy
+            .validate()
+            .map(FileExpiry::Policy)
+            .map_err(Into::into),
+        FileExpiry::Preserve | FileExpiry::Clear => Ok(expiry),
+    }
+}
+
+fn hash_file_expiry(hasher: &mut blake3::Hasher, expiry: FileExpiry) {
+    match expiry {
+        FileExpiry::Preserve => {
+            hasher.update(&[0]);
+        }
+        FileExpiry::Clear => {
+            hasher.update(&[1]);
+        }
+        FileExpiry::Policy(ExpiryPolicy::Relative { duration_seconds }) => {
+            hasher.update(&[2]);
+            hasher.update(&duration_seconds.to_le_bytes());
+        }
+        FileExpiry::Policy(ExpiryPolicy::Absolute {
+            deadline_unix_seconds,
+        }) => {
+            hasher.update(&[3]);
+            hasher.update(&deadline_unix_seconds.to_le_bytes());
+        }
+        FileExpiry::Policy(ExpiryPolicy::Decay(policy)) => {
+            hasher.update(&[4]);
+            hasher.update(&policy.min_age_seconds.to_le_bytes());
+            hasher.update(&policy.max_age_seconds.to_le_bytes());
+            hasher.update(&policy.max_size_bytes.to_le_bytes());
+            hasher.update(&policy.power.to_bits().to_le_bytes());
+        }
+    }
+}
+
+fn authorization_fingerprint(token: &ManagementToken) -> String {
+    let mut encoded = String::with_capacity(64);
+    for byte in token.hash().as_bytes() {
+        write!(encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    encoded
+}
+
+fn cancellation_fingerprint(
     site: &str,
     token: &str,
-    final_name: PendingFinalName<'_>,
+    folder: &str,
+    expected_tree_hash: Option<&str>,
+    authorization_hash: Option<&str>,
 ) -> String {
     let mut hasher = blake3::Hasher::new();
+    hasher.update(b"symbol-allocation-cancellation-v1\0");
+    for value in [
+        site,
+        token,
+        folder,
+        expected_tree_hash.unwrap_or(""),
+        authorization_hash.unwrap_or(""),
+    ] {
+        hasher.update(&(value.len() as u64).to_le_bytes());
+        hasher.update(value.as_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn pending_finalize_fingerprint(input: &PendingFinalizeFingerprint<'_>) -> String {
+    let mut hasher = blake3::Hasher::new();
     hasher.update(b"symbol-pending-finalize-v1\0");
-    hasher.update(site.as_bytes());
+    hasher.update(input.site.as_bytes());
     hasher.update(&[0]);
-    hasher.update(token.as_bytes());
+    hasher.update(input.token.as_bytes());
     hasher.update(&[0]);
-    match final_name {
+    hasher.update(input.folder.unwrap_or("").as_bytes());
+    hasher.update(&[0]);
+    match input.final_name {
         PendingFinalName::Generated(naming) => {
             hasher.update(&[1]);
             for value in [naming.prefix, naming.suffix, naming.extension.unwrap_or("")] {
@@ -4995,6 +5782,9 @@ fn pending_finalize_fingerprint(
             hasher.update(basename.as_bytes());
         }
     }
+    hash_file_expiry(&mut hasher, input.expiry);
+    hasher.update(input.authorization_hash.unwrap_or("").as_bytes());
+    hasher.update(input.expected_tree_hash.unwrap_or("").as_bytes());
     hasher.finalize().to_hex().to_string()
 }
 
@@ -5112,6 +5902,15 @@ fn normalize_extension(extension: &str) -> Result<String, StoreError> {
     } else {
         Ok(normalized)
     }
+}
+
+pub fn normalize_allocated_extension(extension: &str) -> Result<String, StoreError> {
+    normalize_extension(extension)
+}
+
+pub fn validate_mutation_target(path: &str) -> Result<(), StoreError> {
+    let path = normalize_folder(path)?;
+    reject_reserved_path(&path)
 }
 
 fn reject_staged_secrets(staged: &StagedFile) -> Result<(), StoreError> {
@@ -5296,6 +6095,7 @@ fn splice_request_fingerprint(
     path: &str,
     base_hash: &str,
     splices: &[PreparedSplice],
+    expected_tree_hash: Option<&str>,
 ) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"symbol-splice-request-v1\0");
@@ -5303,6 +6103,7 @@ fn splice_request_fingerprint(
         hasher.update(&(value.len() as u64).to_le_bytes());
         hasher.update(value.as_bytes());
     }
+    hasher.update(expected_tree_hash.unwrap_or("").as_bytes());
     for splice in splices {
         hasher.update(&splice.offset.to_le_bytes());
         hasher.update(&splice.delete.to_le_bytes());
@@ -5330,6 +6131,7 @@ fn splice_blob_to_path(
     old_size: u64,
     splices: &[PreparedSplice],
     output: &Path,
+    maximum_result_size: u64,
 ) -> Result<(String, u64), StoreError> {
     let mut previous_end = 0_u64;
     let mut result_size = old_size;
@@ -5356,7 +6158,7 @@ fn splice_blob_to_path(
             .checked_sub(splice.delete)
             .and_then(|size| size.checked_add(insertion_size))
             .ok_or(StoreError::SpliceResultTooLarge)?;
-        if result_size > MAX_SPLICE_RESULT_SIZE {
+        if result_size > maximum_result_size {
             return Err(StoreError::SpliceResultTooLarge);
         }
     }
@@ -5424,11 +6226,17 @@ fn copy_all_hashed(
 }
 
 fn reject_reserved_path(path: &str) -> Result<(), StoreError> {
-    if is_reserved_path(path) {
+    if is_reserved_path(path) || is_virtual_namespace(path) {
         Err(StoreError::Upload(UploadError::ReservedPath))
     } else {
         Ok(())
     }
+}
+
+fn is_virtual_namespace(path: &str) -> bool {
+    path.split('/')
+        .next()
+        .is_some_and(|component| matches!(component, "FILES" | "UNDO" | "EXPIRES"))
 }
 
 fn canonical_alias_target(alias_path: &str, target: &str) -> Result<String, StoreError> {
@@ -5492,7 +6300,11 @@ fn looks_like_external_alias_target(target: &str) -> bool {
         .any(|scheme| lower.starts_with(scheme))
 }
 
-fn alias_mutation_fingerprint(name: &str, aliases: &BTreeMap<String, String>) -> String {
+fn alias_mutation_fingerprint(
+    name: &str,
+    aliases: &BTreeMap<String, String>,
+    expected_tree_hash: Option<&str>,
+) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"symbol-alias-mutation-v1\0");
     hasher.update(name.as_bytes());
@@ -5502,7 +6314,76 @@ fn alias_mutation_fingerprint(name: &str, aliases: &BTreeMap<String, String>) ->
         hasher.update(&(target.len() as u64).to_le_bytes());
         hasher.update(target.as_bytes());
     }
+    hasher.update(expected_tree_hash.unwrap_or("").as_bytes());
     hasher.finalize().to_hex().to_string()
+}
+
+fn load_requested_aliases_locked<'a>(
+    tx: &mut SqliteConnection,
+    site_id: i64,
+    paths: impl Iterator<Item = &'a String>,
+) -> Result<Vec<AliasEntry>, StoreError> {
+    let paths = paths.cloned().collect::<BTreeSet<_>>();
+    aliases::table
+        .filter(aliases::site_id.eq(site_id))
+        .select(AliasRow::as_select())
+        .order(aliases::path)
+        .load::<AliasRow>(tx)?
+        .into_iter()
+        .filter(|row| paths.contains(&row.path))
+        .map(alias_entry)
+        .collect()
+}
+
+fn alias_mutation_replay(
+    tx: &mut SqliteConnection,
+    idempotency: &Idempotency,
+    fingerprint: &str,
+) -> Result<Option<AliasMutationResult>, StoreError> {
+    validate_idempotency_key(&idempotency.key)?;
+    let record = idempotency_records::table
+        .find(idempotency_key_hash(&idempotency.key))
+        .select((
+            idempotency_records::fingerprint,
+            idempotency_records::operation_kind,
+            idempotency_records::result_metadata,
+        ))
+        .first::<(String, i64, String)>(tx)
+        .optional()?;
+    let Some((stored_fingerprint, kind, metadata)) = record else {
+        return Ok(None);
+    };
+    if stored_fingerprint != fingerprint || kind != IdempotencyKind::AliasMutation as i64 {
+        return Err(StoreError::IdempotencyConflict);
+    }
+    let mut result = serde_json::from_str::<AliasMutationResult>(&metadata)
+        .map_err(|error| StoreError::Io(io::Error::new(io::ErrorKind::InvalidData, error)))?;
+    result.mutation.replayed = true;
+    Ok(Some(result))
+}
+
+fn store_alias_mutation(
+    tx: &mut SqliteConnection,
+    idempotency: Option<&Idempotency>,
+    fingerprint: &str,
+    result: &AliasMutationResult,
+    now: i64,
+) -> Result<(), StoreError> {
+    let Some(idempotency) = idempotency else {
+        return Ok(());
+    };
+    let metadata = serde_json::to_string(result)
+        .map_err(|error| StoreError::Io(io::Error::new(io::ErrorKind::InvalidData, error)))?;
+    diesel::insert_into(idempotency_records::table)
+        .values((
+            idempotency_records::key_hash.eq(idempotency_key_hash(&idempotency.key)),
+            idempotency_records::fingerprint.eq(fingerprint),
+            idempotency_records::operation_kind.eq(IdempotencyKind::AliasMutation as i64),
+            idempotency_records::result_metadata.eq(metadata),
+            idempotency_records::expires.eq(now + IDEMPOTENCY_RETENTION_MILLIS),
+        ))
+        .execute(tx)?;
+    Ok(())
 }
 
 fn alias_entry(row: AliasRow) -> Result<AliasEntry, StoreError> {
@@ -5520,6 +6401,7 @@ fn alias_entry(row: AliasRow) -> Result<AliasEntry, StoreError> {
         resolved_kind,
         resolved_hash: row.resolved_hash,
         resolved_size: row.resolved_size.map(i64::cast_unsigned),
+        resolved_files: None,
     })
 }
 
@@ -5548,7 +6430,135 @@ fn idempotency_key_hash(key: &str) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
-fn staged_fingerprint(files: &[&StagedFile]) -> String {
+fn pending_allocation_replay(
+    tx: &mut SqliteConnection,
+    idempotency: Option<&Idempotency>,
+    fingerprint: &str,
+    site_id: i64,
+    now: i64,
+) -> Result<Option<PendingAllocation>, StoreError> {
+    let Some(idempotency) = idempotency else {
+        return Ok(None);
+    };
+    validate_idempotency_key(&idempotency.key)?;
+    let record = idempotency_records::table
+        .find(idempotency_key_hash(&idempotency.key))
+        .select((
+            idempotency_records::fingerprint,
+            idempotency_records::operation_kind,
+            idempotency_records::result_metadata,
+        ))
+        .first::<(String, i64, String)>(tx)
+        .optional()?;
+    let Some((stored_fingerprint, kind, metadata)) = record else {
+        return Ok(None);
+    };
+    if stored_fingerprint != fingerprint || kind != IdempotencyKind::PendingAllocation as i64 {
+        return Err(StoreError::IdempotencyConflict);
+    }
+    let mut result = serde_json::from_str::<PendingAllocation>(&metadata)
+        .map_err(|error| StoreError::Io(io::Error::new(io::ErrorKind::InvalidData, error)))?;
+    let exists = pending_allocations::table
+        .find(&result.token)
+        .filter(pending_allocations::site_id.eq(site_id))
+        .filter(pending_allocations::expires.gt(now))
+        .select(pending_allocations::token)
+        .first::<String>(tx)
+        .optional()?
+        .is_some();
+    if !exists {
+        return Err(StoreError::InvalidPendingAllocation);
+    }
+    result.replayed = true;
+    Ok(Some(result))
+}
+
+fn cancellation_replay(
+    tx: &mut SqliteConnection,
+    idempotency: Option<&Idempotency>,
+    fingerprint: &str,
+) -> Result<Option<AllocationCancellation>, StoreError> {
+    let Some(idempotency) = idempotency else {
+        return Ok(None);
+    };
+    validate_idempotency_key(&idempotency.key)?;
+    let record = idempotency_records::table
+        .find(idempotency_key_hash(&idempotency.key))
+        .select((
+            idempotency_records::fingerprint,
+            idempotency_records::operation_kind,
+            idempotency_records::result_metadata,
+        ))
+        .first::<(String, i64, String)>(tx)
+        .optional()?;
+    let Some((stored_fingerprint, stored_kind, metadata)) = record else {
+        return Ok(None);
+    };
+    if stored_fingerprint != fingerprint
+        || stored_kind != IdempotencyKind::AllocationCancellation as i64
+    {
+        return Err(StoreError::IdempotencyConflict);
+    }
+    let mut result = serde_json::from_str::<AllocationCancellation>(&metadata)
+        .map_err(|error| StoreError::Io(io::Error::new(io::ErrorKind::InvalidData, error)))?;
+    result.replayed = true;
+    Ok(Some(result))
+}
+
+fn store_cancellation(
+    tx: &mut SqliteConnection,
+    idempotency: Option<&Idempotency>,
+    fingerprint: &str,
+    result: &AllocationCancellation,
+    now: i64,
+) -> Result<(), StoreError> {
+    let Some(idempotency) = idempotency else {
+        return Ok(());
+    };
+    validate_idempotency_key(&idempotency.key)?;
+    let metadata = serde_json::to_string(result)
+        .map_err(|error| StoreError::Io(io::Error::new(io::ErrorKind::InvalidData, error)))?;
+    diesel::insert_into(idempotency_records::table)
+        .values((
+            idempotency_records::key_hash.eq(idempotency_key_hash(&idempotency.key)),
+            idempotency_records::fingerprint.eq(fingerprint),
+            idempotency_records::operation_kind.eq(IdempotencyKind::AllocationCancellation as i64),
+            idempotency_records::result_metadata.eq(metadata),
+            idempotency_records::expires.eq(now + IDEMPOTENCY_RETENTION_MILLIS),
+        ))
+        .execute(tx)?;
+    Ok(())
+}
+
+fn store_pending_allocation(
+    tx: &mut SqliteConnection,
+    idempotency: Option<&Idempotency>,
+    fingerprint: &str,
+    result: &PendingAllocation,
+    now: i64,
+) -> Result<(), StoreError> {
+    let Some(idempotency) = idempotency else {
+        return Ok(());
+    };
+    validate_idempotency_key(&idempotency.key)?;
+    let metadata = serde_json::to_string(result)
+        .map_err(|error| StoreError::Io(io::Error::new(io::ErrorKind::InvalidData, error)))?;
+    diesel::insert_into(idempotency_records::table)
+        .values((
+            idempotency_records::key_hash.eq(idempotency_key_hash(&idempotency.key)),
+            idempotency_records::fingerprint.eq(fingerprint),
+            idempotency_records::operation_kind.eq(IdempotencyKind::PendingAllocation as i64),
+            idempotency_records::result_metadata.eq(metadata),
+            idempotency_records::expires.eq(now + IDEMPOTENCY_RETENTION_MILLIS),
+        ))
+        .execute(tx)?;
+    Ok(())
+}
+
+fn staged_entries_fingerprint(
+    files: &[&StagedFile],
+    archive_aliases: &[ArchiveAlias<'_>],
+) -> String {
     let mut files = files.to_vec();
     files.sort_unstable_by(|left, right| left.path.cmp(&right.path));
     let mut hasher = blake3::Hasher::new();
@@ -5557,6 +6567,13 @@ fn staged_fingerprint(files: &[&StagedFile]) -> String {
         hasher.update(&(file.path.len() as u64).to_le_bytes());
         hasher.update(file.path.as_bytes());
         hasher.update(file.hash.as_bytes());
+    }
+    for alias in archive_aliases {
+        hasher.update(b"\0alias\0");
+        hasher.update(&(alias.path.len() as u64).to_le_bytes());
+        hasher.update(alias.path.as_bytes());
+        hasher.update(&(alias.target.len() as u64).to_le_bytes());
+        hasher.update(alias.target.as_bytes());
     }
     hasher.finalize().to_hex().to_string()
 }
@@ -5627,6 +6644,7 @@ fn entry_mutation_fingerprint(
     destination: &str,
     hash: &str,
     kind: UndoKind,
+    expected_tree_hash: Option<&str>,
 ) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"symbol-entry-mutation-v1\0");
@@ -5637,6 +6655,7 @@ fn entry_mutation_fingerprint(
     hasher.update(destination.as_bytes());
     hasher.update(&[0]);
     hasher.update(hash.as_bytes());
+    hasher.update(expected_tree_hash.unwrap_or("").as_bytes());
     hasher.update(&(kind as i64).to_le_bytes());
     hasher.finalize().to_hex().to_string()
 }
@@ -5646,6 +6665,7 @@ fn content_mutation_request_fingerprint(
     current_path: &str,
     hash: &str,
     expected_content_hash: Option<&str>,
+    expected_tree_hash: Option<&str>,
     kind: UndoKind,
 ) -> String {
     let mut hasher = blake3::Hasher::new();
@@ -5655,6 +6675,7 @@ fn content_mutation_request_fingerprint(
         current_path,
         hash,
         expected_content_hash.unwrap_or(""),
+        expected_tree_hash.unwrap_or(""),
     ] {
         hasher.update(&(value.len() as u64).to_le_bytes());
         hasher.update(value.as_bytes());
@@ -5663,30 +6684,26 @@ fn content_mutation_request_fingerprint(
     hasher.finalize().to_hex().to_string()
 }
 
-fn allocated_entry_mutation_fingerprint(
-    name: &str,
-    current_path: Option<&str>,
-    destination: &AllocationDestination,
-    hash: &str,
-    kind: UndoKind,
-) -> String {
+fn allocated_entry_mutation_fingerprint(input: &AllocatedEntryFingerprint<'_>) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"symbol-allocated-entry-mutation-v2\0");
     for value in [
-        name,
-        current_path.unwrap_or(""),
-        &destination.path,
-        hash,
-        &destination.prefix,
-        &destination.suffix,
-        destination.extension.as_deref().unwrap_or(""),
-        &destination.media_type,
+        input.name,
+        input.current_path.unwrap_or(""),
+        &input.destination.path,
+        input.hash,
+        &input.destination.prefix,
+        &input.destination.suffix,
+        input.destination.extension.as_deref().unwrap_or(""),
+        &input.destination.media_type,
     ] {
         hasher.update(&(value.len() as u64).to_le_bytes());
         hasher.update(value.as_bytes());
     }
-    hasher.update(&(destination.naming_mode as i64).to_le_bytes());
-    hasher.update(&(kind as i64).to_le_bytes());
+    hasher.update(&(input.destination.naming_mode as i64).to_le_bytes());
+    hasher.update(&(input.kind as i64).to_le_bytes());
+    hash_file_expiry(&mut hasher, input.expiry);
+    hasher.update(input.expected_tree_hash.unwrap_or("").as_bytes());
     hasher.finalize().to_hex().to_string()
 }
 
@@ -6604,7 +7621,13 @@ fn expiry_target_size_locked(
             {
                 size
             } else {
-                return Err(StoreError::NotFound);
+                let (resolved, _, used_alias) = resolve_db_path_final(db, site_id, rel)?;
+                match resolved {
+                    GraphResolution::File(file) if used_alias => file.size,
+                    GraphResolution::Missing
+                    | GraphResolution::Directory
+                    | GraphResolution::File(_) => return Err(StoreError::NotFound),
+                }
             }
         }
         ExpiryTargetKind::Folder => {
@@ -6747,6 +7770,50 @@ fn store_expiry_policy_locked(
             expiry_policies::size_bytes.eq(excluded(expiry_policies::size_bytes)),
         ))
         .execute(tx)?;
+    Ok(())
+}
+
+fn file_expiry_change_required(
+    tx: &mut SqliteConnection,
+    site_id: i64,
+    path: &str,
+    expiry: FileExpiry,
+) -> Result<bool, StoreError> {
+    let current = load_expiry_policy_locked(tx, site_id, path)?;
+    Ok(match expiry {
+        FileExpiry::Preserve => false,
+        FileExpiry::Clear => current.is_some(),
+        FileExpiry::Policy(policy) => current.is_none_or(|stored| stored.policy != policy),
+    })
+}
+
+fn apply_file_expiry(
+    tx: &mut SqliteConnection,
+    site_id: i64,
+    path: &str,
+    size: u64,
+    expiry: FileExpiry,
+    now: i64,
+) -> Result<(), StoreError> {
+    match expiry {
+        FileExpiry::Preserve => {}
+        FileExpiry::Clear => {
+            diesel::delete(expiry_policies::table.find((site_id, path))).execute(tx)?;
+        }
+        FileExpiry::Policy(policy) => {
+            store_expiry_policy_locked(
+                tx,
+                ExpiryPolicyWrite {
+                    site_id,
+                    path,
+                    kind: ExpiryTargetKind::File,
+                    policy,
+                    size,
+                    now,
+                },
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -7427,6 +8494,7 @@ fn validate_alias_graph_with_staged(
     tx: &mut SqliteConnection,
     site_id: i64,
     staged: &[&StagedFile],
+    archive_aliases: &[ArchiveAlias<'_>],
 ) -> Result<(), StoreError> {
     let mut real = load_real_entries(tx, site_id)?;
     for file in staged {
@@ -7438,12 +8506,17 @@ fn validate_alias_graph_with_staged(
             },
         );
     }
-    let graph = aliases::table
+    let mut graph = aliases::table
         .filter(aliases::site_id.eq(site_id))
         .select((aliases::path, aliases::canonical_target))
         .load::<(String, String)>(tx)?
         .into_iter()
         .collect::<BTreeMap<_, _>>();
+    graph.extend(
+        archive_aliases
+            .iter()
+            .map(|alias| (alias.path.to_string(), alias.target.to_string())),
+    );
     for (path, target) in &graph {
         let (resolution, final_target) = resolve_graph_path_final(&real, &graph, target)?;
         if matches!(resolution, GraphResolution::Directory)
@@ -7454,6 +8527,40 @@ fn validate_alias_graph_with_staged(
             return Err(StoreError::AliasCycle);
         }
         resolve_graph_path(&real, &graph, path)?;
+    }
+    Ok(())
+}
+
+fn validate_archive_alias_conflicts_locked(
+    tx: &mut SqliteConnection,
+    site_id: i64,
+    archive_aliases: &[ArchiveAlias<'_>],
+) -> Result<(), StoreError> {
+    let entries = site_entries::table
+        .filter(site_entries::site_id.eq(site_id))
+        .select((site_entries::path, site_entries::kind))
+        .load::<(String, i64)>(tx)?
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    for alias in archive_aliases {
+        if aggregate_paths(alias.path).into_iter().any(|ancestor| {
+            !ancestor.is_empty()
+                && entries.get(ancestor).is_some_and(|kind| {
+                    *kind == database::schema::ALIAS_ENTRY_KIND || ancestor != alias.path
+                })
+        }) {
+            return Err(StoreError::AliasWrite);
+        }
+        if entries
+            .get(alias.path)
+            .is_some_and(|kind| *kind != database::schema::ALIAS_ENTRY_KIND)
+        {
+            return Err(StoreError::AliasConflict);
+        }
+        let (start, end) = descendant_bounds(alias.path);
+        if entries.range(start..end).next().is_some() {
+            return Err(StoreError::AliasConflict);
+        }
     }
     Ok(())
 }
@@ -7805,15 +8912,15 @@ fn load_alias_directory_files(
         .filter(files::path.lt(&end))
         .select((files::path, files::size))
         .load::<(String, i64)>(db)?;
-    rows.extend(
-        allocated_entries::table
-            .filter(allocated_entries::site_id.eq(site_id))
-            .filter(allocated_entries::path.ge(&start))
-            .filter(allocated_entries::path.lt(&end))
-            .select((allocated_entries::path, allocated_entries::size))
-            .load::<(String, i64)>(db)?,
-    );
     record_alias_listed_file_rows(rows.len());
+    let allocated_rows = allocated_entries::table
+        .filter(allocated_entries::site_id.eq(site_id))
+        .filter(allocated_entries::path.ge(&start))
+        .filter(allocated_entries::path.lt(&end))
+        .select((allocated_entries::path, allocated_entries::size))
+        .load::<(String, i64)>(db)?;
+    record_alias_listed_allocated_rows(allocated_rows.len());
+    rows.extend(allocated_rows);
     rows.sort_unstable_by(|left, right| left.0.cmp(&right.0));
     Ok(rows
         .into_iter()
@@ -7847,24 +8954,59 @@ fn load_directory_aliases(
         .order(aliases::path)
         .load::<AliasRow>(db)?;
     record_alias_listed_rows(rows.len());
-    rows.into_iter()
-        .filter_map(|mut row| {
-            let suffix = if physical.is_empty() {
-                Some(row.path.clone())
-            } else {
-                row.path
-                    .strip_prefix(physical)
-                    .and_then(|suffix| suffix.strip_prefix('/'))
-                    .map(str::to_string)
-            }?;
-            row.path = if logical.is_empty() {
-                suffix
-            } else {
-                format!("{logical}/{suffix}")
-            };
-            Some(alias_entry(row))
-        })
-        .collect()
+    let mut aggregate_targets = BTreeSet::new();
+    let mut prepared = Vec::with_capacity(rows.len());
+    for row in rows {
+        let physical_alias = row.path.clone();
+        let Some(suffix) = (if physical.is_empty() {
+            Some(row.path.clone())
+        } else {
+            row.path
+                .strip_prefix(physical)
+                .and_then(|suffix| suffix.strip_prefix('/'))
+                .map(str::to_string)
+        }) else {
+            continue;
+        };
+        let aggregate_target = if row.resolved_kind == Some(AliasResolvedKind::Directory as i64) {
+            resolved_alias_directory_target_locked(db, name, &physical_alias)?.inspect(|target| {
+                aggregate_targets.insert(target.clone());
+            })
+        } else {
+            None
+        };
+        prepared.push((row, suffix, aggregate_target));
+    }
+    let mut aggregate_counts = BTreeMap::new();
+    let aggregate_targets = aggregate_targets.into_iter().collect::<Vec<_>>();
+    for targets in aggregate_targets.chunks(500) {
+        let loaded = path_aggregates::table
+            .filter(path_aggregates::site_id.eq(site_id))
+            .filter(path_aggregates::path.eq_any(targets))
+            .select((path_aggregates::path, path_aggregates::file_count))
+            .load::<(String, i64)>(db)?;
+        record_alias_aggregate_rows(loaded.len());
+        aggregate_counts.extend(loaded);
+    }
+    let mut entries = Vec::with_capacity(prepared.len());
+    for (mut row, suffix, aggregate_target) in prepared {
+        let resolved_files = aggregate_target.map(|target| {
+            aggregate_counts
+                .get(&target)
+                .copied()
+                .unwrap_or(0)
+                .cast_unsigned()
+        });
+        row.path = if logical.is_empty() {
+            suffix
+        } else {
+            format!("{logical}/{suffix}")
+        };
+        let mut entry = alias_entry(row)?;
+        entry.resolved_files = resolved_files;
+        entries.push(entry);
+    }
+    Ok(entries)
 }
 
 fn load_root_files(
@@ -9306,6 +10448,23 @@ mod tests {
         let store = Store::new(dir.path().to_path_buf()).unwrap();
         store.put_file("alias-bounded", "tree/a", b"a").unwrap();
         store.put_file("alias-bounded", "tree/b", b"b").unwrap();
+        store
+            .allocate_bytes(
+                "alias-bounded",
+                b"allocated",
+                AllocationSpec {
+                    folder: "tree",
+                    ..AllocationSpec::default()
+                },
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        store
+            .put_file("alias-bounded", "elsewhere/a", b"a")
+            .unwrap();
+        store
+            .put_file("alias-bounded", "elsewhere/b", b"b")
+            .unwrap();
         for index in 0..256 {
             store
                 .put_file("alias-bounded", &format!("unrelated/{index:03}"), b"x")
@@ -9316,6 +10475,14 @@ mod tests {
                 "alias-bounded",
                 "tree/nested",
                 "a",
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        store
+            .put_alias(
+                "alias-bounded",
+                "tree/external",
+                "../elsewhere",
                 FileMutationOptions::default(),
             )
             .unwrap();
@@ -9344,11 +10511,13 @@ mod tests {
         reset_alias_directory_row_work();
         let listing = store.list_dir("alias-bounded", "view").unwrap();
         let work = alias_directory_row_work();
-        assert_eq!(listing.files, 2);
-        assert_eq!(listing.alias_count, 1);
+        assert_eq!(listing.files, 3);
+        assert_eq!(listing.alias_count, 2);
         assert_eq!(work.files, 2);
-        assert_eq!(work.aliases, 1);
-        assert!(work.resolution <= 8);
+        assert_eq!(work.allocated, 1);
+        assert_eq!(work.aliases, 2);
+        assert_eq!(work.aggregates, 1);
+        assert!(work.resolution <= 12);
     }
 
     #[test]
@@ -11037,6 +12206,7 @@ mod tests {
                 PendingAllocationSpec {
                     folder: "nested/pending",
                     media_type: "application/custom",
+                    extension: None,
                 },
                 None,
             )
@@ -11138,6 +12308,7 @@ mod tests {
                 PendingAllocationSpec {
                     folder: "nested/custom",
                     media_type: "text/plain",
+                    extension: None,
                 },
                 None,
             )
@@ -11176,6 +12347,7 @@ mod tests {
                 PendingAllocationSpec {
                     folder: "nested/custom",
                     media_type: "text/plain",
+                    extension: None,
                 },
                 None,
             )
@@ -12173,5 +13345,39 @@ mod tests {
             Err(StoreError::DestinationConflict)
         ));
         assert!(!store.blob_path(&conflict_hash).exists());
+    }
+
+    #[test]
+    fn alias_only_archive_is_an_atomic_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("store")).unwrap();
+        store
+            .put_file("alias-only", "existing.txt", b"target")
+            .unwrap();
+        let archive = pack_tar(&[ArchiveFile::Alias {
+            path: "live.txt".to_string(),
+            target: "existing.txt".to_string(),
+        }])
+        .unwrap();
+        let source = dir.path().join("aliases.tar");
+        fs::write(&source, archive).unwrap();
+        let (name, mutation) = store
+            .publish_uploaded_archive(
+                Some("alias-only"),
+                Some("aliases.tar"),
+                &source,
+                Kind::Tar,
+                PublishOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(name, "alias-only");
+        assert!(mutation.changed);
+        assert_eq!(
+            store
+                .alias("alias-only", "live.txt")
+                .unwrap()
+                .canonical_target,
+            "existing.txt"
+        );
     }
 }

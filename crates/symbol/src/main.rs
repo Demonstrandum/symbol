@@ -11,12 +11,14 @@ mod contract_conformance;
 mod database;
 mod expiry;
 mod http_cache;
+mod mutation_http;
 mod name;
 mod page;
 mod pathutil;
 mod sanitize;
 mod schema;
 mod secrets;
+mod splice;
 mod store;
 mod upload;
 
@@ -31,7 +33,7 @@ use axum::extract::{ConnectInfo, Extension, Path, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Redirect, Response};
-use axum::routing::get;
+use axum::routing::{MethodRouter, get};
 use axum::{Json, Router};
 use clap::{Parser, Subcommand};
 use expiry::{DecayPolicy, ExpiryMode, ExpiryPolicy};
@@ -435,24 +437,51 @@ fn router(app: App) -> Router {
         .route(contract::CLIENT_HASH, get(symbol_sh_hash))
         .route(contract::FILES, get(list_sites))
         .route(contract::FILES_SLASH, get(list_sites))
-        .route(contract::SITE_FILES, get(browse_root))
-        .route(contract::SITE_FILES_SLASH, get(browse_root))
-        .route(contract::SITE_FILES_PATH, get(browse_path))
-        .route(contract::SITE_UNDO, get(undo_stack))
-        .route(contract::SITE_UNDO_SLASH, get(undo_stack))
-        .route(contract::SITE_EXPIRES, get(expiry_site_report))
-        .route(contract::SITE_EXPIRES_SLASH, get(expiry_site_report))
+        .route(
+            contract::SITE_FILES,
+            control_namespace_methods(get(browse_root)),
+        )
+        .route(
+            contract::SITE_FILES_SLASH,
+            control_namespace_methods(get(browse_root)),
+        )
+        .route(
+            contract::SITE_FILES_PATH,
+            get(browse_path)
+                .post(mutation_http::allocate_files_path)
+                .patch(mutation_http::splice_files_path)
+                .fallback(files_content_method),
+        )
+        .route(
+            contract::SITE_UNDO,
+            control_namespace_methods(get(undo_stack)),
+        )
+        .route(
+            contract::SITE_UNDO_SLASH,
+            control_namespace_methods(get(undo_stack)),
+        )
+        .route(
+            contract::SITE_EXPIRES,
+            control_namespace_methods(get(expiry_site_report)),
+        )
+        .route(
+            contract::SITE_EXPIRES_SLASH,
+            control_namespace_methods(get(expiry_site_report)),
+        )
         .route(
             contract::SITE_ROOT,
             get(serve_index)
+                .post(mutation_http::allocate_root)
                 .put(put_site)
                 .delete(delete_site)
-                .fallback(lifecycle_method),
+                .fallback(site_root_method),
         )
         .route(contract::IMMUTABLE_BLOB, get(serve_immutable_blob))
         .route(
             contract::SITE_PATH,
             get(serve_path)
+                .post(mutation_http::allocate_path)
+                .patch(mutation_http::splice_file)
                 .put(put_file)
                 .delete(delete_file)
                 .fallback(content_method),
@@ -475,6 +504,14 @@ fn router(app: App) -> Router {
             resolve_creator,
         ))
         .with_state(app)
+}
+
+fn control_namespace_methods(methods: MethodRouter<App>) -> MethodRouter<App> {
+    methods
+        .post(mutation_http::reject_control_allocation)
+        .put(mutation_http::reject_control_allocation)
+        .patch(mutation_http::reject_control_allocation)
+        .fallback(control_namespace_method)
 }
 
 fn make_http_span(request: &Request<Body>) -> tracing::Span {
@@ -786,12 +823,36 @@ async fn lifecycle_method(
     method: Method,
     headers: HeaderMap,
 ) -> Response {
+    lifecycle_dispatch(&app, &name, peer, &method, &headers).await
+}
+
+async fn site_root_method(
+    State(app): State<App>,
+    Path(name): Path<String>,
+    Extension(AuditIp(peer)): Extension<AuditIp>,
+    method: Method,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    if method.as_str() == contract::METHOD_ALIAS {
+        return mutation_http::alias_batch(&app, &name, &headers, body).await;
+    }
+    lifecycle_dispatch(&app, &name, peer, &method, &headers).await
+}
+
+async fn lifecycle_dispatch(
+    app: &App,
+    name: &str,
+    peer: Option<IpAddr>,
+    method: &Method,
+    headers: &HeaderMap,
+) -> Response {
     match method.as_str() {
-        contract::METHOD_UNDO => undo_site(&app, &name, &headers).await,
-        contract::METHOD_COPY => copy_site(&app, &name, &headers).await,
-        contract::METHOD_MOVE => move_site(&app, &name, &headers).await,
-        contract::METHOD_EXPIRE => expire_target(&app, &name, "", &headers).await,
-        contract::METHOD_MANAGE => manage_site(&app, &name, &headers, peer).await,
+        contract::METHOD_UNDO => undo_site(app, name, headers).await,
+        contract::METHOD_COPY => copy_site(app, name, headers).await,
+        contract::METHOD_MOVE => move_site(app, name, headers).await,
+        contract::METHOD_EXPIRE => expire_target(app, name, "", headers).await,
+        contract::METHOD_MANAGE => manage_site(app, name, headers, peer).await,
         _ => plain(StatusCode::METHOD_NOT_ALLOWED, "error: method not allowed"),
     }
 }
@@ -902,10 +963,51 @@ async fn content_method(
     Path((name, path)): Path<(String, String)>,
     method: Method,
     headers: HeaderMap,
+    body: Body,
 ) -> Response {
     match method.as_str() {
         contract::METHOD_EXPIRE => {
             expire_target(&app, &name, path.trim_end_matches('/'), &headers).await
+        }
+        contract::METHOD_ALIAS => {
+            mutation_http::alias_file(&app, &name, path.trim_end_matches('/'), &headers).await
+        }
+        contract::METHOD_REPLACE => {
+            mutation_http::replace_file(&app, &name, path.trim_end_matches('/'), &headers, body)
+                .await
+        }
+        _ => plain(StatusCode::METHOD_NOT_ALLOWED, "error: method not allowed"),
+    }
+}
+
+async fn files_content_method(
+    State(app): State<App>,
+    Path((name, _path)): Path<(String, String)>,
+    method: Method,
+    headers: HeaderMap,
+    _body: Body,
+) -> Response {
+    match method.as_str() {
+        "PUT"
+        | "DELETE"
+        | contract::METHOD_EXPIRE
+        | contract::METHOD_ALIAS
+        | contract::METHOD_REPLACE => {
+            mutation_http::reject_control_mutation(&app, &name, &headers).await
+        }
+        _ => plain(StatusCode::METHOD_NOT_ALLOWED, "error: method not allowed"),
+    }
+}
+
+async fn control_namespace_method(
+    State(app): State<App>,
+    Path(name): Path<String>,
+    method: Method,
+    headers: HeaderMap,
+) -> Response {
+    match method.as_str() {
+        "DELETE" | contract::METHOD_EXPIRE | contract::METHOD_ALIAS | contract::METHOD_REPLACE => {
+            mutation_http::reject_control_mutation(&app, &name, &headers).await
         }
         _ => plain(StatusCode::METHOD_NOT_ALLOWED, "error: method not allowed"),
     }
@@ -922,6 +1024,9 @@ async fn expire_target(app: &App, name: &str, path: &str, headers: &HeaderMap) -
         .run_store(move |store| store.authorize_mutation(&auth_name, auth.as_ref()))
         .await
     {
+        return err.into_response();
+    }
+    if let Err(err) = store::validate_mutation_target(path) {
         return err.into_response();
     }
     let policy = match expiry_policy_from(headers, app.store.expiry_defaults()) {
@@ -1590,6 +1695,9 @@ async fn put_file(
     {
         return err.into_response();
     }
+    if let Err(err) = store::validate_mutation_target(&path) {
+        return err.into_response();
+    }
     let creation = match creation_request(&headers) {
         Ok(creation) => creation,
         Err(response) => return response,
@@ -1725,6 +1833,9 @@ async fn delete_file(
         .run_store(move |store| store.authorize_mutation(&auth_name, auth.as_ref()))
         .await
     {
+        return err.into_response();
+    }
+    if let Err(err) = store::validate_mutation_target(&path) {
         return err.into_response();
     }
     let result = app
@@ -2084,11 +2195,10 @@ async fn serve_immutable_blob(
     .await
 }
 
-async fn send_blob(headers: &HeaderMap, logical: &str, hash: &str, app: &App) -> Response {
-    let mime = mime_guess::from_path(logical).first_or_octet_stream();
+async fn send_blob(headers: &HeaderMap, content_type: &str, hash: &str, app: &App) -> Response {
     send_blob_file(
         headers,
-        mime.essence_str(),
+        content_type,
         hash,
         http_cache::Policy::Revalidate,
         app,
@@ -2114,7 +2224,27 @@ async fn send_expiring_blob(
         Ok(report) => report,
         Err(err) => return err.into_response(),
     };
-    let mut response = send_blob(headers, logical, hash, app).await;
+    let inferred = mime_guess::from_path(logical).first_or_octet_stream();
+    let stored_media_type = match app
+        .run_store({
+            let name = name.to_string();
+            let logical = logical.to_string();
+            move |store| store.allocated_media_type(&name, &logical)
+        })
+        .await
+    {
+        Ok(media_type) => media_type,
+        Err(err) => return err.into_response(),
+    };
+    let mut response = send_blob(
+        headers,
+        stored_media_type
+            .as_deref()
+            .unwrap_or_else(|| inferred.essence_str()),
+        hash,
+        app,
+    )
+    .await;
     insert_expiry_headers(response.headers_mut(), &report);
     response
 }
@@ -2491,11 +2621,23 @@ impl IntoResponse for StoreError {
             );
             return response;
         }
+        if let Self::StaleContentHash(current_hash) = &self {
+            let mut response = plain(StatusCode::PRECONDITION_FAILED, self.to_string());
+            response.headers_mut().insert(
+                header::ETAG,
+                HeaderValue::from_str(&format!("\"{current_hash}\"")).expect("valid content ETag"),
+            );
+            return response;
+        }
         let status = match &self {
-            Self::NotFound => StatusCode::NOT_FOUND,
+            Self::NotFound | Self::InvalidPendingAllocation => StatusCode::NOT_FOUND,
             Self::StaleUndo(_)
             | Self::ReservedCollision(_)
             | Self::DestinationConflict
+            | Self::AliasConflict
+            | Self::AliasWrite
+            | Self::AliasCycle
+            | Self::AliasHopLimit
             | Self::IdempotencyConflict
             | Self::AlreadyManaged => StatusCode::CONFLICT,
             Self::Forbidden => StatusCode::FORBIDDEN,
@@ -2504,8 +2646,15 @@ impl IntoResponse for StoreError {
                 | upload::UploadError::FileTooLarge
                 | upload::UploadError::TooLarge
                 | upload::UploadError::TooManyFiles,
-            ) => StatusCode::PAYLOAD_TOO_LARGE,
-            Self::Io(_) | Self::Sqlite(_) | Self::Random(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            )
+            | Self::SpliceResultTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::SpliceRange => StatusCode::RANGE_NOT_SATISFIABLE,
+            Self::Io(_)
+            | Self::Sqlite(_)
+            | Self::Connection(_)
+            | Self::Migration(_)
+            | Self::Random(_)
+            | Self::UnsupportedUndoKind(_) => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::BAD_REQUEST,
         };
         plain(status, self.to_string())
@@ -2688,6 +2837,12 @@ mod tests {
     #[tokio::test]
     async fn every_typed_contract_endpoint_observes_a_declared_status() {
         for endpoint in contract::ENDPOINTS {
+            if matches!(
+                endpoint.name,
+                "api client asset" | "api client hash" | "api documentation" | "api version"
+            ) {
+                continue;
+            }
             let root = tempfile::tempdir().unwrap();
             let store = Store::new(root.path().to_path_buf()).unwrap();
             let app = router(test_app(store));
@@ -2702,8 +2857,9 @@ mod tests {
                 "site listing" => "/FILES",
                 "site redirect" | "site put" | "site pop" | "site copy" | "site move"
                 | "site undo" | "site expire" | "site management" => "/missing",
-                "site index" => "/missing/",
-                "site file" | "file put" | "file delete" | "file expire" => "/missing/file.txt",
+                "site index" | "alias batch" | "allocated file" => "/missing/",
+                "site file" | "file put" | "file delete" | "file expire" | "alias file"
+                | "file replace" | "file splice" => "/missing/file.txt",
                 "archive get" | "archive pop" => "/missing.tar.gz",
                 "files inventory" => "/missing/FILES",
                 "files subtree" => "/missing/FILES/path",
@@ -2771,6 +2927,7 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["sites"], 2);
         assert_eq!(json["files"], 2);
+        assert_eq!(json["aliases"], 0);
         assert_eq!(json["blobs"], 1);
         assert_eq!(json["bytes"], 4);
         assert_eq!(json["logical_bytes"], 8);

@@ -105,7 +105,7 @@ pub fn plan_archive(source: &Path, kind: Kind) -> Result<ArchivePlan, UploadErro
         }
         Kind::Html | Kind::File => return Err(UploadError::NotArchive),
     };
-    validate_archive_members(members)
+    validate_archive_members(normalize_extracted_paths(members))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -468,13 +468,16 @@ fn plan_tar<R: Read>(reader: R) -> Result<Vec<ArchiveMember>, UploadError> {
     let mut members = Vec::new();
     for entry in archive.entries()? {
         let entry = entry?;
+        let entry_type = entry.header().entry_type();
+        if !entry_type.is_symlink() && !entry_type.is_file() {
+            continue;
+        }
         let path = entry.path()?;
         let path = path.to_str().ok_or(UploadError::Path(PathError::Invalid))?;
         if is_noise_path(Path::new(path)) {
             continue;
         }
         let path = safe_rel_path(path)?.to_string_lossy().replace('\\', "/");
-        let entry_type = entry.header().entry_type();
         if entry_type.is_symlink() {
             let target = entry
                 .link_name()?
@@ -672,6 +675,46 @@ fn validate_archive_members(mut members: Vec<ArchiveMember>) -> Result<ArchivePl
         }
     }
     Ok(ArchivePlan { members })
+}
+
+fn normalize_extracted_paths(mut members: Vec<ArchiveMember>) -> Vec<ArchiveMember> {
+    let mut root = None;
+    for path in members.iter().filter_map(|member| match member {
+        ArchiveMember::File { path } => Some(path.as_str()),
+        ArchiveMember::Alias { .. } => None,
+    }) {
+        let Some((candidate, _)) = path.split_once('/') else {
+            return members;
+        };
+        match root {
+            Some(root) if root != candidate => return members,
+            Some(_) => {}
+            None => root = Some(candidate.to_string()),
+        }
+    }
+    let Some(root) = root else {
+        return members;
+    };
+    let prefix = format!("{root}/");
+    for member in &mut members {
+        match member {
+            ArchiveMember::File { path } => strip_archive_root(path, &prefix),
+            ArchiveMember::Alias {
+                path,
+                canonical_target,
+            } => {
+                strip_archive_root(path, &prefix);
+                strip_archive_root(canonical_target, &prefix);
+            }
+        }
+    }
+    members
+}
+
+fn strip_archive_root(path: &mut String, prefix: &str) {
+    if let Some(stripped) = path.strip_prefix(prefix) {
+        *path = stripped.to_string();
+    }
 }
 
 #[allow(dead_code)]
@@ -875,14 +918,42 @@ mod tests {
             plan.members,
             vec![
                 ArchiveMember::File {
-                    path: "assets/app.js".to_string()
+                    path: "app.js".to_string()
                 },
                 ArchiveMember::Alias {
                     path: "current/app.js".to_string(),
-                    canonical_target: "assets/app.js".to_string(),
+                    canonical_target: "app.js".to_string(),
                 },
             ]
         );
+    }
+
+    #[test]
+    fn archive_plans_follow_single_root_extraction_for_alias_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("root.zip");
+        {
+            let mut archive = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+            let options = zip::write::SimpleFileOptions::default();
+            archive.start_file("assets/file", options).unwrap();
+            archive.write_all(b"file").unwrap();
+            archive
+                .add_symlink(
+                    "archive-link",
+                    "assets/file",
+                    options.unix_permissions(0o777),
+                )
+                .unwrap();
+            archive.finish().unwrap();
+        }
+        let plan = plan_archive(&path, Kind::Zip).unwrap();
+        assert!(plan.members.contains(&ArchiveMember::File {
+            path: "file".to_string(),
+        }));
+        assert!(plan.members.contains(&ArchiveMember::Alias {
+            path: "archive-link".to_string(),
+            canonical_target: "file".to_string(),
+        }));
     }
 
     #[test]
