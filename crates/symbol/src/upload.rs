@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, HashSet};
 #[cfg(test)]
 use std::io::Cursor;
 use std::io::{BufRead, BufReader, Read, Seek, Write};
@@ -14,6 +15,7 @@ use crate::sanitize;
 const DEFAULT_MAX_FILES: usize = 5000;
 const DEFAULT_MAX_EXTRACTED: u64 = 80 * 1024 * 1024;
 static ARCHIVE_LIMITS: OnceLock<ArchiveLimits> = OnceLock::new();
+pub const MAX_ALIAS_TARGET_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ArchiveLimits {
@@ -60,12 +62,50 @@ pub enum UploadError {
     ReservedPath,
     #[error("error: supported archive contains a Symbol management secret; unpack or remove it")]
     OpaqueSecret,
+    #[allow(dead_code)]
+    #[error("error: archive alias target is invalid")]
+    InvalidAlias,
+    #[allow(dead_code)]
+    #[error("error: archive alias cycle detected")]
+    AliasCycle,
     #[error("{0}")]
     Path(#[from] PathError),
     #[error("error: zip: {0}")]
     Zip(#[from] zip::result::ZipError),
     #[error("error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum ArchiveMember {
+    File {
+        path: String,
+    },
+    Alias {
+        path: String,
+        canonical_target: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct ArchivePlan {
+    pub members: Vec<ArchiveMember>,
+}
+
+#[allow(dead_code)]
+pub fn plan_archive(source: &Path, kind: Kind) -> Result<ArchivePlan, UploadError> {
+    let members = match kind {
+        Kind::Zip => plan_zip(std::fs::File::open(source)?)?,
+        Kind::Tar => plan_tar(std::fs::File::open(source)?)?,
+        Kind::Gzip => {
+            let decoder = GzDecoder::new(std::fs::File::open(source)?);
+            plan_tar(decoder)?
+        }
+        Kind::Html | Kind::File => return Err(UploadError::NotArchive),
+    };
+    validate_archive_members(members)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -371,6 +411,294 @@ fn strip_gz_name(name: &str) -> Option<&str> {
     }
 }
 
+#[allow(dead_code)]
+fn plan_zip<R: Read + Seek>(reader: R) -> Result<Vec<ArchiveMember>, UploadError> {
+    let limits = archive_limits();
+    let mut archive = zip::ZipArchive::new(reader)?;
+    let mut members = Vec::new();
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index)?;
+        if entry.is_dir() {
+            continue;
+        }
+        let enclosed = entry
+            .enclosed_name()
+            .ok_or(UploadError::Path(PathError::Invalid))?;
+        if is_noise_path(&enclosed) {
+            continue;
+        }
+        let path = safe_rel_path(&enclosed.to_string_lossy())?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let is_symlink = entry
+            .unix_mode()
+            .is_some_and(|mode| mode & 0o170_000 == 0o120_000);
+        if is_symlink {
+            let mut target = String::new();
+            let read_limit =
+                u64::try_from(MAX_ALIAS_TARGET_BYTES + 1).expect("alias target limit fits in u64");
+            if (&mut entry)
+                .take(read_limit)
+                .read_to_string(&mut target)
+                .is_err()
+            {
+                return Err(UploadError::InvalidAlias);
+            }
+            if target.len() > MAX_ALIAS_TARGET_BYTES {
+                return Err(UploadError::InvalidAlias);
+            }
+            members.push(ArchiveMember::Alias {
+                canonical_target: canonical_archive_target(&path, &target)?,
+                path,
+            });
+        } else if entry.is_file() {
+            members.push(ArchiveMember::File { path });
+        }
+        if members.len() > limits.max_files {
+            return Err(UploadError::TooManyFiles);
+        }
+    }
+    Ok(members)
+}
+
+#[allow(dead_code)]
+fn plan_tar<R: Read>(reader: R) -> Result<Vec<ArchiveMember>, UploadError> {
+    let limits = archive_limits();
+    let mut archive = tar::Archive::new(reader);
+    let mut members = Vec::new();
+    for entry in archive.entries()? {
+        let entry = entry?;
+        let path = entry.path()?;
+        let path = path.to_str().ok_or(UploadError::Path(PathError::Invalid))?;
+        if is_noise_path(Path::new(path)) {
+            continue;
+        }
+        let path = safe_rel_path(path)?.to_string_lossy().replace('\\', "/");
+        let entry_type = entry.header().entry_type();
+        if entry_type.is_symlink() {
+            let target = entry
+                .link_name()?
+                .ok_or(UploadError::InvalidAlias)?
+                .to_str()
+                .ok_or(UploadError::InvalidAlias)?
+                .to_string();
+            members.push(ArchiveMember::Alias {
+                canonical_target: canonical_archive_target(&path, &target)?,
+                path,
+            });
+        } else if entry_type.is_file() {
+            members.push(ArchiveMember::File { path });
+        }
+        if members.len() > limits.max_files {
+            return Err(UploadError::TooManyFiles);
+        }
+    }
+    Ok(members)
+}
+
+#[allow(dead_code)]
+fn canonical_archive_target(path: &str, target: &str) -> Result<String, UploadError> {
+    if target.is_empty()
+        || target.len() > MAX_ALIAS_TARGET_BYTES
+        || target.starts_with(['/', '\\'])
+        || target.contains('\\')
+        || target.chars().any(char::is_control)
+        || looks_like_external_archive_target(target)
+    {
+        return Err(UploadError::InvalidAlias);
+    }
+    let mut parts = path.rsplit_once('/').map_or_else(Vec::new, |(parent, _)| {
+        parent.split('/').collect::<Vec<_>>()
+    });
+    for component in target.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                if parts.pop().is_none() {
+                    return Err(UploadError::InvalidAlias);
+                }
+            }
+            component => parts.push(component),
+        }
+    }
+    if parts.is_empty() {
+        return Err(UploadError::InvalidAlias);
+    }
+    let canonical = parts.join("/");
+    safe_rel_path(&canonical).map_err(|_| UploadError::InvalidAlias)?;
+    if archive_reserved(&canonical) || is_noise_path(Path::new(&canonical)) {
+        return Err(UploadError::InvalidAlias);
+    }
+    if relative_archive_target(path, &canonical).len() > MAX_ALIAS_TARGET_BYTES {
+        return Err(UploadError::InvalidAlias);
+    }
+    Ok(canonical)
+}
+
+fn relative_archive_target(path: &str, target: &str) -> String {
+    let parent = path.rsplit_once('/').map_or("", |(parent, _)| parent);
+    let from = if parent.is_empty() {
+        Vec::new()
+    } else {
+        parent.split('/').collect::<Vec<_>>()
+    };
+    let to = target.split('/').collect::<Vec<_>>();
+    let common = from
+        .iter()
+        .zip(&to)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let mut parts = vec![".."; from.len() - common];
+    parts.extend_from_slice(&to[common..]);
+    if parts.is_empty() {
+        ".".to_string()
+    } else {
+        parts.join("/")
+    }
+}
+
+#[allow(dead_code)]
+fn looks_like_external_archive_target(target: &str) -> bool {
+    let lower = target.to_ascii_lowercase();
+    lower.contains("://")
+        || [
+            "data:",
+            "file:",
+            "ftp:",
+            "ftps:",
+            "git:",
+            "http:",
+            "https:",
+            "javascript:",
+            "mailto:",
+            "ssh:",
+            "ws:",
+            "wss:",
+        ]
+        .iter()
+        .any(|scheme| lower.starts_with(scheme))
+}
+
+#[allow(dead_code)]
+fn archive_reserved(path: &str) -> bool {
+    const RESERVED: [&str; 7] = [
+        "FILES",
+        "HASH",
+        "UNDO",
+        "EXPIRES",
+        "symbol.toml",
+        ".symbol-token",
+        ".symbol-claim",
+    ];
+    RESERVED.contains(&path.rsplit('/').next().unwrap_or(path))
+}
+
+#[allow(dead_code)]
+fn validate_archive_members(mut members: Vec<ArchiveMember>) -> Result<ArchivePlan, UploadError> {
+    if members.is_empty() {
+        return Err(UploadError::EmptyArchive);
+    }
+    members.sort_unstable_by(|left, right| member_path(left).cmp(member_path(right)));
+    for pair in members.windows(2) {
+        if member_path(&pair[0]) == member_path(&pair[1]) {
+            return Err(UploadError::InvalidAlias);
+        }
+    }
+    for member in &members {
+        if matches!(member, ArchiveMember::Alias { .. }) {
+            let path = member_path(member);
+            if archive_reserved(path) {
+                return Err(UploadError::ReservedPath);
+            }
+            if path.chars().any(char::is_control) || is_noise_path(Path::new(path)) {
+                return Err(UploadError::InvalidAlias);
+            }
+        }
+    }
+    let aliases = members
+        .iter()
+        .filter_map(|member| match member {
+            ArchiveMember::Alias {
+                path,
+                canonical_target,
+            } => Some((path.clone(), canonical_target.clone())),
+            ArchiveMember::File { .. } => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    for path in aliases.keys() {
+        if members.iter().map(member_path).any(|member| {
+            member
+                .strip_prefix(path)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+        }) {
+            return Err(UploadError::InvalidAlias);
+        }
+        let target = &aliases[path];
+        if path
+            .strip_prefix(target)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+        {
+            return Err(UploadError::AliasCycle);
+        }
+    }
+    for path in aliases.keys() {
+        let mut current = path.clone();
+        let mut visited = HashSet::new();
+        let mut complete = false;
+        for _ in 0..64 {
+            if !visited.insert(current.clone()) {
+                return Err(UploadError::AliasCycle);
+            }
+            let Some((prefix, target)) = archive_alias_substitution(&aliases, &current) else {
+                complete = true;
+                break;
+            };
+            current = format!("{target}{}", &current[prefix.len()..]);
+        }
+        if !complete {
+            return Err(UploadError::AliasCycle);
+        }
+        let resolves_directory = members.iter().map(member_path).any(|member| {
+            member
+                .strip_prefix(&current)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+        });
+        if resolves_directory
+            && path
+                .strip_prefix(&current)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+        {
+            return Err(UploadError::AliasCycle);
+        }
+    }
+    Ok(ArchivePlan { members })
+}
+
+#[allow(dead_code)]
+fn member_path(member: &ArchiveMember) -> &str {
+    match member {
+        ArchiveMember::File { path } | ArchiveMember::Alias { path, .. } => path,
+    }
+}
+
+#[allow(dead_code)]
+fn archive_alias_substitution<'a>(
+    aliases: &'a BTreeMap<String, String>,
+    path: &str,
+) -> Option<(&'a str, &'a str)> {
+    if let Some((path, target)) = aliases.get_key_value(path) {
+        return Some((path, target));
+    }
+    let mut end = path.len();
+    while let Some(slash) = path[..end].rfind('/') {
+        if let Some((path, target)) = aliases.get_key_value(&path[..slash]) {
+            return Some((path, target));
+        }
+        end = slash;
+    }
+    None
+}
+
 #[cfg(test)]
 fn gunzip(bytes: &[u8]) -> Result<Vec<u8>, UploadError> {
     let limits = archive_limits();
@@ -517,6 +845,227 @@ fn strip_single_root(dest: &Path) -> Result<(), UploadError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn archive_plans_preserve_safe_links_independent_of_member_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("links.tar");
+        {
+            let mut archive = tar::Builder::new(std::fs::File::create(&path).unwrap());
+            let mut link = tar::Header::new_gnu();
+            link.set_entry_type(tar::EntryType::Symlink);
+            link.set_size(0);
+            link.set_mode(0o777);
+            link.set_link_name("../assets/app.js").unwrap();
+            link.set_cksum();
+            archive
+                .append_data(&mut link, "current/app.js", std::io::empty())
+                .unwrap();
+            let mut file = tar::Header::new_gnu();
+            file.set_size(3);
+            file.set_mode(0o644);
+            file.set_cksum();
+            archive
+                .append_data(&mut file, "assets/app.js", b"app".as_slice())
+                .unwrap();
+            archive.finish().unwrap();
+        }
+        let plan = plan_archive(&path, Kind::Tar).unwrap();
+        assert_eq!(
+            plan.members,
+            vec![
+                ArchiveMember::File {
+                    path: "assets/app.js".to_string()
+                },
+                ArchiveMember::Alias {
+                    path: "current/app.js".to_string(),
+                    canonical_target: "assets/app.js".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn archive_plans_reject_root_escape_and_complete_graph_cycles() {
+        let dir = tempfile::tempdir().unwrap();
+        let escaped = dir.path().join("escaped.tar");
+        {
+            let mut archive = tar::Builder::new(std::fs::File::create(&escaped).unwrap());
+            let mut link = tar::Header::new_gnu();
+            link.set_entry_type(tar::EntryType::Symlink);
+            link.set_size(0);
+            link.set_mode(0o777);
+            link.set_link_name("../../outside").unwrap();
+            link.set_cksum();
+            archive
+                .append_data(&mut link, "link", std::io::empty())
+                .unwrap();
+            archive.finish().unwrap();
+        }
+        assert!(matches!(
+            plan_archive(&escaped, Kind::Tar),
+            Err(UploadError::InvalidAlias)
+        ));
+
+        let cyclic = dir.path().join("cyclic.zip");
+        {
+            let mut archive = zip::ZipWriter::new(std::fs::File::create(&cyclic).unwrap());
+            let link = zip::write::SimpleFileOptions::default().unix_permissions(0o777);
+            archive.add_symlink("a", "b", link).unwrap();
+            archive.add_symlink("b", "a", link).unwrap();
+            archive.finish().unwrap();
+        }
+        assert!(matches!(
+            plan_archive(&cyclic, Kind::Zip),
+            Err(UploadError::AliasCycle)
+        ));
+    }
+
+    #[test]
+    fn archive_plans_reject_containment_cycles_and_prefix_shadowing_in_any_order() {
+        assert!(matches!(
+            validate_archive_members(vec![ArchiveMember::Alias {
+                path: "dir/link".to_string(),
+                canonical_target: "dir".to_string(),
+            }]),
+            Err(UploadError::AliasCycle)
+        ));
+        assert!(matches!(
+            validate_archive_members(vec![
+                ArchiveMember::Alias {
+                    path: "root-link".to_string(),
+                    canonical_target: "dir".to_string(),
+                },
+                ArchiveMember::Alias {
+                    path: "dir/back".to_string(),
+                    canonical_target: "root-link".to_string(),
+                },
+            ]),
+            Err(UploadError::AliasCycle)
+        ));
+        for members in [
+            vec![
+                ArchiveMember::Alias {
+                    path: "shadow".to_string(),
+                    canonical_target: "target".to_string(),
+                },
+                ArchiveMember::File {
+                    path: "shadow/child".to_string(),
+                },
+            ],
+            vec![
+                ArchiveMember::File {
+                    path: "shadow/child".to_string(),
+                },
+                ArchiveMember::Alias {
+                    path: "shadow".to_string(),
+                    canonical_target: "target".to_string(),
+                },
+            ],
+        ] {
+            assert!(matches!(
+                validate_archive_members(members),
+                Err(UploadError::InvalidAlias)
+            ));
+        }
+    }
+
+    #[test]
+    fn zip_alias_targets_preserve_significant_whitespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("whitespace.zip");
+        {
+            let mut archive = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+            let options = zip::write::SimpleFileOptions::default();
+            archive.start_file(" target ", options).unwrap();
+            archive.write_all(b"x").unwrap();
+            archive
+                .add_symlink("link", " target ", options.unix_permissions(0o777))
+                .unwrap();
+            archive.finish().unwrap();
+        }
+        let plan = plan_archive(&path, Kind::Zip).unwrap();
+        assert!(plan.members.contains(&ArchiveMember::Alias {
+            path: "link".to_string(),
+            canonical_target: " target ".to_string(),
+        }));
+    }
+
+    #[test]
+    fn zip_alias_target_limit_rejects_one_byte_over_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized-link.zip");
+        {
+            let mut archive = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+            archive
+                .add_symlink(
+                    "link",
+                    "x".repeat(MAX_ALIAS_TARGET_BYTES + 1),
+                    zip::write::SimpleFileOptions::default().unix_permissions(0o777),
+                )
+                .unwrap();
+            archive.finish().unwrap();
+        }
+        assert!(matches!(
+            plan_archive(&path, Kind::Zip),
+            Err(UploadError::InvalidAlias)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tar_alias_targets_reject_non_utf8() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("non-utf8.tar");
+        {
+            let mut archive = tar::Builder::new(std::fs::File::create(&path).unwrap());
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_size(0);
+            header.set_mode(0o777);
+            archive
+                .append_link(
+                    &mut header,
+                    "link",
+                    std::path::PathBuf::from(std::ffi::OsString::from_vec(vec![0xff])),
+                )
+                .unwrap();
+            archive.finish().unwrap();
+        }
+        assert!(matches!(
+            plan_archive(&path, Kind::Tar),
+            Err(UploadError::InvalidAlias)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tar_member_paths_reject_non_utf8_without_lossy_conversion() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("non-utf8-path.tar");
+        {
+            let mut archive = tar::Builder::new(std::fs::File::create(&path).unwrap());
+            let mut header = tar::Header::new_gnu();
+            header.set_size(1);
+            header.set_mode(0o644);
+            archive
+                .append_data(
+                    &mut header,
+                    std::path::PathBuf::from(std::ffi::OsString::from_vec(vec![0xff])),
+                    b"x".as_slice(),
+                )
+                .unwrap();
+            archive.finish().unwrap();
+        }
+        assert!(matches!(
+            plan_archive(&path, Kind::Tar),
+            Err(UploadError::Path(PathError::Invalid))
+        ));
+    }
 
     #[test]
     fn sniffs_html_and_zip() {

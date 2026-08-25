@@ -1,6 +1,8 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+#[cfg(test)]
+use std::cell::Cell;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -34,15 +36,15 @@ use crate::name::{NameError, generate_id, parse_site_name};
 use crate::pathutil::{PathError, is_junk, is_noise_path, looks_like_apple_fork, safe_rel_path};
 use crate::sanitize::{self, TokenCounts};
 use crate::schema::{
-    allocated_entries, blobs, expiry_policies, files, idempotency_records, management_audit,
-    management_idempotency, management_tombstones, metadata, path_aggregates, pending_allocations,
-    site_entries, sites, undo_allocated_deltas, undo_expiry_policies, undo_file_deltas, undo_files,
-    undo_names, undo_operations, undo_sites,
+    aliases, allocated_entries, blobs, expiry_policies, files, idempotency_records,
+    management_audit, management_idempotency, management_tombstones, metadata, path_aggregates,
+    pending_allocations, site_entries, sites, undo_alias_deltas, undo_allocated_deltas,
+    undo_expiry_policies, undo_file_deltas, undo_files, undo_names, undo_operations, undo_sites,
 };
 use crate::secrets::{ClaimToken, ClaimTokenHash, ManagementToken, ManagementTokenHash};
 #[cfg(test)]
 use crate::upload::write_payload;
-use crate::upload::{Kind, UploadError, write_payload_file};
+use crate::upload::{Kind, MAX_ALIAS_TARGET_BYTES, UploadError, write_payload_file};
 
 #[cfg(test)]
 use std::io::Cursor;
@@ -67,6 +69,7 @@ const BLOB_CACHE_ENTRY_OVERHEAD: usize = 128;
 const MAX_READ_CONNECTIONS: usize = 8;
 const PENDING_RETENTION_MILLIS: i64 = 15 * 60 * 1000;
 const MAX_SPLICE_RESULT_SIZE: u64 = 4 * 1024 * 1024 * 1024;
+const MAX_ALIAS_HOPS: usize = 64;
 
 #[cfg(test)]
 type ContentCommitHook = Box<dyn FnOnce() + Send>;
@@ -164,6 +167,27 @@ struct NewFile<'a> {
     path: &'a str,
     hash: &'a str,
     size: i64,
+}
+
+#[derive(Debug, Clone, Queryable, Selectable)]
+#[diesel(table_name = aliases)]
+struct AliasRow {
+    path: String,
+    canonical_target: String,
+    resolved_kind: Option<i64>,
+    resolved_hash: Option<String>,
+    resolved_size: Option<i64>,
+}
+
+#[derive(Debug, Clone, Queryable, Selectable)]
+#[diesel(table_name = undo_alias_deltas)]
+struct UndoAliasRow {
+    path: String,
+    existed: i64,
+    canonical_target: Option<String>,
+    resolved_kind: Option<i64>,
+    resolved_hash: Option<String>,
+    resolved_size: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -296,6 +320,73 @@ struct ForeignKeyViolationCount {
     violation_count: i64,
 }
 
+#[cfg(test)]
+#[derive(QueryableByName)]
+struct AliasUpdateCount {
+    #[diesel(sql_type = BigInt)]
+    count: i64,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Default)]
+struct AliasDirectoryRowWork {
+    resolution: u64,
+    files: u64,
+    aliases: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    static ALIAS_DIRECTORY_ROW_WORK: Cell<AliasDirectoryRowWork> =
+        Cell::new(AliasDirectoryRowWork::default());
+}
+
+#[cfg(test)]
+fn reset_alias_directory_row_work() {
+    ALIAS_DIRECTORY_ROW_WORK.set(AliasDirectoryRowWork::default());
+}
+
+#[cfg(test)]
+fn alias_directory_row_work() -> AliasDirectoryRowWork {
+    ALIAS_DIRECTORY_ROW_WORK.get()
+}
+
+#[cfg(test)]
+fn record_alias_resolution_rows(rows: usize) {
+    ALIAS_DIRECTORY_ROW_WORK.with(|cell| {
+        let mut work = cell.get();
+        work.resolution += u64::try_from(rows).expect("row count fits in u64");
+        cell.set(work);
+    });
+}
+
+#[cfg(not(test))]
+const fn record_alias_resolution_rows(_: usize) {}
+
+#[cfg(test)]
+fn record_alias_listed_file_rows(rows: usize) {
+    ALIAS_DIRECTORY_ROW_WORK.with(|cell| {
+        let mut work = cell.get();
+        work.files += u64::try_from(rows).expect("row count fits in u64");
+        cell.set(work);
+    });
+}
+
+#[cfg(not(test))]
+const fn record_alias_listed_file_rows(_: usize) {}
+
+#[cfg(test)]
+fn record_alias_listed_rows(rows: usize) {
+    ALIAS_DIRECTORY_ROW_WORK.with(|cell| {
+        let mut work = cell.get();
+        work.aliases += u64::try_from(rows).expect("row count fits in u64");
+        cell.set(work);
+    });
+}
+
+#[cfg(not(test))]
+const fn record_alias_listed_rows(_: usize) {}
+
 struct BlobCache {
     capacity: usize,
     max_entries: usize,
@@ -346,6 +437,8 @@ pub struct DirEnt {
 pub struct DirList {
     pub files: u64,
     pub bytes: u64,
+    pub alias_count: u64,
+    pub aliases: Vec<AliasEntry>,
     pub entries: Vec<DirEnt>,
 }
 
@@ -524,6 +617,43 @@ pub struct FileMutationOptions<'a> {
     pub authorization: Option<&'a ManagementToken>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct AliasSpec<'a> {
+    pub path: &'a str,
+    pub target: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i64)]
+pub enum AliasResolvedKind {
+    File = 0,
+    Directory = 1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AliasEntry {
+    pub path: String,
+    pub canonical_target: String,
+    pub resolved_kind: Option<AliasResolvedKind>,
+    pub resolved_hash: Option<String>,
+    pub resolved_size: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AliasInventory {
+    pub site: String,
+    pub content_revision: u64,
+    pub tree_hash: String,
+    pub aliases: Vec<AliasEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AliasStats {
+    pub aliases: u64,
+    pub resolved: u64,
+    pub dangling: u64,
+}
+
 #[derive(Clone, Copy, Default)]
 pub struct PublishOptions<'a> {
     pub expected_tree_hash: Option<&'a str>,
@@ -634,15 +764,21 @@ impl Drop for StagedFile {
 }
 
 #[cfg(test)]
-struct ArchiveFile {
-    path: String,
-    bytes: Vec<u8>,
+enum ArchiveFile {
+    File { path: String, bytes: Vec<u8> },
+    Alias { path: String, target: String },
 }
 
-struct ArchiveEntry {
-    path: String,
-    hash: String,
-    size: u64,
+enum ArchiveEntry {
+    File {
+        path: String,
+        hash: String,
+        size: u64,
+    },
+    Alias {
+        path: String,
+        target: String,
+    },
 }
 
 #[cfg(test)]
@@ -666,6 +802,16 @@ pub enum StoreError {
     UnsupportedUndoKind(i64),
     #[error("error: destination site already exists")]
     DestinationConflict,
+    #[error("error: alias conflicts with an existing entry")]
+    AliasConflict,
+    #[error("error: writes through aliases are not allowed")]
+    AliasWrite,
+    #[error("error: alias target is invalid")]
+    InvalidAliasTarget,
+    #[error("error: alias cycle detected")]
+    AliasCycle,
+    #[error("error: alias resolution exceeded {MAX_ALIAS_HOPS} hops")]
+    AliasHopLimit,
     #[error("error: idempotency key was already used for a different request")]
     IdempotencyConflict,
     #[error("error: idempotency key must be 1-256 visible ASCII characters")]
@@ -1179,12 +1325,25 @@ impl Store {
             NodeKind::Dir => {}
             NodeKind::File { .. } | NodeKind::Missing => return Err(StoreError::NotFound),
         }
-        let files = if rel.is_empty() {
+        let alias_target = if rel.is_empty() {
+            None
+        } else {
+            resolved_alias_directory_target_locked(&mut db, name, &rel)?
+        };
+        let files = if let Some(ref target) = alias_target {
+            load_alias_directory_files(&mut db, name, &rel, target)?
+        } else if rel.is_empty() {
             load_root_files(&mut db, name)?
         } else {
             load_descendant_files(&mut db, name, &rel)?
         };
-        Ok(dirents(&files, &rel))
+        let aliases =
+            load_directory_aliases(&mut db, name, &rel, alias_target.as_deref().unwrap_or(&rel))?;
+        let mut listing = dirents(&files, &rel);
+        listing.alias_count =
+            u64::try_from(aliases.len()).expect("directory alias count fits in u64");
+        listing.aliases = aliases;
+        Ok(listing)
     }
 
     pub fn site_inventory(&self, name: &str) -> Result<SiteInventory, StoreError> {
@@ -1468,6 +1627,300 @@ impl Store {
         tx.commit()?;
         drop(db);
         Ok(token)
+    }
+
+    pub fn put_alias(
+        &self,
+        name: &str,
+        path: &str,
+        target: &str,
+        options: FileMutationOptions<'_>,
+    ) -> Result<MutationResult, StoreError> {
+        self.put_aliases(name, &[AliasSpec { path, target }], options)
+    }
+
+    #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
+    pub fn put_aliases(
+        &self,
+        name: &str,
+        specs: &[AliasSpec<'_>],
+        options: FileMutationOptions<'_>,
+    ) -> Result<MutationResult, StoreError> {
+        let name = parse_site_name(name)?;
+        if specs.is_empty() {
+            return Err(StoreError::InvalidAliasTarget);
+        }
+        let mut requested = BTreeMap::new();
+        for spec in specs {
+            if spec.path.starts_with(['/', '\\']) || spec.path.contains('\\') {
+                return Err(StoreError::InvalidAliasTarget);
+            }
+            let path = normalize_rel(spec.path)?;
+            if path.is_empty()
+                || path.chars().any(char::is_control)
+                || is_noise_path(Path::new(&path))
+            {
+                return Err(StoreError::InvalidAliasTarget);
+            }
+            reject_reserved_path(&path)?;
+            let target = canonical_alias_target(&path, spec.target)?;
+            match requested.insert(path.clone(), target.clone()) {
+                Some(previous) if previous != target => return Err(StoreError::AliasConflict),
+                _ => {}
+            }
+        }
+        let fingerprint = alias_mutation_fingerprint(name, &requested);
+        let now = self.now_millis();
+        let mut db = self.inner.writer.lock().unwrap();
+        let mut tx = DbTransaction::begin(&mut db)?;
+        authorize_locked(&mut tx, name, options.authorization)?;
+        prune_idempotency_locked(&mut tx, now)?;
+        if let Some(idempotency) = options.idempotency {
+            validate_idempotency_key(&idempotency.key)?;
+            if let Some(replay) = idempotency_replay(
+                &mut tx,
+                &idempotency.key,
+                &fingerprint,
+                IdempotencyKind::AliasMutation,
+            )? {
+                return Ok(replay.mutation);
+            }
+        }
+        check_tree_precondition(&mut tx, name, options.expected_tree_hash)?;
+        let site_id = site_id_locked(&mut tx, name)?;
+        let entry_kinds = site_entries::table
+            .filter(site_entries::site_id.eq(site_id))
+            .select((site_entries::path, site_entries::kind))
+            .load::<(String, i64)>(&mut *tx)?
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        let entry_paths = entry_kinds.keys().cloned().collect::<BTreeSet<_>>();
+        let existing_aliases = aliases::table
+            .filter(aliases::site_id.eq(site_id))
+            .select((aliases::path, aliases::canonical_target))
+            .load::<(String, String)>(&mut *tx)?
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        let prospective_alias_paths = existing_aliases
+            .keys()
+            .chain(requested.keys())
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        let mut changed_paths = Vec::new();
+        let mut created_paths = 0_usize;
+        for (path, target) in &requested {
+            if path
+                .strip_prefix(target)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+            {
+                return Err(StoreError::AliasCycle);
+            }
+            if aggregate_paths(path)
+                .into_iter()
+                .any(|ancestor| !ancestor.is_empty() && prospective_alias_paths.contains(ancestor))
+            {
+                return Err(StoreError::AliasWrite);
+            }
+            let (descendant_start, descendant_end) = descendant_bounds(path);
+            if entry_paths
+                .range(descendant_start..descendant_end)
+                .next()
+                .is_some()
+            {
+                return Err(StoreError::AliasConflict);
+            }
+            let entry_kind = entry_kinds.get(path).copied();
+            match entry_kind {
+                Some(kind) if kind != database::schema::ALIAS_ENTRY_KIND => {
+                    return Err(StoreError::AliasConflict);
+                }
+                Some(_) => {
+                    let current = existing_aliases
+                        .get(path)
+                        .expect("alias entry has alias metadata");
+                    if current != target {
+                        changed_paths.push(path.as_str());
+                    }
+                }
+                None => {
+                    changed_paths.push(path.as_str());
+                    created_paths += 1;
+                }
+            }
+        }
+        if changed_paths.is_empty() {
+            let (revision, tree_hash) = site_revision_locked(&mut tx, name)?;
+            let result = MutationResult {
+                created: false,
+                changed: false,
+                replayed: false,
+                files: requested.len(),
+                revision,
+                tree_hash,
+                undo: None,
+                sanitized: TokenCounts::default(),
+            };
+            if let Some(idempotency) = options.idempotency {
+                store_idempotency(
+                    &mut tx,
+                    &idempotency.key,
+                    &fingerprint,
+                    IdempotencyKind::AliasMutation,
+                    &PublishedMutation {
+                        name: name.to_string(),
+                        mutation: result.clone(),
+                    },
+                    now,
+                )?;
+            }
+            tx.commit()?;
+            return Ok(result);
+        }
+        let undo = snapshot_entry_deltas(
+            &mut tx,
+            name,
+            UndoKind::Alias,
+            &format!("restore previous aliases in {name}"),
+            &changed_paths,
+            now,
+        )?;
+        for path in &changed_paths {
+            let target = &requested[*path];
+            diesel::insert_into(site_entries::table)
+                .values((
+                    site_entries::site_id.eq(site_id),
+                    site_entries::path.eq(*path),
+                    site_entries::kind.eq(database::schema::ALIAS_ENTRY_KIND),
+                ))
+                .on_conflict_do_nothing()
+                .execute(&mut *tx)?;
+            diesel::insert_into(aliases::table)
+                .values((
+                    aliases::site_id.eq(site_id),
+                    aliases::path.eq(*path),
+                    aliases::kind.eq(database::schema::ALIAS_ENTRY_KIND),
+                    aliases::canonical_target.eq(target),
+                    aliases::resolved_kind.eq(Option::<i64>::None),
+                    aliases::resolved_hash.eq(Option::<String>::None),
+                    aliases::resolved_size.eq(Option::<i64>::None),
+                ))
+                .on_conflict((aliases::site_id, aliases::path))
+                .do_update()
+                .set((
+                    aliases::canonical_target.eq(excluded(aliases::canonical_target)),
+                    aliases::resolved_kind.eq(Option::<i64>::None),
+                    aliases::resolved_hash.eq(Option::<String>::None),
+                    aliases::resolved_size.eq(Option::<i64>::None),
+                ))
+                .execute(&mut *tx)?;
+        }
+        diesel::update(sites::table.find(site_id))
+            .set((
+                sites::updated.eq(now),
+                sites::content_revision.eq(sites::content_revision + 1),
+            ))
+            .execute(&mut *tx)?;
+        refresh_aliases_locked(&mut tx, site_id)?;
+        refresh_expiry_for_changes_locked(&mut tx, site_id, &changed_paths, now)?;
+        let tree_hash = regenerate_site(&mut tx, &self.inner.blob_files, site_id, now)?;
+        let (revision, _) = site_revision_locked(&mut tx, name)?;
+        prune_undo_locked(&mut tx, now)?;
+        let result = MutationResult {
+            created: created_paths > 0,
+            changed: true,
+            replayed: false,
+            files: changed_paths.len(),
+            revision,
+            tree_hash,
+            undo: Some(undo),
+            sanitized: TokenCounts::default(),
+        };
+        if let Some(idempotency) = options.idempotency {
+            store_idempotency(
+                &mut tx,
+                &idempotency.key,
+                &fingerprint,
+                IdempotencyKind::AliasMutation,
+                &PublishedMutation {
+                    name: name.to_string(),
+                    mutation: result.clone(),
+                },
+                now,
+            )?;
+        }
+        tx.commit()?;
+        Ok(result)
+    }
+
+    pub fn alias(&self, name: &str, path: &str) -> Result<AliasEntry, StoreError> {
+        let name = parse_site_name(name)?;
+        let path = normalize_rel(path)?;
+        let mut db = self.inner.readers.get();
+        let site_id = site_id_locked(&mut db, name)?;
+        let row = aliases::table
+            .find((site_id, path.as_str()))
+            .select(AliasRow::as_select())
+            .first::<AliasRow>(&mut *db)
+            .map_err(map_sql)?;
+        alias_entry(row)
+    }
+
+    pub fn aliases(&self, name: &str) -> Result<Vec<AliasEntry>, StoreError> {
+        let name = parse_site_name(name)?;
+        let mut db = self.inner.readers.get();
+        let site_id = site_id_locked(&mut db, name)?;
+        aliases::table
+            .filter(aliases::site_id.eq(site_id))
+            .select(AliasRow::as_select())
+            .order(aliases::path)
+            .load::<AliasRow>(&mut *db)?
+            .into_iter()
+            .map(alias_entry)
+            .collect()
+    }
+
+    pub fn alias_inventory(&self, name: &str) -> Result<AliasInventory, StoreError> {
+        let name = parse_site_name(name)?;
+        let mut db = self.inner.readers.get();
+        let mut snapshot = DbTransaction::begin(&mut db)?;
+        let (site_id, content_revision, tree_hash) = sites::table
+            .filter(sites::name.eq(name))
+            .select((sites::id, sites::content_revision, sites::tree_hash))
+            .first::<(i64, i64, String)>(&mut *snapshot)
+            .map_err(map_sql)?;
+        let aliases = aliases::table
+            .filter(aliases::site_id.eq(site_id))
+            .select(AliasRow::as_select())
+            .order(aliases::path)
+            .load::<AliasRow>(&mut *snapshot)?
+            .into_iter()
+            .map(alias_entry)
+            .collect::<Result<Vec<_>, _>>()?;
+        snapshot.commit()?;
+        Ok(AliasInventory {
+            site: name.to_string(),
+            content_revision: content_revision.cast_unsigned(),
+            tree_hash,
+            aliases,
+        })
+    }
+
+    pub fn alias_stats(&self, name: &str) -> Result<AliasStats, StoreError> {
+        let inventory = self.alias_inventory(name)?;
+        let aliases = u64::try_from(inventory.aliases.len()).expect("alias count fits in u64");
+        let resolved = u64::try_from(
+            inventory
+                .aliases
+                .iter()
+                .filter(|alias| alias.resolved_kind.is_some())
+                .count(),
+        )
+        .expect("resolved alias count fits in u64");
+        Ok(AliasStats {
+            aliases,
+            resolved,
+            dangling: aliases - resolved,
+        })
     }
 
     pub fn lookup(&self, name: &str, rel: &str) -> Result<Node, StoreError> {
@@ -1982,6 +2435,7 @@ impl Store {
         }
         let mut db = self.inner.readers.get();
         let site_id = site_id_locked(&mut db, name)?;
+        reject_alias_write_locked(&mut db, site_id, &path, false)?;
         let kind = site_entries::table
             .find((site_id, path.as_str()))
             .select(site_entries::kind)
@@ -2041,6 +2495,7 @@ impl Store {
         }
         let mut db = self.inner.readers.get();
         let site_id = site_id_locked(&mut db, name)?;
+        reject_alias_write_locked(&mut db, site_id, &path, false)?;
         let kind = site_entries::table
             .find((site_id, path.as_str()))
             .select(site_entries::kind)
@@ -2318,6 +2773,36 @@ impl Store {
                 ))
                 .execute(&mut *tx)?;
         }
+        let copied_aliases = aliases::table
+            .filter(aliases::site_id.eq(source_id))
+            .select((
+                aliases::path,
+                aliases::canonical_target,
+                aliases::resolved_kind,
+                aliases::resolved_hash,
+                aliases::resolved_size,
+            ))
+            .load::<(String, String, Option<i64>, Option<String>, Option<i64>)>(&mut *tx)?;
+        for (path, target, resolved_kind, resolved_hash, resolved_size) in copied_aliases {
+            diesel::insert_into(site_entries::table)
+                .values((
+                    site_entries::site_id.eq(destination_id),
+                    site_entries::path.eq(&path),
+                    site_entries::kind.eq(database::schema::ALIAS_ENTRY_KIND),
+                ))
+                .execute(&mut *tx)?;
+            diesel::insert_into(aliases::table)
+                .values((
+                    aliases::site_id.eq(destination_id),
+                    aliases::path.eq(path),
+                    aliases::kind.eq(database::schema::ALIAS_ENTRY_KIND),
+                    aliases::canonical_target.eq(target),
+                    aliases::resolved_kind.eq(resolved_kind),
+                    aliases::resolved_hash.eq(resolved_hash),
+                    aliases::resolved_size.eq(resolved_size),
+                ))
+                .execute(&mut *tx)?;
+        }
         let aggregates = path_aggregates::table
             .filter(path_aggregates::site_id.eq(source_id))
             .select((
@@ -2469,7 +2954,8 @@ impl Store {
         authorize_locked(&mut tx, name, authorization)?;
         reject_reserved_path(&rel)?;
         let site_id = site_id_locked(&mut tx, name)?;
-        let paths = site_entries::table
+        reject_alias_write_locked(&mut tx, site_id, &rel, true)?;
+        let mut paths = site_entries::table
             .filter(site_entries::site_id.eq(site_id))
             .filter(
                 site_entries::path.eq(&rel).or(site_entries::path
@@ -2478,6 +2964,15 @@ impl Store {
             )
             .select(site_entries::path)
             .load::<String>(&mut *tx)?;
+        let exact_kind = site_entries::table
+            .find((site_id, rel.as_str()))
+            .select(site_entries::kind)
+            .first::<i64>(&mut *tx)
+            .optional()?;
+        if exact_kind == Some(database::schema::ALIAS_ENTRY_KIND) {
+            paths.clear();
+            paths.push(rel.clone());
+        }
         if paths.is_empty() {
             return Err(StoreError::NotFound);
         }
@@ -2522,6 +3017,7 @@ impl Store {
         diesel::update(sites::table.find(site_id))
             .set(sites::content_revision.eq(sites::content_revision + 1))
             .execute(&mut *tx)?;
+        refresh_aliases_locked(&mut tx, site_id)?;
         refresh_expiry_for_changes_locked(&mut tx, site_id, &[&rel], self.now_millis())?;
         regenerate_site(&mut tx, &self.inner.blob_files, site_id, self.now_millis())?;
         prune_undo_locked(&mut tx, self.now_millis())?;
@@ -2732,6 +3228,14 @@ impl Store {
             .select(sites::id)
             .first::<i64>(tx)
             .optional()?;
+        if let Some(site_id) = existing_site_id {
+            reject_alias_writes_locked(
+                tx,
+                site_id,
+                files.iter().map(|file| file.path.as_str()),
+                false,
+            )?;
+        }
         let mut changed = false;
         for file in files {
             let current = if let Some(site_id) = existing_site_id {
@@ -2757,6 +3261,9 @@ impl Store {
                 undo: None,
                 sanitized: sanitized_counts(files),
             });
+        }
+        if let Some(site_id) = existing_site_id {
+            validate_alias_graph_with_staged(tx, site_id, files)?;
         }
         for file in files {
             self.materialize(file)?;
@@ -2911,6 +3418,7 @@ impl Store {
         }
         check_tree_precondition(&mut tx, name, options.expected_tree_hash)?;
         let site_id = site_id_locked(&mut tx, name)?;
+        reject_alias_write_locked(&mut tx, site_id, path, false)?;
         let current = files::table
             .find((site_id, path))
             .select((files::hash, files::size))
@@ -3039,6 +3547,10 @@ impl Store {
         }
         check_tree_precondition(&mut tx, name, options.expected_tree_hash)?;
         let site_id = site_id_locked(&mut tx, name)?;
+        if let Some(current_path) = current_path {
+            reject_alias_write_locked(&mut tx, site_id, current_path, false)?;
+        }
+        reject_alias_write_locked(&mut tx, site_id, &destination.path, false)?;
         let needs_materialization = validate_allocated_commit_locked(
             &mut tx,
             site_id,
@@ -3439,12 +3951,16 @@ impl Store {
             sites.insert(*site_id);
         }
         for site_id in sites {
-            let remaining = files::table
-                .filter(files::site_id.eq(site_id))
+            let remaining = site_entries::table
+                .filter(site_entries::site_id.eq(site_id))
+                .filter(site_entries::path.ne(MANIFEST_PATH))
                 .select(count_star())
                 .first::<i64>(&mut *tx)?;
             if remaining == 0 {
                 diesel::delete(sites::table.find(site_id)).execute(&mut *tx)?;
+            } else {
+                rebuild_aggregates_locked(&mut tx, site_id)?;
+                regenerate_site(&mut tx, &self.inner.blob_files, site_id, self.now_millis())?;
             }
         }
         let removed = gc_blobs(&mut tx, self.now_millis())?;
@@ -3554,12 +4070,17 @@ impl Store {
                 | UndoKind::Allocate
                 | UndoKind::Replace
                 | UndoKind::Splice
+                | UndoKind::Alias
         ) && (undo_file_deltas::table
             .filter(undo_file_deltas::token.eq(&latest))
             .select(count_star())
             .first::<i64>(&mut *tx)?
             + undo_allocated_deltas::table
                 .filter(undo_allocated_deltas::token.eq(&latest))
+                .select(count_star())
+                .first::<i64>(&mut *tx)?
+            + undo_alias_deltas::table
+                .filter(undo_alias_deltas::token.eq(&latest))
                 .select(count_star())
                 .first::<i64>(&mut *tx)?
             > 0);
@@ -3708,6 +4229,33 @@ impl Store {
                     )
                     .execute(&mut *tx)?;
             }
+            let saved_aliases = undo_alias_deltas::table
+                .filter(undo_alias_deltas::token.eq(&latest))
+                .filter(undo_alias_deltas::existed.eq(1_i64))
+                .select(UndoAliasRow::as_select())
+                .load::<UndoAliasRow>(&mut *tx)?;
+            for alias in saved_aliases {
+                diesel::insert_into(site_entries::table)
+                    .values((
+                        site_entries::site_id.eq(site_id),
+                        site_entries::path.eq(&alias.path),
+                        site_entries::kind.eq(database::schema::ALIAS_ENTRY_KIND),
+                    ))
+                    .execute(&mut *tx)?;
+                diesel::insert_into(aliases::table)
+                    .values((
+                        aliases::site_id.eq(site_id),
+                        aliases::path.eq(alias.path),
+                        aliases::kind.eq(database::schema::ALIAS_ENTRY_KIND),
+                        aliases::canonical_target.eq(alias
+                            .canonical_target
+                            .expect("whole-site alias snapshot has target")),
+                        aliases::resolved_kind.eq(alias.resolved_kind),
+                        aliases::resolved_hash.eq(alias.resolved_hash),
+                        aliases::resolved_size.eq(alias.resolved_size),
+                    ))
+                    .execute(&mut *tx)?;
+            }
             restore_expiry_policies_locked(&mut tx, &latest, site_id)?;
             rebuild_aggregates_locked(&mut tx, site_id)?;
             regenerate_site(&mut tx, &self.inner.blob_files, site_id, snapshot.updated)?;
@@ -3759,8 +4307,9 @@ impl Store {
         let mut db = self.inner.writer.lock().unwrap();
         let mut tx = DbTransaction::begin(&mut db)?;
         authorize_locked(&mut tx, name, authorization)?;
-        let kind = expiry_target_kind_locked(&mut tx, name, &rel)?;
         let site_id = site_id_locked(&mut tx, name)?;
+        reject_expiry_below_alias_locked(&mut tx, site_id, &rel)?;
+        let kind = expiry_target_kind_locked(&mut tx, name, &rel)?;
         let previous = expiry_policies::table
             .find((site_id, rel.as_str()))
             .select(expiry_policies::site_id)
@@ -3953,6 +4502,22 @@ impl Store {
                     now,
                 )?;
             }
+            let exact_alias = !path.is_empty()
+                && site_entries::table
+                    .find((site_id, path.as_str()))
+                    .select(site_entries::kind)
+                    .first::<i64>(&mut *tx)
+                    .optional()?
+                    == Some(database::schema::ALIAS_ENTRY_KIND);
+            if exact_alias {
+                diesel::delete(site_entries::table.find((site_id, path.as_str())))
+                    .execute(&mut *tx)?;
+                diesel::delete(expiry_policies::table.find((site_id, path.as_str())))
+                    .execute(&mut *tx)?;
+                finish_partial_expiry_locked(&mut tx, &self.inner.blob_files, site_id, &path, now)?;
+                removed_targets += 1;
+                continue;
+            }
             match kind {
                 ExpiryTargetKind::Site => {
                     retain_management_tombstone(&mut tx, &name, now)?;
@@ -3980,39 +4545,54 @@ impl Store {
                     )?;
                 }
                 ExpiryTargetKind::Folder => {
-                    let (start, end) = descendant_bounds(&path);
-                    let removed_files = files::table
-                        .filter(files::site_id.eq(site_id))
-                        .filter(files::path.ge(&start))
-                        .filter(files::path.lt(&end))
-                        .select((files::path, files::size))
-                        .load::<(String, i64)>(&mut *tx)?;
-                    let removed_allocated = allocated_entries::table
-                        .filter(allocated_entries::site_id.eq(site_id))
-                        .filter(allocated_entries::path.ge(&start))
-                        .filter(allocated_entries::path.lt(&end))
-                        .select((allocated_entries::path, allocated_entries::size))
-                        .load::<(String, i64)>(&mut *tx)?;
-                    diesel::delete(
-                        site_entries::table
-                            .filter(site_entries::site_id.eq(site_id))
-                            .filter(site_entries::path.ge(&start))
-                            .filter(site_entries::path.lt(&end)),
-                    )
-                    .execute(&mut *tx)?;
-                    for (removed_path, size) in removed_files.into_iter().chain(removed_allocated) {
-                        adjust_aggregates_locked(&mut tx, site_id, &removed_path, -size, -1)?;
+                    let alias_folder = site_entries::table
+                        .find((site_id, path.as_str()))
+                        .select(site_entries::kind)
+                        .first::<i64>(&mut *tx)
+                        .optional()?
+                        == Some(database::schema::ALIAS_ENTRY_KIND);
+                    if alias_folder {
+                        diesel::delete(site_entries::table.find((site_id, path.as_str())))
+                            .execute(&mut *tx)?;
+                        diesel::delete(expiry_policies::table.find((site_id, path.as_str())))
+                            .execute(&mut *tx)?;
+                    } else {
+                        let (start, end) = descendant_bounds(&path);
+                        let removed_files = files::table
+                            .filter(files::site_id.eq(site_id))
+                            .filter(files::path.ge(&start))
+                            .filter(files::path.lt(&end))
+                            .select((files::path, files::size))
+                            .load::<(String, i64)>(&mut *tx)?;
+                        let removed_allocated = allocated_entries::table
+                            .filter(allocated_entries::site_id.eq(site_id))
+                            .filter(allocated_entries::path.ge(&start))
+                            .filter(allocated_entries::path.lt(&end))
+                            .select((allocated_entries::path, allocated_entries::size))
+                            .load::<(String, i64)>(&mut *tx)?;
+                        diesel::delete(
+                            site_entries::table
+                                .filter(site_entries::site_id.eq(site_id))
+                                .filter(site_entries::path.ge(&start))
+                                .filter(site_entries::path.lt(&end)),
+                        )
+                        .execute(&mut *tx)?;
+                        for (removed_path, size) in
+                            removed_files.into_iter().chain(removed_allocated)
+                        {
+                            adjust_aggregates_locked(&mut tx, site_id, &removed_path, -size, -1)?;
+                        }
+                        diesel::delete(
+                            expiry_policies::table
+                                .filter(expiry_policies::site_id.eq(site_id))
+                                .filter(
+                                    expiry_policies::path.eq(&path).or(expiry_policies::path
+                                        .ge(&start)
+                                        .and(expiry_policies::path.lt(&end))),
+                                ),
+                        )
+                        .execute(&mut *tx)?;
                     }
-                    diesel::delete(
-                        expiry_policies::table
-                            .filter(expiry_policies::site_id.eq(site_id))
-                            .filter(
-                                expiry_policies::path.eq(&path).or(expiry_policies::path
-                                    .ge(&start)
-                                    .and(expiry_policies::path.lt(&end))),
-                            ),
-                    )
-                    .execute(&mut *tx)?;
                     finish_partial_expiry_locked(
                         &mut tx,
                         &self.inner.blob_files,
@@ -4118,6 +4698,7 @@ enum UndoKind {
     Allocate = 9,
     Replace = 10,
     Splice = 11,
+    Alias = 12,
 }
 
 impl UndoKind {
@@ -4134,6 +4715,7 @@ impl UndoKind {
             Self::Allocate => "allocate",
             Self::Replace => "replace",
             Self::Splice => "splice",
+            Self::Alias => "alias",
         }
     }
 
@@ -4150,6 +4732,7 @@ impl UndoKind {
             9 => Ok(Self::Allocate),
             10 => Ok(Self::Replace),
             11 => Ok(Self::Splice),
+            12 => Ok(Self::Alias),
             _ => Err(StoreError::UnsupportedUndoKind(value)),
         }
     }
@@ -4161,6 +4744,7 @@ enum IdempotencyKind {
     UnnamedPut = 1,
     AutoCopy = 2,
     EntryMutation = 3,
+    AliasMutation = 4,
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -4617,6 +5201,12 @@ fn entry_size_locked(
             .find((site_id, path))
             .select(allocated_entries::size)
             .first::<i64>(db)?
+    } else if kind == database::schema::ALIAS_ENTRY_KIND {
+        aliases::table
+            .find((site_id, path))
+            .select(aliases::site_id)
+            .first::<i64>(db)?;
+        0
     } else {
         return Err(StoreError::NotFound);
     };
@@ -4636,6 +5226,7 @@ fn finish_entry_mutation(
             sites::content_revision.eq(sites::content_revision + 1),
         ))
         .execute(tx)?;
+    refresh_aliases_locked(tx, site_id)?;
     refresh_expiry_for_changes_locked(tx, site_id, paths, now)?;
     regenerate_site(tx, blob_files, site_id, now)?;
     prune_undo_locked(tx, now)?;
@@ -4838,6 +5429,98 @@ fn reject_reserved_path(path: &str) -> Result<(), StoreError> {
     } else {
         Ok(())
     }
+}
+
+fn canonical_alias_target(alias_path: &str, target: &str) -> Result<String, StoreError> {
+    if target.is_empty()
+        || target.len() > MAX_ALIAS_TARGET_BYTES
+        || target.starts_with(['/', '\\'])
+        || target.contains('\\')
+        || target.chars().any(char::is_control)
+        || looks_like_external_alias_target(target)
+    {
+        return Err(StoreError::InvalidAliasTarget);
+    }
+    let mut parts = alias_path
+        .rsplit_once('/')
+        .map_or_else(Vec::new, |(parent, _)| {
+            parent.split('/').collect::<Vec<_>>()
+        });
+    for part in target.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if parts.pop().is_none() {
+                    return Err(StoreError::InvalidAliasTarget);
+                }
+            }
+            part => parts.push(part),
+        }
+    }
+    if parts.is_empty() {
+        return Err(StoreError::InvalidAliasTarget);
+    }
+    let canonical = parts.join("/");
+    safe_rel_path(&canonical).map_err(|_| StoreError::InvalidAliasTarget)?;
+    if is_reserved_path(&canonical) || is_noise_path(Path::new(&canonical)) {
+        return Err(StoreError::InvalidAliasTarget);
+    }
+    if relative_alias_target(alias_path, &canonical).len() > MAX_ALIAS_TARGET_BYTES {
+        return Err(StoreError::InvalidAliasTarget);
+    }
+    Ok(canonical)
+}
+
+fn looks_like_external_alias_target(target: &str) -> bool {
+    let lower = target.to_ascii_lowercase();
+    lower.contains("://")
+        || [
+            "data:",
+            "file:",
+            "ftp:",
+            "ftps:",
+            "git:",
+            "http:",
+            "https:",
+            "javascript:",
+            "mailto:",
+            "ssh:",
+            "ws:",
+            "wss:",
+        ]
+        .iter()
+        .any(|scheme| lower.starts_with(scheme))
+}
+
+fn alias_mutation_fingerprint(name: &str, aliases: &BTreeMap<String, String>) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"symbol-alias-mutation-v1\0");
+    hasher.update(name.as_bytes());
+    for (path, target) in aliases {
+        hasher.update(&(path.len() as u64).to_le_bytes());
+        hasher.update(path.as_bytes());
+        hasher.update(&(target.len() as u64).to_le_bytes());
+        hasher.update(target.as_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn alias_entry(row: AliasRow) -> Result<AliasEntry, StoreError> {
+    let resolved_kind = row
+        .resolved_kind
+        .map(|kind| match kind {
+            0 => Ok(AliasResolvedKind::File),
+            1 => Ok(AliasResolvedKind::Directory),
+            _ => Err(StoreError::InvalidAliasTarget),
+        })
+        .transpose()?;
+    Ok(AliasEntry {
+        path: row.path,
+        canonical_target: row.canonical_target,
+        resolved_kind,
+        resolved_hash: row.resolved_hash,
+        resolved_size: row.resolved_size.map(i64::cast_unsigned),
+    })
 }
 
 fn is_reserved_path(path: &str) -> bool {
@@ -5249,6 +5932,7 @@ fn snapshot_site(
         UndoKind::Allocate => format!("remove allocated content from {name}"),
         UndoKind::Replace => format!("restore replaced content in {name}"),
         UndoKind::Splice => format!("restore spliced content in {name}"),
+        UndoKind::Alias => format!("restore aliases in {name}"),
     };
     snapshot_site_with_description(tx, name, kind, &description, now)
 }
@@ -5272,6 +5956,26 @@ fn insert_undo_allocated(
             undo_allocated_deltas::extension
                 .eq(metadata.and_then(|value| value.extension.as_deref())),
             undo_allocated_deltas::media_type.eq(metadata.map(|value| value.media_type.as_str())),
+        ))
+        .execute(tx)?;
+    Ok(())
+}
+
+fn insert_undo_alias(
+    tx: &mut SqliteConnection,
+    token: &str,
+    path: &str,
+    alias: Option<&AliasRow>,
+) -> Result<(), diesel::result::Error> {
+    diesel::insert_into(undo_alias_deltas::table)
+        .values((
+            undo_alias_deltas::token.eq(token),
+            undo_alias_deltas::path.eq(path),
+            undo_alias_deltas::existed.eq(i64::from(alias.is_some())),
+            undo_alias_deltas::canonical_target.eq(alias.map(|row| row.canonical_target.as_str())),
+            undo_alias_deltas::resolved_kind.eq(alias.and_then(|row| row.resolved_kind)),
+            undo_alias_deltas::resolved_hash.eq(alias.and_then(|row| row.resolved_hash.as_deref())),
+            undo_alias_deltas::resolved_size.eq(alias.and_then(|row| row.resolved_size)),
         ))
         .execute(tx)?;
     Ok(())
@@ -5397,6 +6101,13 @@ fn snapshot_site_with_description(
                 }),
             )?;
         }
+        let saved_aliases = aliases::table
+            .filter(aliases::site_id.eq(site_id))
+            .select(AliasRow::as_select())
+            .load::<AliasRow>(tx)?;
+        for alias in saved_aliases {
+            insert_undo_alias(tx, &token, &alias.path, Some(&alias))?;
+        }
         snapshot_expiry_policies_locked(tx, &token, site_id)?;
     }
     Ok(UndoInfo {
@@ -5450,6 +6161,28 @@ fn snapshot_entry_deltas(
             undo_sites::tree_hash.eq(tree_hash),
         ))
         .execute(tx)?;
+    if matches!(kind, UndoKind::Alias) {
+        let mut previous = HashMap::new();
+        for chunk in paths.chunks(SQLITE_DELETE_BATCH_SIZE) {
+            previous.extend(
+                aliases::table
+                    .filter(aliases::site_id.eq(site_id))
+                    .filter(aliases::path.eq_any(chunk))
+                    .select(AliasRow::as_select())
+                    .load::<AliasRow>(tx)?
+                    .into_iter()
+                    .map(|row| (row.path.clone(), row)),
+            );
+        }
+        for path in paths {
+            insert_undo_alias(tx, &token, path, previous.get(*path))?;
+        }
+        snapshot_expiry_policies_locked(tx, &token, site_id)?;
+        return Ok(UndoInfo {
+            token,
+            expires_at: format_timestamp(expires),
+        });
+    }
     let operation_is_allocated = matches!(kind, UndoKind::Allocate)
         || (matches!(kind, UndoKind::Replace | UndoKind::Splice)
             && site_entries::table
@@ -5486,7 +6219,17 @@ fn snapshot_entry_deltas(
                 let metadata = allocated_metadata_locked(tx, site_id, path)?;
                 insert_undo_allocated(tx, &token, path, Some(&metadata))?;
             }
+            Some(entry_kind) if entry_kind == database::schema::ALIAS_ENTRY_KIND => {
+                let alias = aliases::table
+                    .find((site_id, *path))
+                    .select(AliasRow::as_select())
+                    .first::<AliasRow>(tx)?;
+                insert_undo_alias(tx, &token, path, Some(&alias))?;
+            }
             Some(_) => return Err(StoreError::DestinationConflict),
+            None if matches!(kind, UndoKind::Alias) => {
+                insert_undo_alias(tx, &token, path, None)?;
+            }
             None if operation_is_allocated => {
                 insert_undo_allocated(tx, &token, path, None)?;
             }
@@ -5511,6 +6254,7 @@ fn snapshot_entry_deltas(
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn restore_entry_deltas(
     tx: &mut SqliteConnection,
     blob_files: &BlobFiles,
@@ -5535,17 +6279,24 @@ fn restore_entry_deltas(
         .filter(undo_allocated_deltas::token.eq(token))
         .select(UndoAllocatedMetadata::as_select())
         .load::<UndoAllocatedMetadata>(tx)?;
+    let alias_deltas = undo_alias_deltas::table
+        .filter(undo_alias_deltas::token.eq(token))
+        .select(UndoAliasRow::as_select())
+        .load::<UndoAliasRow>(tx)?;
     let changed_paths = file_deltas
         .iter()
         .map(|row| row.0.as_str())
         .chain(allocated_deltas.iter().map(|row| row.path.as_str()))
+        .chain(alias_deltas.iter().map(|row| row.path.as_str()))
         .collect::<Vec<_>>();
-    diesel::delete(
-        site_entries::table
-            .filter(site_entries::site_id.eq(site_id))
-            .filter(site_entries::path.eq_any(&changed_paths)),
-    )
-    .execute(tx)?;
+    for paths in changed_paths.chunks(512) {
+        diesel::delete(
+            site_entries::table
+                .filter(site_entries::site_id.eq(site_id))
+                .filter(site_entries::path.eq_any(paths)),
+        )
+        .execute(tx)?;
+    }
     for (path, existed, hash, size) in file_deltas {
         if existed == 0 {
             continue;
@@ -5592,6 +6343,32 @@ fn restore_entry_deltas(
                 allocated_entries::media_type.eq(delta
                     .media_type
                     .expect("existing allocated delta has media type")),
+            ))
+            .execute(tx)?;
+    }
+    for delta in alias_deltas {
+        if delta.existed == 0 {
+            continue;
+        }
+        let path = delta.path;
+        diesel::insert_into(site_entries::table)
+            .values((
+                site_entries::site_id.eq(site_id),
+                site_entries::path.eq(&path),
+                site_entries::kind.eq(database::schema::ALIAS_ENTRY_KIND),
+            ))
+            .execute(tx)?;
+        diesel::insert_into(aliases::table)
+            .values((
+                aliases::site_id.eq(site_id),
+                aliases::path.eq(&path),
+                aliases::kind.eq(database::schema::ALIAS_ENTRY_KIND),
+                aliases::canonical_target.eq(delta
+                    .canonical_target
+                    .expect("existing alias delta has target")),
+                aliases::resolved_kind.eq(delta.resolved_kind),
+                aliases::resolved_hash.eq(delta.resolved_hash),
+                aliases::resolved_size.eq(delta.resolved_size),
             ))
             .execute(tx)?;
     }
@@ -5683,6 +6460,30 @@ fn expiry_target_kind_locked(
     name: &str,
     rel: &str,
 ) -> Result<ExpiryTargetKind, StoreError> {
+    if !rel.is_empty() {
+        let site_id = site_id_locked(db, name)?;
+        let alias_kind = aliases::table
+            .find((site_id, rel))
+            .select(aliases::resolved_kind)
+            .first::<Option<i64>>(db)
+            .optional()?;
+        if let Some(kind) = alias_kind {
+            return match kind {
+                Some(kind) if kind == AliasResolvedKind::Directory as i64 => {
+                    Ok(ExpiryTargetKind::Folder)
+                }
+                Some(kind) if kind == AliasResolvedKind::File as i64 => Ok(ExpiryTargetKind::File),
+                None => expiry_policies::table
+                    .find((site_id, rel))
+                    .select(expiry_policies::target_kind)
+                    .first::<i64>(db)
+                    .optional()?
+                    .map_or(Ok(ExpiryTargetKind::File), ExpiryTargetKind::try_from)
+                    .map_err(StoreError::Expiry),
+                Some(_) => Err(StoreError::InvalidAliasTarget),
+            };
+        }
+    }
     match node_locked(db, name, rel)? {
         NodeKind::Missing => Err(StoreError::NotFound),
         NodeKind::Dir if rel.is_empty() => Ok(ExpiryTargetKind::Site),
@@ -5770,6 +6571,16 @@ fn expiry_target_size_locked(
     rel: &str,
     kind: ExpiryTargetKind,
 ) -> Result<u64, StoreError> {
+    if !rel.is_empty()
+        && aliases::table
+            .find((site_id, rel))
+            .select(aliases::site_id)
+            .first::<i64>(db)
+            .optional()?
+            .is_some()
+    {
+        return Ok(0);
+    }
     let size = match kind {
         ExpiryTargetKind::Site => path_aggregates::table
             .find((site_id, ""))
@@ -5785,17 +6596,43 @@ fn expiry_target_size_locked(
                 .optional()?
             {
                 size
+            } else if let Some(size) = allocated_entries::table
+                .find((site_id, rel))
+                .select(allocated_entries::size)
+                .first::<i64>(db)
+                .optional()?
+            {
+                size
             } else {
-                allocated_entries::table
-                    .find((site_id, rel))
-                    .select(allocated_entries::size)
+                return Err(StoreError::NotFound);
+            }
+        }
+        ExpiryTargetKind::Folder => {
+            if let Some(size) = path_aggregates::table
+                .find((site_id, rel))
+                .select(path_aggregates::logical_bytes)
+                .first::<i64>(db)
+                .optional()?
+            {
+                size
+            } else {
+                let graph = aliases::table
+                    .filter(aliases::site_id.eq(site_id))
+                    .select((aliases::path, aliases::canonical_target))
+                    .load::<(String, String)>(db)?
+                    .into_iter()
+                    .collect::<BTreeMap<_, _>>();
+                let real_entries = load_real_entries(db, site_id)?;
+                let (resolved, target) = resolve_graph_path_final(&real_entries, &graph, rel)?;
+                if !matches!(resolved, GraphResolution::Directory) {
+                    return Err(StoreError::NotFound);
+                }
+                path_aggregates::table
+                    .find((site_id, target))
+                    .select(path_aggregates::logical_bytes)
                     .first::<i64>(db)?
             }
         }
-        ExpiryTargetKind::Folder => path_aggregates::table
-            .find((site_id, rel))
-            .select(path_aggregates::logical_bytes)
-            .first::<i64>(db)?,
     };
     Ok(size.cast_unsigned())
 }
@@ -6050,24 +6887,61 @@ fn refresh_expiry_for_changes_locked(
     changed_paths: &[&str],
     now: i64,
 ) -> Result<(), StoreError> {
+    let alias_rows = aliases::table
+        .filter(aliases::site_id.eq(site_id))
+        .select((
+            aliases::path,
+            aliases::canonical_target,
+            aliases::resolved_kind,
+        ))
+        .load::<(String, String, Option<i64>)>(tx)?;
+    let alias_kinds = alias_rows
+        .iter()
+        .map(|(path, _, kind)| (path.as_str(), *kind))
+        .collect::<HashMap<_, _>>();
+    let alias_graph = alias_rows
+        .iter()
+        .map(|(path, target, _)| (path.clone(), target.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let real_entries = load_real_entries(tx, site_id)?;
     let policies = expiry_policies::table
         .filter(expiry_policies::site_id.eq(site_id))
-        .filter(expiry_policies::mode.eq_any([
-            i64::from(ExpiryMode::Relative),
-            i64::from(ExpiryMode::Decay),
-        ]))
         .select((expiry_policies::path, expiry_policies::target_kind))
         .load::<(String, i64)>(tx)?;
     for (path, raw_kind) in policies {
-        let kind = ExpiryTargetKind::try_from(raw_kind)?;
-        if !changed_paths
+        let stored_kind = ExpiryTargetKind::try_from(raw_kind)?;
+        let directly_affected = changed_paths
             .iter()
-            .any(|changed| policy_is_affected(&path, kind, changed))
-        {
+            .any(|changed| policy_is_affected(&path, stored_kind, changed));
+        let alias_dependency_affected = if alias_graph.contains_key(&path) {
+            let (_, target, dependencies) =
+                resolve_graph_path_trace(&real_entries, &alias_graph, &path)?;
+            changed_paths.iter().any(|changed| {
+                dependencies.iter().any(|dependency| *changed == dependency)
+                    || *changed == target
+                    || changed
+                        .strip_prefix(&target)
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+                    || target
+                        .strip_prefix(*changed)
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+            })
+        } else {
+            false
+        };
+        if !directly_affected && !alias_dependency_affected {
             continue;
         }
         let Some(stored) = load_expiry_policy_locked(tx, site_id, &path)? else {
             continue;
+        };
+        let kind = match alias_kinds.get(path.as_str()) {
+            Some(Some(kind)) if *kind == AliasResolvedKind::File as i64 => ExpiryTargetKind::File,
+            Some(Some(kind)) if *kind == AliasResolvedKind::Directory as i64 => {
+                ExpiryTargetKind::Folder
+            }
+            Some(None) | None => stored_kind,
+            Some(Some(_)) => return Err(StoreError::InvalidAliasTarget),
         };
         let size = expiry_target_size_locked(tx, site_id, &path, kind)?;
         store_expiry_policy_locked(
@@ -6098,7 +6972,8 @@ fn finish_partial_expiry_locked(
         .filter(
             site_entries::kind
                 .eq(database::schema::FILE_ENTRY_KIND)
-                .or(site_entries::kind.eq(database::schema::ALLOCATED_ENTRY_KIND)),
+                .or(site_entries::kind.eq(database::schema::ALLOCATED_ENTRY_KIND))
+                .or(site_entries::kind.eq(database::schema::ALIAS_ENTRY_KIND)),
         )
         .select(count_star())
         .first::<i64>(tx)?;
@@ -6114,6 +6989,7 @@ fn finish_partial_expiry_locked(
     diesel::update(sites::table.find(site_id))
         .set(sites::content_revision.eq(sites::content_revision + 1))
         .execute(tx)?;
+    refresh_aliases_locked(tx, site_id)?;
     refresh_expiry_for_changes_locked(tx, site_id, &[changed_path], now)?;
     regenerate_site(tx, blobs, site_id, now)?;
     Ok(())
@@ -6126,6 +7002,7 @@ fn regenerate_site(
     site_id: i64,
     updated: i64,
 ) -> Result<String, StoreError> {
+    refresh_aliases_locked(tx, site_id)?;
     let (name, public_url, revision, management_status) = sites::table
         .find(site_id)
         .select((
@@ -6156,6 +7033,17 @@ fn regenerate_site(
         hasher.update(path.as_bytes());
         hasher.update(hash.as_bytes());
     }
+    let alias_entries = aliases::table
+        .filter(aliases::site_id.eq(site_id))
+        .select((aliases::path, aliases::canonical_target))
+        .order(aliases::path)
+        .load::<(String, String)>(tx)?;
+    for (path, target) in &alias_entries {
+        hasher.update(&(path.len() as u64).to_le_bytes());
+        hasher.update(path.as_bytes());
+        hasher.update(&(target.len() as u64).to_le_bytes());
+        hasher.update(target.as_bytes());
+    }
     let tree_hash = format!("blake3:{}", hasher.finalize().to_hex());
     let mut manifest = format!(
         "version = 1\nhost = \"{}\"\nname = \"{}\"\nmanaged = {managed}\ncontent_revision = {}\ntree_hash = \"{}\"\n\n[files]\n",
@@ -6167,6 +7055,18 @@ fn regenerate_site(
     for (path, hash) in &entries {
         writeln!(manifest, "\"{}\" = \"blake3:{}\"", toml_escape(path), hash)
             .expect("writing to String cannot fail");
+    }
+    if !alias_entries.is_empty() {
+        manifest.push_str("\n[aliases]\n");
+        for (path, target) in &alias_entries {
+            writeln!(
+                manifest,
+                "\"{}\" = \"{}\"",
+                toml_escape(path),
+                toml_escape(target)
+            )
+            .expect("writing to String cannot fail");
+        }
     }
     let expiry_paths = expiry_policies::table
         .filter(expiry_policies::site_id.eq(site_id))
@@ -6360,6 +7260,271 @@ enum NodeKind {
     File { hash: String },
 }
 
+#[derive(Clone)]
+struct RealEntry {
+    hash: String,
+    size: i64,
+}
+
+enum GraphResolution {
+    Missing,
+    Directory,
+    File(RealEntry),
+}
+
+fn load_real_entries(
+    db: &mut SqliteConnection,
+    site_id: i64,
+) -> Result<BTreeMap<String, RealEntry>, StoreError> {
+    let mut entries = files::table
+        .filter(files::site_id.eq(site_id))
+        .filter(files::path.ne(MANIFEST_PATH))
+        .select((files::path, files::hash, files::size))
+        .load::<(String, String, i64)>(db)?
+        .into_iter()
+        .map(|(path, hash, size)| (path, RealEntry { hash, size }))
+        .collect::<BTreeMap<_, _>>();
+    entries.extend(
+        allocated_entries::table
+            .filter(allocated_entries::site_id.eq(site_id))
+            .select((
+                allocated_entries::path,
+                allocated_entries::hash,
+                allocated_entries::size,
+            ))
+            .load::<(String, String, i64)>(db)?
+            .into_iter()
+            .map(|(path, hash, size)| (path, RealEntry { hash, size })),
+    );
+    Ok(entries)
+}
+
+fn path_has_descendant<T>(entries: &BTreeMap<String, T>, path: &str) -> bool {
+    let (start, end) = descendant_bounds(path);
+    entries.range(start..end).next().is_some()
+}
+
+fn alias_substitution<'a>(
+    aliases: &'a BTreeMap<String, String>,
+    path: &str,
+) -> Option<(&'a str, &'a str)> {
+    if let Some((path, target)) = aliases.get_key_value(path) {
+        return Some((path, target));
+    }
+    let mut end = path.len();
+    while let Some(slash) = path[..end].rfind('/') {
+        let prefix = &path[..slash];
+        if let Some((prefix, target)) = aliases.get_key_value(prefix) {
+            return Some((prefix, target));
+        }
+        end = slash;
+    }
+    None
+}
+
+fn resolve_graph_path(
+    real: &BTreeMap<String, RealEntry>,
+    aliases: &BTreeMap<String, String>,
+    initial: &str,
+) -> Result<GraphResolution, StoreError> {
+    resolve_graph_path_final(real, aliases, initial).map(|(resolution, _)| resolution)
+}
+
+fn resolve_graph_path_final(
+    real: &BTreeMap<String, RealEntry>,
+    aliases: &BTreeMap<String, String>,
+    initial: &str,
+) -> Result<(GraphResolution, String), StoreError> {
+    resolve_graph_path_trace(real, aliases, initial).map(|(resolution, path, _)| (resolution, path))
+}
+
+fn resolve_graph_path_trace(
+    real: &BTreeMap<String, RealEntry>,
+    aliases: &BTreeMap<String, String>,
+    initial: &str,
+) -> Result<(GraphResolution, String, Vec<String>), StoreError> {
+    let mut path = initial.to_string();
+    let mut visited = HashSet::new();
+    let mut dependencies = Vec::new();
+    for _ in 0..MAX_ALIAS_HOPS {
+        if !visited.insert(path.clone()) {
+            return Err(StoreError::AliasCycle);
+        }
+        if let Some(entry) = real.get(&path) {
+            return Ok((GraphResolution::File(entry.clone()), path, dependencies));
+        }
+        if let Some((prefix, target)) = alias_substitution(aliases, &path) {
+            dependencies.push(prefix.to_string());
+            let suffix = &path[prefix.len()..];
+            path = format!("{target}{suffix}");
+            continue;
+        }
+        if path_has_descendant(real, &path) || path_has_descendant(aliases, &path) {
+            return Ok((GraphResolution::Directory, path, dependencies));
+        }
+        return Ok((GraphResolution::Missing, path, dependencies));
+    }
+    Err(StoreError::AliasHopLimit)
+}
+
+fn refresh_aliases_locked(tx: &mut SqliteConnection, site_id: i64) -> Result<(), StoreError> {
+    let real = load_real_entries(tx, site_id)?;
+    let rows = aliases::table
+        .filter(aliases::site_id.eq(site_id))
+        .select(AliasRow::as_select())
+        .order(aliases::path)
+        .load::<AliasRow>(tx)?;
+    let graph = rows
+        .iter()
+        .map(|row| (row.path.clone(), row.canonical_target.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut resolved = Vec::with_capacity(rows.len());
+    for row in rows {
+        let (resolution, final_target) =
+            resolve_graph_path_final(&real, &graph, &row.canonical_target)?;
+        if matches!(resolution, GraphResolution::Directory)
+            && row
+                .path
+                .strip_prefix(&final_target)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+        {
+            return Err(StoreError::AliasCycle);
+        }
+        let value = match resolution {
+            GraphResolution::Missing => (None, None, None),
+            GraphResolution::Directory => (Some(AliasResolvedKind::Directory as i64), None, None),
+            GraphResolution::File(file) => (
+                Some(AliasResolvedKind::File as i64),
+                Some(file.hash),
+                Some(file.size),
+            ),
+        };
+        // Resolving the alias path itself catches prefix-substitution cycles that
+        // are not visible by following only its canonical target.
+        resolve_graph_path(&real, &graph, &row.path)?;
+        if (
+            row.resolved_kind,
+            row.resolved_hash.as_ref(),
+            row.resolved_size,
+        ) != (value.0, value.1.as_ref(), value.2)
+        {
+            resolved.push((row.path, value));
+        }
+    }
+    for (path, (kind, hash, size)) in resolved {
+        diesel::update(aliases::table.find((site_id, path.as_str())))
+            .set((
+                aliases::resolved_kind.eq(kind),
+                aliases::resolved_hash.eq(hash),
+                aliases::resolved_size.eq(size),
+            ))
+            .execute(tx)?;
+    }
+    Ok(())
+}
+
+fn validate_alias_graph_with_staged(
+    tx: &mut SqliteConnection,
+    site_id: i64,
+    staged: &[&StagedFile],
+) -> Result<(), StoreError> {
+    let mut real = load_real_entries(tx, site_id)?;
+    for file in staged {
+        real.insert(
+            file.path.clone(),
+            RealEntry {
+                hash: file.hash.clone(),
+                size: file.size,
+            },
+        );
+    }
+    let graph = aliases::table
+        .filter(aliases::site_id.eq(site_id))
+        .select((aliases::path, aliases::canonical_target))
+        .load::<(String, String)>(tx)?
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    for (path, target) in &graph {
+        let (resolution, final_target) = resolve_graph_path_final(&real, &graph, target)?;
+        if matches!(resolution, GraphResolution::Directory)
+            && path
+                .strip_prefix(&final_target)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+        {
+            return Err(StoreError::AliasCycle);
+        }
+        resolve_graph_path(&real, &graph, path)?;
+    }
+    Ok(())
+}
+
+fn reject_alias_write_locked(
+    db: &mut SqliteConnection,
+    site_id: i64,
+    path: &str,
+    allow_exact: bool,
+) -> Result<(), StoreError> {
+    reject_alias_writes_locked(db, site_id, [path], allow_exact)
+}
+
+fn reject_expiry_below_alias_locked(
+    db: &mut SqliteConnection,
+    site_id: i64,
+    path: &str,
+) -> Result<(), StoreError> {
+    let ancestors = aggregate_paths(path)
+        .into_iter()
+        .filter(|ancestor| !ancestor.is_empty())
+        .collect::<Vec<_>>();
+    if ancestors.is_empty() {
+        return Ok(());
+    }
+    let found = aliases::table
+        .filter(aliases::site_id.eq(site_id))
+        .filter(aliases::path.eq_any(ancestors))
+        .select(aliases::site_id)
+        .first::<i64>(db)
+        .optional()?
+        .is_some();
+    if found {
+        Err(StoreError::AliasWrite)
+    } else {
+        Ok(())
+    }
+}
+
+fn reject_alias_writes_locked<'a>(
+    db: &mut SqliteConnection,
+    site_id: i64,
+    paths: impl IntoIterator<Item = &'a str>,
+    allow_exact: bool,
+) -> Result<(), StoreError> {
+    let alias_paths = aliases::table
+        .filter(aliases::site_id.eq(site_id))
+        .select(aliases::path)
+        .load::<String>(db)?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    for path in paths {
+        let ancestor_conflict = aggregate_paths(path)
+            .into_iter()
+            .filter(|ancestor| !ancestor.is_empty())
+            .any(|ancestor| alias_paths.contains(ancestor));
+        let (descendant_start, descendant_end) = descendant_bounds(path);
+        let descendant_conflict = alias_paths
+            .range(descendant_start..descendant_end)
+            .next()
+            .is_some();
+        if (!allow_exact && alias_paths.contains(path))
+            || ancestor_conflict
+            || (!allow_exact && descendant_conflict)
+        {
+            return Err(StoreError::AliasWrite);
+        }
+    }
+    Ok(())
+}
+
 fn site_exists_locked(
     db: &mut SqliteConnection,
     name: &str,
@@ -6416,6 +7581,9 @@ fn node_locked(db: &mut SqliteConnection, name: &str, rel: &str) -> Result<NodeK
     if let Some(hash) = allocated {
         return Ok(NodeKind::File { hash });
     }
+    if let Some(node) = alias_node_locked(db, site_id, rel)? {
+        return Ok(node);
+    }
     let (prefix_start, prefix_end) = descendant_bounds(rel);
     let regular_dir_exists = files::table
         .filter(files::site_id.eq(site_id))
@@ -6433,11 +7601,270 @@ fn node_locked(db: &mut SqliteConnection, name: &str, rel: &str) -> Result<NodeK
         .first::<i64>(db)
         .optional()?
         .is_some();
-    Ok(if regular_dir_exists || allocated_dir_exists {
-        NodeKind::Dir
+    let alias_dir_exists = aliases::table
+        .filter(aliases::site_id.eq(site_id))
+        .filter(aliases::path.ge(&prefix_start))
+        .filter(aliases::path.lt(&prefix_end))
+        .select(aliases::site_id)
+        .first::<i64>(db)
+        .optional()?
+        .is_some();
+    Ok(
+        if regular_dir_exists || allocated_dir_exists || alias_dir_exists {
+            NodeKind::Dir
+        } else {
+            NodeKind::Missing
+        },
+    )
+}
+
+fn alias_node_locked(
+    db: &mut SqliteConnection,
+    site_id: i64,
+    rel: &str,
+) -> Result<Option<NodeKind>, StoreError> {
+    let direct_alias = aliases::table
+        .find((site_id, rel))
+        .select((aliases::resolved_kind, aliases::resolved_hash))
+        .first::<(Option<i64>, Option<String>)>(db)
+        .optional()?;
+    if let Some((kind, hash)) = direct_alias {
+        return Ok(Some(match (kind, hash) {
+            (Some(kind), Some(hash)) if kind == AliasResolvedKind::File as i64 => {
+                NodeKind::File { hash }
+            }
+            (Some(kind), _) if kind == AliasResolvedKind::Directory as i64 => NodeKind::Dir,
+            _ => NodeKind::Missing,
+        }));
+    }
+    let ancestor_paths = aggregate_paths(rel)
+        .into_iter()
+        .filter(|path| !path.is_empty())
+        .collect::<Vec<_>>();
+    let has_alias_ancestor = if ancestor_paths.is_empty() {
+        false
     } else {
-        NodeKind::Missing
-    })
+        aliases::table
+            .filter(aliases::site_id.eq(site_id))
+            .filter(aliases::path.eq_any(&ancestor_paths))
+            .select(aliases::site_id)
+            .first::<i64>(db)
+            .optional()?
+            .is_some()
+    };
+    if has_alias_ancestor {
+        let candidate_aliases = aliases::table
+            .filter(aliases::site_id.eq(site_id))
+            .select((aliases::path, aliases::canonical_target))
+            .load::<(String, String)>(db)?;
+        let graph = candidate_aliases.into_iter().collect::<BTreeMap<_, _>>();
+        let real_entries = load_real_entries(db, site_id)?;
+        return Ok(Some(
+            match resolve_graph_path(&real_entries, &graph, rel)? {
+                GraphResolution::Missing => NodeKind::Missing,
+                GraphResolution::Directory => NodeKind::Dir,
+                GraphResolution::File(file) => NodeKind::File { hash: file.hash },
+            },
+        ));
+    }
+    Ok(None)
+}
+
+fn resolved_alias_directory_target_locked(
+    db: &mut SqliteConnection,
+    name: &str,
+    rel: &str,
+) -> Result<Option<String>, StoreError> {
+    let site_id = site_id_locked(db, name)?;
+    let (resolved, target, used_alias) = resolve_db_path_final(db, site_id, rel)?;
+    match resolved {
+        GraphResolution::Directory if used_alias => Ok(Some(target)),
+        GraphResolution::Missing | GraphResolution::File(_) | GraphResolution::Directory => {
+            Ok(None)
+        }
+    }
+}
+
+fn resolve_db_path_final(
+    db: &mut SqliteConnection,
+    site_id: i64,
+    initial: &str,
+) -> Result<(GraphResolution, String, bool), StoreError> {
+    let mut path = initial.to_string();
+    let mut visited = HashSet::new();
+    let mut used_alias = false;
+    for _ in 0..MAX_ALIAS_HOPS {
+        if !visited.insert(path.clone()) {
+            return Err(StoreError::AliasCycle);
+        }
+        let file = files::table
+            .find((site_id, path.as_str()))
+            .select((files::hash, files::size))
+            .first::<(String, i64)>(db)
+            .optional()?;
+        record_alias_resolution_rows(usize::from(file.is_some()));
+        if let Some((hash, size)) = file {
+            return Ok((
+                GraphResolution::File(RealEntry { hash, size }),
+                path,
+                used_alias,
+            ));
+        }
+        let allocated = allocated_entries::table
+            .find((site_id, path.as_str()))
+            .select((allocated_entries::hash, allocated_entries::size))
+            .first::<(String, i64)>(db)
+            .optional()?;
+        record_alias_resolution_rows(usize::from(allocated.is_some()));
+        if let Some((hash, size)) = allocated {
+            return Ok((
+                GraphResolution::File(RealEntry { hash, size }),
+                path,
+                used_alias,
+            ));
+        }
+        let mut candidates = aggregate_paths(&path)
+            .into_iter()
+            .filter(|candidate| !candidate.is_empty())
+            .collect::<Vec<_>>();
+        candidates.push(path.as_str());
+        candidates.sort_unstable();
+        candidates.dedup();
+        let substitutions = aliases::table
+            .filter(aliases::site_id.eq(site_id))
+            .filter(aliases::path.eq_any(candidates))
+            .select((aliases::path, aliases::canonical_target))
+            .load::<(String, String)>(db)?;
+        record_alias_resolution_rows(substitutions.len());
+        if let Some((prefix, target)) = substitutions
+            .into_iter()
+            .max_by_key(|(prefix, _)| prefix.len())
+        {
+            let suffix = &path[prefix.len()..];
+            path = format!("{target}{suffix}");
+            used_alias = true;
+            continue;
+        }
+        let (start, end) = descendant_bounds(&path);
+        let file_descendant = files::table
+            .filter(files::site_id.eq(site_id))
+            .filter(files::path.ge(&start))
+            .filter(files::path.lt(&end))
+            .select(files::site_id)
+            .first::<i64>(db)
+            .optional()?
+            .is_some();
+        record_alias_resolution_rows(usize::from(file_descendant));
+        let allocated_descendant = if file_descendant {
+            false
+        } else {
+            let found = allocated_entries::table
+                .filter(allocated_entries::site_id.eq(site_id))
+                .filter(allocated_entries::path.ge(&start))
+                .filter(allocated_entries::path.lt(&end))
+                .select(allocated_entries::site_id)
+                .first::<i64>(db)
+                .optional()?
+                .is_some();
+            record_alias_resolution_rows(usize::from(found));
+            found
+        };
+        let alias_descendant = if file_descendant || allocated_descendant {
+            false
+        } else {
+            let found = aliases::table
+                .filter(aliases::site_id.eq(site_id))
+                .filter(aliases::path.ge(&start))
+                .filter(aliases::path.lt(&end))
+                .select(aliases::site_id)
+                .first::<i64>(db)
+                .optional()?
+                .is_some();
+            record_alias_resolution_rows(usize::from(found));
+            found
+        };
+        if file_descendant || allocated_descendant || alias_descendant {
+            return Ok((GraphResolution::Directory, path, used_alias));
+        }
+        return Ok((GraphResolution::Missing, path, used_alias));
+    }
+    Err(StoreError::AliasHopLimit)
+}
+
+fn load_alias_directory_files(
+    db: &mut SqliteConnection,
+    name: &str,
+    logical: &str,
+    target: &str,
+) -> Result<Vec<(String, u64)>, StoreError> {
+    let site_id = site_id_locked(db, name)?;
+    let (start, end) = descendant_bounds(target);
+    let mut rows = files::table
+        .filter(files::site_id.eq(site_id))
+        .filter(files::path.ge(&start))
+        .filter(files::path.lt(&end))
+        .select((files::path, files::size))
+        .load::<(String, i64)>(db)?;
+    rows.extend(
+        allocated_entries::table
+            .filter(allocated_entries::site_id.eq(site_id))
+            .filter(allocated_entries::path.ge(&start))
+            .filter(allocated_entries::path.lt(&end))
+            .select((allocated_entries::path, allocated_entries::size))
+            .load::<(String, i64)>(db)?,
+    );
+    record_alias_listed_file_rows(rows.len());
+    rows.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    Ok(rows
+        .into_iter()
+        .map(|(path, size)| {
+            (
+                format!("{logical}{}", &path[target.len()..]),
+                size.cast_unsigned(),
+            )
+        })
+        .collect())
+}
+
+fn load_directory_aliases(
+    db: &mut SqliteConnection,
+    name: &str,
+    logical: &str,
+    physical: &str,
+) -> Result<Vec<AliasEntry>, StoreError> {
+    let site_id = site_id_locked(db, name)?;
+    let mut query = aliases::table
+        .filter(aliases::site_id.eq(site_id))
+        .into_boxed();
+    if !physical.is_empty() {
+        let (start, end) = descendant_bounds(physical);
+        query = query
+            .filter(aliases::path.ge(start))
+            .filter(aliases::path.lt(end));
+    }
+    let rows = query
+        .select(AliasRow::as_select())
+        .order(aliases::path)
+        .load::<AliasRow>(db)?;
+    record_alias_listed_rows(rows.len());
+    rows.into_iter()
+        .filter_map(|mut row| {
+            let suffix = if physical.is_empty() {
+                Some(row.path.clone())
+            } else {
+                row.path
+                    .strip_prefix(physical)
+                    .and_then(|suffix| suffix.strip_prefix('/'))
+                    .map(str::to_string)
+            }?;
+            row.path = if logical.is_empty() {
+                suffix
+            } else {
+                format!("{logical}/{suffix}")
+            };
+            Some(alias_entry(row))
+        })
+        .collect()
 }
 
 fn load_root_files(
@@ -6602,6 +8029,8 @@ fn dirents(files: &[(String, u64)], rel: &str) -> DirList {
     DirList {
         files: total_files,
         bytes: total_bytes,
+        alias_count: 0,
+        aliases: Vec::new(),
         entries: dirs,
     }
 }
@@ -6692,12 +8121,16 @@ fn site_files(
     let entries = site_manifest(db, name)?;
     let mut files = Vec::new();
     for entry in entries {
-        let bytes = blobs.read(&entry.hash)?;
-        if !is_junk(Path::new(&entry.path), Some(&bytes)) {
-            files.push(ArchiveFile {
-                path: entry.path,
-                bytes,
-            });
+        match entry {
+            ArchiveEntry::File { path, hash, .. } => {
+                let bytes = blobs.read(&hash)?;
+                if !is_junk(Path::new(&path), Some(&bytes)) {
+                    files.push(ArchiveFile::File { path, bytes });
+                }
+            }
+            ArchiveEntry::Alias { path, target } => {
+                files.push(ArchiveFile::Alias { path, target });
+            }
         }
     }
     Ok(SiteArchive { files })
@@ -6711,7 +8144,7 @@ fn site_manifest(db: &mut SqliteConnection, name: &str) -> Result<Vec<ArchiveEnt
         .order(files::path)
         .load::<(String, String, i64)>(db)?
         .into_iter()
-        .map(|(path, hash, size)| ArchiveEntry {
+        .map(|(path, hash, size)| ArchiveEntry::File {
             path,
             hash,
             size: size.cast_unsigned(),
@@ -6726,14 +8159,28 @@ fn site_manifest(db: &mut SqliteConnection, name: &str) -> Result<Vec<ArchiveEnt
         ))
         .load::<(String, String, i64)>(db)?;
     for (path, hash, size) in allocated {
-        entries.push(ArchiveEntry {
+        entries.push(ArchiveEntry::File {
             hash,
             path,
             size: size.cast_unsigned(),
         });
     }
-    entries.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+    entries.extend(
+        aliases::table
+            .filter(aliases::site_id.eq(site_id))
+            .select((aliases::path, aliases::canonical_target))
+            .load::<(String, String)>(db)?
+            .into_iter()
+            .map(|(path, target)| ArchiveEntry::Alias { path, target }),
+    );
+    entries.sort_unstable_by(|left, right| archive_path(left).cmp(archive_path(right)));
     Ok(entries)
+}
+
+fn archive_path(entry: &ArchiveEntry) -> &str {
+    match entry {
+        ArchiveEntry::File { path, .. } | ArchiveEntry::Alias { path, .. } => path,
+    }
 }
 
 fn write_site_archive(
@@ -6761,16 +8208,24 @@ fn append_tar_entries<W: Write>(
     files: &[ArchiveEntry],
 ) -> io::Result<W> {
     let mut archive = tar::Builder::new(writer);
-    for file in files {
-        let mut header = tar::Header::new_gnu();
-        header.set_size(file.size);
-        header.set_mode(0o644);
-        header.set_cksum();
-        archive.append_data(
-            &mut header,
-            &file.path,
-            fs::File::open(blobs.path(&file.hash))?,
-        )?;
+    for entry in files {
+        match entry {
+            ArchiveEntry::File { path, hash, size } => {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(*size);
+                header.set_mode(0o644);
+                header.set_cksum();
+                archive.append_data(&mut header, path, fs::File::open(blobs.path(hash))?)?;
+            }
+            ArchiveEntry::Alias { path, target } => {
+                let relative = relative_alias_target(path, target);
+                let mut header = tar::Header::new_gnu();
+                header.set_entry_type(tar::EntryType::Symlink);
+                header.set_size(0);
+                header.set_mode(0o777);
+                archive.append_link(&mut header, path, relative)?;
+            }
+        }
     }
     archive.into_inner()
 }
@@ -6784,24 +8239,85 @@ fn write_zip_entries(
     let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated)
         .unix_permissions(0o644);
-    for file in files {
-        archive
-            .start_file(&file.path, options)
-            .map_err(io::Error::other)?;
-        io::copy(&mut fs::File::open(blobs.path(&file.hash))?, &mut archive)?;
+    for entry in files {
+        match entry {
+            ArchiveEntry::File { path, hash, .. } => {
+                archive
+                    .start_file(path, options)
+                    .map_err(io::Error::other)?;
+                io::copy(&mut fs::File::open(blobs.path(hash))?, &mut archive)?;
+            }
+            ArchiveEntry::Alias { path, target } => {
+                let relative = zip_safe_relative_alias_target(path, target)?;
+                archive
+                    .add_symlink(
+                        path,
+                        relative,
+                        zip::write::SimpleFileOptions::default().unix_permissions(0o777),
+                    )
+                    .map_err(io::Error::other)?;
+            }
+        }
     }
     archive.finish().map(|_| ()).map_err(io::Error::other)
+}
+
+fn relative_alias_target(path: &str, target: &str) -> String {
+    let parent = path.rsplit_once('/').map_or("", |(parent, _)| parent);
+    let from = if parent.is_empty() {
+        Vec::new()
+    } else {
+        parent.split('/').collect::<Vec<_>>()
+    };
+    let to = target.split('/').collect::<Vec<_>>();
+    let common = from
+        .iter()
+        .zip(&to)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let mut parts = vec![".."; from.len() - common];
+    parts.extend_from_slice(&to[common..]);
+    if parts.is_empty() {
+        ".".to_string()
+    } else {
+        parts.join("/")
+    }
+}
+
+fn zip_safe_relative_alias_target(path: &str, target: &str) -> io::Result<String> {
+    let relative = relative_alias_target(path, target);
+    if relative.len() > MAX_ALIAS_TARGET_BYTES {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "alias target exceeds ZIP-safe limit",
+        ))
+    } else {
+        Ok(relative)
+    }
 }
 
 #[cfg(test)]
 fn append_tar<W: Write>(writer: W, files: &[ArchiveFile]) -> io::Result<W> {
     let mut archive = tar::Builder::new(writer);
     for file in files {
-        let mut header = tar::Header::new_gnu();
-        header.set_size(file.bytes.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-        archive.append_data(&mut header, &file.path, file.bytes.as_slice())?;
+        match file {
+            ArchiveFile::File { path, bytes } => {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(bytes.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                archive.append_data(&mut header, path, bytes.as_slice())?;
+            }
+            ArchiveFile::Alias { path, target } => {
+                let mut header = tar::Header::new_gnu();
+                header.set_entry_type(tar::EntryType::Symlink);
+                header.set_size(0);
+                header.set_mode(0o777);
+                header.set_link_name(relative_alias_target(path, target))?;
+                header.set_cksum();
+                archive.append_data(&mut header, path, io::empty())?;
+            }
+        }
     }
     archive.into_inner()
 }
@@ -6824,10 +8340,24 @@ fn pack_zip(files: &[ArchiveFile]) -> io::Result<Vec<u8>> {
         .compression_method(zip::CompressionMethod::Deflated)
         .unix_permissions(0o644);
     for file in files {
-        archive
-            .start_file(&file.path, options)
-            .map_err(io::Error::other)?;
-        archive.write_all(&file.bytes)?;
+        match file {
+            ArchiveFile::File { path, bytes } => {
+                archive
+                    .start_file(path, options)
+                    .map_err(io::Error::other)?;
+                archive.write_all(bytes)?;
+            }
+            ArchiveFile::Alias { path, target } => {
+                let relative = zip_safe_relative_alias_target(path, target)?;
+                archive
+                    .add_symlink(
+                        path,
+                        relative,
+                        zip::write::SimpleFileOptions::default().unix_permissions(0o777),
+                    )
+                    .map_err(io::Error::other)?;
+            }
+        }
     }
     archive
         .finish()
@@ -6933,6 +8463,32 @@ mod tests {
         millis: AtomicU64,
     }
 
+    #[derive(Default)]
+    struct ReferenceAliases {
+        files: HashSet<String>,
+        aliases: BTreeMap<String, String>,
+    }
+
+    impl ReferenceAliases {
+        fn resolves_file(&self, path: &str) -> bool {
+            let mut current = path.to_string();
+            let mut visited = HashSet::new();
+            for _ in 0..MAX_ALIAS_HOPS {
+                if self.files.contains(&current) {
+                    return true;
+                }
+                if !visited.insert(current.clone()) {
+                    return false;
+                }
+                let Some(target) = self.aliases.get(&current) else {
+                    return false;
+                };
+                current.clone_from(target);
+            }
+            false
+        }
+    }
+
     impl TestClock {
         fn new(millis: u64) -> Self {
             Self {
@@ -6948,6 +8504,1087 @@ mod tests {
     impl Clock for TestClock {
         fn now_millis(&self) -> i64 {
             i64::try_from(self.millis.load(Ordering::Relaxed)).expect("test time fits in i64")
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn aliases_resolve_files_chains_directories_and_dangling_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+        store
+            .put_file("alias-test", "assets/app.js", b"app")
+            .unwrap();
+
+        let first = store
+            .put_alias(
+                "alias-test",
+                "latest.js",
+                "assets/app.js",
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        assert!(first.created);
+        let direct = store.alias("alias-test", "latest.js").unwrap();
+        assert_eq!(direct.resolved_kind, Some(AliasResolvedKind::File));
+        assert_eq!(direct.resolved_size, Some(3));
+        let Node::File { hash, .. } = store.lookup("alias-test", "latest.js").unwrap() else {
+            panic!("file alias must resolve");
+        };
+        assert_eq!(Some(hash), direct.resolved_hash);
+
+        store
+            .put_aliases(
+                "alias-test",
+                &[
+                    AliasSpec {
+                        path: "chain.js",
+                        target: "latest.js",
+                    },
+                    AliasSpec {
+                        path: "static",
+                        target: "assets",
+                    },
+                    AliasSpec {
+                        path: "missing",
+                        target: "future/file.txt",
+                    },
+                ],
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        assert!(matches!(
+            store.lookup("alias-test", "chain.js"),
+            Ok(Node::File { .. })
+        ));
+        assert!(matches!(
+            store.lookup("alias-test", "static/app.js"),
+            Ok(Node::File { .. })
+        ));
+        let static_listing = store.list_dir("alias-test", "static").unwrap();
+        assert_eq!(static_listing.files, 1);
+        assert_eq!(static_listing.entries[0].name, "app.js");
+        assert!(matches!(
+            store.lookup("alias-test", "missing"),
+            Err(StoreError::NotFound)
+        ));
+        store
+            .put_file("alias-test", "future/file.txt", b"future")
+            .unwrap();
+        assert!(matches!(
+            store.lookup("alias-test", "missing"),
+            Ok(Node::File { .. })
+        ));
+        let deleted = store.delete_file("alias-test", "future/file.txt").unwrap();
+        assert_eq!(
+            store.alias("alias-test", "missing").unwrap().resolved_kind,
+            None
+        );
+        store
+            .undo(
+                "alias-test",
+                deleted.undo.as_ref().map(|undo| undo.token.as_str()),
+            )
+            .unwrap();
+        assert!(matches!(
+            store.lookup("alias-test", "missing"),
+            Ok(Node::File { .. })
+        ));
+        assert_eq!(store.aliases("alias-test").unwrap().len(), 4);
+        let inventory = store.alias_inventory("alias-test").unwrap();
+        assert_eq!(inventory.aliases.len(), 4);
+        assert_eq!(
+            store.alias_stats("alias-test").unwrap(),
+            AliasStats {
+                aliases: 4,
+                resolved: 4,
+                dangling: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn directory_listings_include_nested_aliases_without_inflating_files_or_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+        store
+            .put_file("alias-list", "tree/file.txt", b"1234")
+            .unwrap();
+        let baseline = store.list_dir("alias-list", "").unwrap();
+        store
+            .put_alias(
+                "alias-list",
+                "tree/nested/link",
+                "../file.txt",
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        store
+            .put_alias("alias-list", "view", "tree", FileMutationOptions::default())
+            .unwrap();
+
+        let root = store.list_dir("alias-list", "").unwrap();
+        assert_eq!(root.alias_count, 2);
+        assert_eq!(root.files, baseline.files);
+        assert!(
+            root.entries
+                .iter()
+                .all(|entry| entry.name != "view" && entry.name != "link")
+        );
+        let tree = store.list_dir("alias-list", "tree").unwrap();
+        assert_eq!(tree.alias_count, 1);
+        assert_eq!(tree.aliases[0].path, "tree/nested/link");
+        assert_eq!(tree.files, 1);
+        let view = store.list_dir("alias-list", "view").unwrap();
+        assert_eq!(view.alias_count, 1);
+        assert_eq!(view.aliases[0].path, "view/nested/link");
+        assert_eq!(view.files, 1);
+        assert_eq!(view.bytes, 4);
+    }
+
+    #[test]
+    fn alias_security_conflicts_cycles_no_follow_and_undo_are_atomic() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+        store.put_file("alias-safe", "real/file.txt", b"x").unwrap();
+        assert!(matches!(
+            store.put_alias(
+                "alias-safe",
+                "bad",
+                "../../outside",
+                FileMutationOptions::default()
+            ),
+            Err(StoreError::InvalidAliasTarget)
+        ));
+        assert!(matches!(
+            store.put_alias(
+                "alias-safe",
+                "real/file.txt",
+                "other",
+                FileMutationOptions::default()
+            ),
+            Err(StoreError::AliasConflict)
+        ));
+        store
+            .put_alias("alias-safe", "a", "b", FileMutationOptions::default())
+            .unwrap();
+        assert!(matches!(
+            store.put_alias("alias-safe", "b", "a", FileMutationOptions::default()),
+            Err(StoreError::AliasCycle)
+        ));
+        assert!(store.alias("alias-safe", "b").is_err());
+        store
+            .put_alias(
+                "alias-safe",
+                "linked",
+                "real",
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        assert!(matches!(
+            store.put_file("alias-safe", "linked/new.txt", b"no"),
+            Err(StoreError::AliasWrite)
+        ));
+        let mutation = store
+            .put_alias(
+                "alias-safe",
+                "temporary",
+                "real/file.txt",
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        store
+            .undo(
+                "alias-safe",
+                mutation.undo.as_ref().map(|undo| undo.token.as_str()),
+            )
+            .unwrap();
+        assert!(store.alias("alias-safe", "temporary").is_err());
+
+        let chain = (0..65)
+            .map(|index| {
+                (
+                    format!("hop-{index:02}"),
+                    if index == 64 {
+                        "real/file.txt".to_string()
+                    } else {
+                        format!("hop-{:02}", index + 1)
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let specs = chain
+            .iter()
+            .map(|(path, target)| AliasSpec { path, target })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            store.put_aliases("alias-safe", &specs, FileMutationOptions::default()),
+            Err(StoreError::AliasHopLimit)
+        ));
+        assert!(store.alias("alias-safe", "hop-00").is_err());
+    }
+
+    #[test]
+    fn aliases_reject_containment_cycles_and_prefix_shadowing_in_both_orders() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+        store.put_file("alias-prefix", "seed.txt", b"x").unwrap();
+        assert!(matches!(
+            store.put_alias(
+                "alias-prefix",
+                "dir/link",
+                ".",
+                FileMutationOptions::default()
+            ),
+            Err(StoreError::AliasCycle)
+        ));
+        assert!(matches!(
+            store.put_aliases(
+                "alias-prefix",
+                &[
+                    AliasSpec {
+                        path: "root-link",
+                        target: "dir",
+                    },
+                    AliasSpec {
+                        path: "dir/back",
+                        target: "../root-link",
+                    },
+                ],
+                FileMutationOptions::default(),
+            ),
+            Err(StoreError::AliasCycle)
+        ));
+
+        store
+            .put_file("alias-prefix", "existing/child.txt", b"x")
+            .unwrap();
+        assert!(matches!(
+            store.put_alias(
+                "alias-prefix",
+                "existing",
+                "seed.txt",
+                FileMutationOptions::default()
+            ),
+            Err(StoreError::AliasConflict)
+        ));
+
+        store
+            .put_alias(
+                "alias-prefix",
+                "first",
+                "seed.txt",
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        assert!(matches!(
+            store.put_file("alias-prefix", "first/child.txt", b"x"),
+            Err(StoreError::AliasWrite)
+        ));
+        assert!(matches!(
+            store.put_alias(
+                "alias-prefix",
+                "first/child",
+                "seed.txt",
+                FileMutationOptions::default()
+            ),
+            Err(StoreError::AliasWrite)
+        ));
+    }
+
+    #[test]
+    fn alias_targets_allow_safe_punctuation_but_reject_noise_controls_and_external_uris() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+        for target in ["name:part", "query?part", "hash#part"] {
+            store
+                .put_file("alias-paths", target, target.as_bytes())
+                .unwrap();
+            store
+                .put_alias(
+                    "alias-paths",
+                    &format!("link-{}", target.len()),
+                    target,
+                    FileMutationOptions::default(),
+                )
+                .unwrap();
+        }
+        for target in [
+            "https://example.test/file",
+            "mailto:user@example.test",
+            "data:text/plain,x",
+            "file:///tmp/x",
+            ".DS_Store",
+            "dir/\nname",
+        ] {
+            assert!(matches!(
+                store.put_alias(
+                    "alias-paths",
+                    "rejected",
+                    target,
+                    FileMutationOptions::default()
+                ),
+                Err(StoreError::InvalidAliasTarget)
+            ));
+        }
+        for path in ["bad\npath", "/absolute", r"back\slash", ".DS_Store"] {
+            assert!(matches!(
+                store.put_alias(
+                    "alias-paths",
+                    path,
+                    "name:part",
+                    FileMutationOptions::default()
+                ),
+                Err(StoreError::InvalidAliasTarget)
+            ));
+        }
+    }
+
+    #[test]
+    fn alias_retarget_reports_created_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+        store.put_file("alias-created", "one", b"1").unwrap();
+        store.put_file("alias-created", "two", b"2").unwrap();
+        store
+            .put_alias(
+                "alias-created",
+                "link",
+                "one",
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        let retargeted = store
+            .put_alias(
+                "alias-created",
+                "link",
+                "two",
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        assert!(!retargeted.created);
+        assert!(retargeted.changed);
+    }
+
+    #[test]
+    fn alias_batch_database_failure_rolls_back_every_row_and_undo_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+        store.put_file("alias-failure", "target", b"x").unwrap();
+        let undo_count = store.undo_stack("alias-failure").unwrap().entries.len();
+        {
+            let mut db = store.inner.writer.lock().unwrap();
+            db.batch_execute(
+                "CREATE TEMP TRIGGER fail_second_alias
+                 BEFORE INSERT ON aliases
+                 WHEN NEW.path = 'b'
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected alias failure');
+                 END;",
+            )
+            .unwrap();
+        }
+        assert!(
+            store
+                .put_aliases(
+                    "alias-failure",
+                    &[
+                        AliasSpec {
+                            path: "a",
+                            target: "target",
+                        },
+                        AliasSpec {
+                            path: "b",
+                            target: "target",
+                        },
+                    ],
+                    FileMutationOptions::default(),
+                )
+                .is_err()
+        );
+        assert!(store.aliases("alias-failure").unwrap().is_empty());
+        assert_eq!(
+            store.undo_stack("alias-failure").unwrap().entries.len(),
+            undo_count
+        );
+    }
+
+    #[test]
+    fn alias_inventory_identity_and_rows_share_one_reader_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+        store.put_file("alias-snapshot", "target", b"x").unwrap();
+        store
+            .put_alias(
+                "alias-snapshot",
+                "first",
+                "target",
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        let initial = store.alias_inventory("alias-snapshot").unwrap();
+        let (identity_tx, identity_rx) = std::sync::mpsc::sync_channel(0);
+        let (continue_tx, continue_rx) = std::sync::mpsc::sync_channel(0);
+        {
+            let mut readers = store.inner.readers.available.lock().unwrap();
+            let db = readers.last_mut().unwrap();
+            let mut paused = false;
+            db.set_instrumentation(move |event: diesel::connection::InstrumentationEvent<'_>| {
+                if paused {
+                    return;
+                }
+                if let diesel::connection::InstrumentationEvent::FinishQuery {
+                    query,
+                    error: None,
+                    ..
+                } = event
+                {
+                    let sql = query.to_string();
+                    if sql.contains("content_revision") && sql.contains("sites") {
+                        paused = true;
+                        identity_tx.send(()).unwrap();
+                        continue_rx.recv().unwrap();
+                    }
+                }
+            });
+            drop(readers);
+        }
+        let reader_store = store.clone();
+        let reader =
+            std::thread::spawn(move || reader_store.alias_inventory("alias-snapshot").unwrap());
+        identity_rx.recv().unwrap();
+        store
+            .put_alias(
+                "alias-snapshot",
+                "second",
+                "target",
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        continue_tx.send(()).unwrap();
+        let snapshot = reader.join().unwrap();
+        assert_eq!(snapshot.content_revision, initial.content_revision);
+        assert_eq!(snapshot.aliases, initial.aliases);
+        assert_eq!(store.aliases("alias-snapshot").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn alias_archives_export_relative_symlink_metadata_for_tar_and_zip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("store")).unwrap();
+        store
+            .put_file("alias-archive", "assets/app.js", b"app")
+            .unwrap();
+        store
+            .put_alias(
+                "alias-archive",
+                "current/app.js",
+                "../assets/app.js",
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        for (format, kind, extension) in [
+            (ArchiveFormat::Tar, Kind::Tar, "tar"),
+            (ArchiveFormat::Zip, Kind::Zip, "zip"),
+        ] {
+            let archive = dir.path().join(format!("site.{extension}"));
+            store
+                .pack_site_to_path("alias-archive", format, &archive)
+                .unwrap();
+            let plan = crate::upload::plan_archive(&archive, kind).unwrap();
+            assert!(plan.members.contains(&crate::upload::ArchiveMember::Alias {
+                path: "current/app.js".to_string(),
+                canonical_target: "assets/app.js".to_string(),
+            }));
+        }
+    }
+
+    #[test]
+    fn tar_alias_export_supports_gnu_long_link_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("store")).unwrap();
+        let target = format!("{}/file.txt", "long".repeat(30));
+        store.put_file("alias-long", &target, b"x").unwrap();
+        store
+            .put_alias(
+                "alias-long",
+                "link",
+                &target,
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        let archive = dir.path().join("long.tar");
+        store
+            .pack_site_to_path("alias-long", ArchiveFormat::Tar, &archive)
+            .unwrap();
+        let plan = crate::upload::plan_archive(&archive, Kind::Tar).unwrap();
+        assert!(plan.members.contains(&crate::upload::ArchiveMember::Alias {
+            path: "link".to_string(),
+            canonical_target: target,
+        }));
+    }
+
+    #[test]
+    fn copy_move_and_whole_site_undo_preserve_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+        store.put_file("alias-source", "file.txt", b"x").unwrap();
+        store
+            .put_alias(
+                "alias-source",
+                "link.txt",
+                "file.txt",
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        store
+            .copy_site("alias-source", Some("alias-copy"), None)
+            .unwrap();
+        assert!(matches!(
+            store.lookup("alias-copy", "link.txt"),
+            Ok(Node::File { .. })
+        ));
+        store.move_site("alias-copy", "alias-moved").unwrap();
+        assert!(matches!(
+            store.lookup("alias-moved", "link.txt"),
+            Ok(Node::File { .. })
+        ));
+        store.undo("alias-moved", None).unwrap();
+        assert!(matches!(
+            store.lookup("alias-copy", "link.txt"),
+            Ok(Node::File { .. })
+        ));
+        store.pop_site("alias-copy").unwrap();
+        store.undo("alias-copy", None).unwrap();
+        assert!(matches!(
+            store.lookup("alias-copy", "link.txt"),
+            Ok(Node::File { .. })
+        ));
+    }
+
+    #[test]
+    fn alias_expiry_removes_only_the_alias_and_undo_restores_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(TestClock::new(1_700_000_000_000));
+        let store_clock = Arc::<TestClock>::clone(&clock);
+        let store = Store::with_clock(
+            dir.path().to_path_buf(),
+            "http://symbol".to_string(),
+            store_clock,
+        )
+        .unwrap();
+        store
+            .put_file("alias-expiry", "dir/file.txt", b"x")
+            .unwrap();
+        store
+            .put_alias(
+                "alias-expiry",
+                "linked",
+                "dir",
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        store
+            .set_expiry(
+                "alias-expiry",
+                "linked",
+                Some(ExpiryPolicy::Relative {
+                    duration_seconds: 1,
+                }),
+            )
+            .unwrap();
+        clock.advance(1_001);
+        assert_eq!(store.sweep_expired().unwrap(), 1);
+        assert!(store.alias("alias-expiry", "linked").is_err());
+        assert!(matches!(
+            store.lookup("alias-expiry", "dir/file.txt"),
+            Ok(Node::File { .. })
+        ));
+        store.undo("alias-expiry", None).unwrap();
+        assert!(matches!(
+            store.lookup("alias-expiry", "linked/file.txt"),
+            Ok(Node::File { .. })
+        ));
+    }
+
+    #[test]
+    fn alias_expiry_is_zero_cost_dangling_safe_and_rejects_paths_below_directory_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(TestClock::new(1_700_000_000_000));
+        let store = Store::with_clock(
+            dir.path().to_path_buf(),
+            "http://symbol".to_string(),
+            Arc::<TestClock>::clone(&clock),
+        )
+        .unwrap();
+        store
+            .put_file("alias-expiry-rules", "target/file.txt", b"1234")
+            .unwrap();
+        let baseline = store.list_sites().unwrap();
+        store
+            .put_alias(
+                "alias-expiry-rules",
+                "linked",
+                "target",
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        let after_alias = store.list_sites().unwrap();
+        assert_eq!(after_alias.files, baseline.files);
+        assert_eq!(after_alias.bytes, baseline.bytes);
+        assert!(matches!(
+            store.set_expiry(
+                "alias-expiry-rules",
+                "linked/file.txt",
+                Some(ExpiryPolicy::Relative {
+                    duration_seconds: 60
+                })
+            ),
+            Err(StoreError::AliasWrite)
+        ));
+        store
+            .set_expiry(
+                "alias-expiry-rules",
+                "linked",
+                Some(ExpiryPolicy::Relative {
+                    duration_seconds: 60,
+                }),
+            )
+            .unwrap();
+        store
+            .delete_file("alias-expiry-rules", "target/file.txt")
+            .unwrap();
+        assert_eq!(
+            store
+                .alias("alias-expiry-rules", "linked")
+                .unwrap()
+                .resolved_kind,
+            None
+        );
+        assert!(store.expiry_report("alias-expiry-rules", "linked").is_ok());
+        clock.advance(60_001);
+        assert_eq!(store.sweep_expired().unwrap(), 1);
+        assert!(store.alias("alias-expiry-rules", "linked").is_err());
+    }
+
+    #[test]
+    fn alias_retarget_and_dependency_changes_refresh_expiry_kind_size_and_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(TestClock::new(1_700_000_000_000));
+        let store_clock = Arc::<TestClock>::clone(&clock);
+        let store = Store::with_clock(
+            dir.path().to_path_buf(),
+            "http://symbol".to_string(),
+            store_clock,
+        )
+        .unwrap();
+        store.put_file("alias-policy", "small", b"x").unwrap();
+        store
+            .put_file("alias-policy", "folder/large", &[0_u8; 4096])
+            .unwrap();
+        store
+            .put_alias(
+                "alias-policy",
+                "linked",
+                "small",
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        store
+            .set_expiry(
+                "alias-policy",
+                "linked",
+                Some(ExpiryPolicy::Decay(DecayPolicy {
+                    min_age_seconds: 10,
+                    max_age_seconds: 1_000,
+                    max_size_bytes: 10_000,
+                    power: 1.0,
+                })),
+            )
+            .unwrap();
+        let site_id = {
+            let mut db = store.inner.readers.get();
+            site_id_locked(&mut db, "alias-policy").unwrap()
+        };
+        let before = {
+            let mut db = store.inner.readers.get();
+            load_expiry_policy_locked(&mut db, site_id, "linked")
+                .unwrap()
+                .unwrap()
+        };
+        clock.advance(1_000);
+        store
+            .put_alias(
+                "alias-policy",
+                "linked",
+                "folder",
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        let after = {
+            let mut db = store.inner.readers.get();
+            load_expiry_policy_locked(&mut db, site_id, "linked")
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(after.kind, ExpiryTargetKind::Folder);
+        assert_eq!(after.size_bytes, 0);
+        assert_ne!(after.own_deadline_millis, before.own_deadline_millis);
+
+        clock.advance(1_000);
+        store
+            .put_file("alias-policy", "folder/another", &[0_u8; 4096])
+            .unwrap();
+        let dependency_changed = {
+            let mut db = store.inner.readers.get();
+            load_expiry_policy_locked(&mut db, site_id, "linked")
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(dependency_changed.size_bytes, 0);
+        assert_ne!(
+            dependency_changed.own_deadline_millis,
+            after.own_deadline_millis
+        );
+    }
+
+    #[test]
+    fn intermediate_alias_retarget_refreshes_transitive_alias_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(TestClock::new(1_700_000_000_000));
+        let store = Store::with_clock(
+            dir.path().to_path_buf(),
+            "http://symbol".to_string(),
+            Arc::<TestClock>::clone(&clock),
+        )
+        .unwrap();
+        store.put_file("alias-transitive", "one", b"1").unwrap();
+        store.put_file("alias-transitive", "two", b"22").unwrap();
+        store
+            .put_alias(
+                "alias-transitive",
+                "middle",
+                "one",
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        store
+            .put_alias(
+                "alias-transitive",
+                "outer",
+                "middle",
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        store
+            .set_expiry(
+                "alias-transitive",
+                "outer",
+                Some(ExpiryPolicy::Relative {
+                    duration_seconds: 60,
+                }),
+            )
+            .unwrap();
+        let before = store.expiry_report("alias-transitive", "outer").unwrap();
+        clock.advance(1_000);
+        store
+            .put_alias(
+                "alias-transitive",
+                "middle",
+                "two",
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        let after = store.expiry_report("alias-transitive", "outer").unwrap();
+        assert_ne!(after.refreshed_at, before.refreshed_at);
+        assert_ne!(after.effective_expires_at, before.effective_expires_at);
+    }
+
+    #[test]
+    fn directory_alias_listing_row_work_is_prefix_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+        store.put_file("alias-bounded", "tree/a", b"a").unwrap();
+        store.put_file("alias-bounded", "tree/b", b"b").unwrap();
+        for index in 0..256 {
+            store
+                .put_file("alias-bounded", &format!("unrelated/{index:03}"), b"x")
+                .unwrap();
+        }
+        store
+            .put_alias(
+                "alias-bounded",
+                "tree/nested",
+                "a",
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        let unrelated_paths = (0..256)
+            .map(|index| format!("unrelated-links/{index:03}"))
+            .collect::<Vec<_>>();
+        let unrelated = unrelated_paths
+            .iter()
+            .map(|path| AliasSpec {
+                path,
+                target: "../unrelated/000",
+            })
+            .collect::<Vec<_>>();
+        store
+            .put_aliases("alias-bounded", &unrelated, FileMutationOptions::default())
+            .unwrap();
+        store
+            .put_alias(
+                "alias-bounded",
+                "view",
+                "tree",
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+
+        reset_alias_directory_row_work();
+        let listing = store.list_dir("alias-bounded", "view").unwrap();
+        let work = alias_directory_row_work();
+        assert_eq!(listing.files, 2);
+        assert_eq!(listing.alias_count, 1);
+        assert_eq!(work.files, 2);
+        assert_eq!(work.aliases, 1);
+        assert!(work.resolution <= 8);
+    }
+
+    #[test]
+    fn zip_safe_alias_target_limit_roundtrips_at_boundary_and_rejects_overflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("store")).unwrap();
+        let boundary = format!("{}aa", "a/".repeat((MAX_ALIAS_TARGET_BYTES - 2) / 2));
+        assert_eq!(boundary.len(), MAX_ALIAS_TARGET_BYTES);
+        store.put_file("alias-limit", "seed", b"x").unwrap();
+        store
+            .put_alias(
+                "alias-limit",
+                "link",
+                &boundary,
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        let archive = dir.path().join("boundary.zip");
+        store
+            .pack_site_to_path("alias-limit", ArchiveFormat::Zip, &archive)
+            .unwrap();
+        let plan = crate::upload::plan_archive(&archive, Kind::Zip).unwrap();
+        assert!(plan.members.contains(&crate::upload::ArchiveMember::Alias {
+            path: "link".to_string(),
+            canonical_target: boundary.clone(),
+        }));
+
+        let overflow = format!("{boundary}x");
+        assert!(matches!(
+            store.put_alias(
+                "alias-limit",
+                "too-long",
+                &overflow,
+                FileMutationOptions::default()
+            ),
+            Err(StoreError::InvalidAliasTarget)
+        ));
+    }
+
+    #[test]
+    fn alias_batch_scales_to_42802_entries_atomically() {
+        const ALIAS_COUNT: usize = 42_802;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+        store.put_file("alias-scale", "target.txt", b"x").unwrap();
+        let paths = (0..ALIAS_COUNT)
+            .map(|index| format!("links/{index:05}.txt"))
+            .collect::<Vec<_>>();
+        let specs = paths
+            .iter()
+            .map(|path| AliasSpec {
+                path,
+                target: "../target.txt",
+            })
+            .collect::<Vec<_>>();
+        let mutation = store
+            .put_aliases("alias-scale", &specs, FileMutationOptions::default())
+            .unwrap();
+        assert_eq!(mutation.files, ALIAS_COUNT);
+        assert_eq!(
+            store.alias_stats("alias-scale").unwrap().resolved,
+            ALIAS_COUNT as u64
+        );
+        assert!(matches!(
+            store.lookup("alias-scale", "links/42801.txt"),
+            Ok(Node::File { .. })
+        ));
+        let alias_queries = Arc::new(AtomicU64::new(0));
+        {
+            let counter = Arc::clone(&alias_queries);
+            let mut db = store.inner.writer.lock().unwrap();
+            db.set_instrumentation(move |event: diesel::connection::InstrumentationEvent<'_>| {
+                if let diesel::connection::InstrumentationEvent::StartQuery { query, .. } = event {
+                    let sql = query.to_string();
+                    if sql.contains("SELECT") && sql.contains("aliases") {
+                        counter.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            });
+        }
+        let hash = blake3::hash(b"x").to_hex().to_string();
+        let staged = (0..ALIAS_COUNT)
+            .map(|index| StagedFile {
+                path: format!("files/{index:05}.txt"),
+                size: 1,
+                hash: hash.clone(),
+                source: StagedSource::Bytes(vec![b'x']),
+                sanitized: TokenCounts::default(),
+            })
+            .collect::<Vec<_>>();
+        let file_mutation = store
+            .merge_staged("alias-scale", &staged, UndoKind::Put)
+            .unwrap();
+        let no_op = store
+            .put_aliases("alias-scale", &specs, FileMutationOptions::default())
+            .unwrap();
+        assert!(!no_op.changed);
+        let bounded_alias_queries = alias_queries.load(Ordering::Relaxed);
+        assert!(
+            (1..=12).contains(&bounded_alias_queries),
+            "alias query work must stay batch-bounded"
+        );
+        store
+            .undo(
+                "alias-scale",
+                file_mutation.undo.as_ref().map(|undo| undo.token.as_str()),
+            )
+            .unwrap();
+        store
+            .undo(
+                "alias-scale",
+                mutation.undo.as_ref().map(|undo| undo.token.as_str()),
+            )
+            .unwrap();
+        assert_eq!(store.alias_stats("alias-scale").unwrap().aliases, 0);
+    }
+
+    #[test]
+    fn alias_cache_refresh_writes_only_rows_whose_resolution_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+        store.put_file("alias-cache", "target", b"x").unwrap();
+        let paths = (0..128)
+            .map(|index| format!("links/{index:03}"))
+            .collect::<Vec<_>>();
+        let specs = paths
+            .iter()
+            .map(|path| AliasSpec {
+                path,
+                target: "../target",
+            })
+            .collect::<Vec<_>>();
+        store
+            .put_aliases("alias-cache", &specs, FileMutationOptions::default())
+            .unwrap();
+        {
+            let mut db = store.inner.writer.lock().unwrap();
+            db.batch_execute(
+                "CREATE TEMP TABLE alias_update_count (count INTEGER NOT NULL);
+                 INSERT INTO alias_update_count VALUES (0);
+                 CREATE TEMP TRIGGER count_alias_cache_updates
+                 BEFORE UPDATE ON aliases
+                 BEGIN
+                   UPDATE alias_update_count SET count = count + 1;
+                 END;",
+            )
+            .unwrap();
+        }
+        store.put_file("alias-cache", "unrelated", b"u").unwrap();
+        {
+            let mut db = store.inner.writer.lock().unwrap();
+            let count = diesel::sql_query("SELECT count FROM alias_update_count")
+                .get_result::<AliasUpdateCount>(&mut *db)
+                .unwrap()
+                .count;
+            assert_eq!(count, 0);
+            diesel::sql_query("UPDATE alias_update_count SET count = 0")
+                .execute(&mut *db)
+                .unwrap();
+        }
+        store.put_file("alias-cache", "target", b"changed").unwrap();
+        let mut db = store.inner.writer.lock().unwrap();
+        let count = diesel::sql_query("SELECT count FROM alias_update_count")
+            .get_result::<AliasUpdateCount>(&mut *db)
+            .unwrap()
+            .count;
+        drop(db);
+        assert_eq!(count, 128);
+    }
+
+    #[test]
+    fn deterministic_alias_sequences_match_the_simple_reference_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+        store.put_file("alias-model", "seed.txt", b"seed").unwrap();
+        let mut reference = ReferenceAliases::default();
+        reference.files.insert("seed.txt".to_string());
+        let mut state = 0x42_u64;
+        for index in 0..256 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            let path = format!("alias-{index:03}");
+            let target = match state % 5 {
+                0 => "seed.txt".to_string(),
+                1 if index > 0 => format!(
+                    "alias-{:03}",
+                    usize::try_from(state % u64::try_from(index).expect("index fits in u64"))
+                        .expect("bounded index fits in usize")
+                ),
+                _ => format!("missing-{:03}", state % 31),
+            };
+            store
+                .put_alias(
+                    "alias-model",
+                    &path,
+                    &target,
+                    FileMutationOptions::default(),
+                )
+                .unwrap();
+            reference.aliases.insert(path.clone(), target);
+            if index > 0 && index % 11 == 0 {
+                let retargeted = format!("alias-{:03}", index / 2);
+                store
+                    .put_alias(
+                        "alias-model",
+                        &retargeted,
+                        "seed.txt",
+                        FileMutationOptions::default(),
+                    )
+                    .unwrap();
+                reference.aliases.insert(retargeted, "seed.txt".to_string());
+            }
+            if index > 0 && index % 53 == 0 {
+                let deleted = format!("alias-{:03}", index / 3);
+                store.delete_file("alias-model", &deleted).unwrap();
+                reference.aliases.remove(&deleted);
+            }
+            if index > 0 && index % 37 == 0 {
+                store.delete_file("alias-model", "seed.txt").unwrap();
+                reference.files.remove("seed.txt");
+                for alias in reference.aliases.keys() {
+                    assert_eq!(
+                        store.lookup("alias-model", alias).is_ok(),
+                        reference.resolves_file(alias)
+                    );
+                }
+                store.put_file("alias-model", "seed.txt", b"seed").unwrap();
+                reference.files.insert("seed.txt".to_string());
+            }
+            for alias in reference.aliases.keys() {
+                assert_eq!(
+                    store.lookup("alias-model", alias).is_ok(),
+                    reference.resolves_file(alias)
+                );
+            }
         }
     }
 

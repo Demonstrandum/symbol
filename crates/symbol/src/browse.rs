@@ -531,6 +531,8 @@ mod tests {
         let list = DirList {
             files: 8,
             bytes: 3_774_464,
+            alias_count: 0,
+            aliases: Vec::new(),
             entries: vec![
                 DirEnt {
                     kind: EntryKind::Directory,
@@ -638,6 +640,8 @@ mod tests {
         let list = DirList {
             files: 1,
             bytes: 512,
+            alias_count: 0,
+            aliases: Vec::new(),
             entries: vec![DirEnt {
                 kind: EntryKind::File,
                 name: "index.html".to_string(),
