@@ -26,8 +26,17 @@ diesel::table! {
     files (site_id, path) {
         site_id -> BigInt,
         path -> Text,
+        kind -> BigInt,
         hash -> Text,
         size -> BigInt,
+    }
+}
+
+diesel::table! {
+    site_entries (site_id, path) {
+        site_id -> BigInt,
+        path -> Text,
+        kind -> BigInt,
     }
 }
 
@@ -159,14 +168,99 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    undo_file_deltas (token, path) {
+        token -> Text,
+        path -> Text,
+        existed -> BigInt,
+        kind -> Nullable<BigInt>,
+        hash -> Nullable<Text>,
+        size -> Nullable<BigInt>,
+    }
+}
+
+diesel::table! {
+    allocated_entries (site_id, path) {
+        site_id -> BigInt,
+        path -> Text,
+        kind -> BigInt,
+        hash -> Text,
+        size -> BigInt,
+        naming_mode -> BigInt,
+        prefix -> Text,
+        suffix -> Text,
+        extension -> Nullable<Text>,
+        media_type -> Text,
+    }
+}
+
+diesel::table! {
+    pending_allocations (token) {
+        token -> Text,
+        site_id -> BigInt,
+        folder -> Text,
+        hash -> Text,
+        size -> BigInt,
+        media_type -> Text,
+        request_fingerprint -> Text,
+        created -> BigInt,
+        expires -> BigInt,
+    }
+}
+
+diesel::table! {
+    undo_allocated_deltas (token, path) {
+        token -> Text,
+        path -> Text,
+        existed -> BigInt,
+        hash -> Nullable<Text>,
+        size -> Nullable<BigInt>,
+        naming_mode -> Nullable<BigInt>,
+        prefix -> Nullable<Text>,
+        suffix -> Nullable<Text>,
+        extension -> Nullable<Text>,
+        media_type -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
+    aliases (site_id, path) {
+        site_id -> BigInt,
+        path -> Text,
+        kind -> BigInt,
+        canonical_target -> Text,
+        resolved_kind -> Nullable<BigInt>,
+        resolved_hash -> Nullable<Text>,
+        resolved_size -> Nullable<BigInt>,
+    }
+}
+
+diesel::table! {
+    undo_alias_deltas (token, path) {
+        token -> Text,
+        path -> Text,
+        existed -> BigInt,
+        canonical_target -> Nullable<Text>,
+        resolved_kind -> Nullable<BigInt>,
+        resolved_hash -> Nullable<Text>,
+        resolved_size -> Nullable<BigInt>,
+    }
+}
+
+diesel::joinable!(site_entries -> sites (site_id));
 diesel::joinable!(files -> sites (site_id));
 diesel::joinable!(files -> blobs (hash));
 diesel::joinable!(expiry_policies -> sites (site_id));
 diesel::joinable!(path_aggregates -> sites (site_id));
+diesel::joinable!(pending_allocations -> sites (site_id));
+diesel::joinable!(undo_file_deltas -> undo_operations (token));
+diesel::joinable!(undo_allocated_deltas -> undo_operations (token));
+diesel::joinable!(undo_alias_deltas -> undo_operations (token));
 
 diesel::allow_tables_to_appear_in_same_query!(
     sites,
     blobs,
+    site_entries,
     files,
     metadata,
     undo_operations,
@@ -180,4 +274,10 @@ diesel::allow_tables_to_appear_in_same_query!(
     management_audit,
     management_idempotency,
     path_aggregates,
+    undo_file_deltas,
+    allocated_entries,
+    pending_allocations,
+    undo_allocated_deltas,
+    aliases,
+    undo_alias_deltas,
 );

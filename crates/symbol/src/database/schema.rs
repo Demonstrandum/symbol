@@ -1,11 +1,16 @@
 use std::fmt::Write as _;
 
+#[cfg(test)]
+use sea_query::Query;
 use sea_query::{
-    Alias, ColumnDef, ForeignKey, ForeignKeyAction, Iden, Index, IndexCreateStatement, IntoIden,
-    IntoTableRef, SqliteQueryBuilder, Table, TableCreateStatement,
+    Alias, ColumnDef, Expr, ExprTrait, ForeignKey, ForeignKeyAction, Iden, Index,
+    IndexCreateStatement, IntoIden, IntoTableRef, SqliteQueryBuilder, Table, TableCreateStatement,
 };
 
-pub const LATEST_SCHEMA_VERSION: i64 = 6;
+pub const LATEST_SCHEMA_VERSION: i64 = 9;
+pub const FILE_ENTRY_KIND: i64 = 0;
+pub const ALLOCATED_ENTRY_KIND: i64 = 1;
+pub const ALIAS_ENTRY_KIND: i64 = 2;
 
 #[derive(Iden)]
 enum Sites {
@@ -36,8 +41,117 @@ enum Files {
     Table,
     SiteId,
     Path,
+    Kind,
     Hash,
     Size,
+}
+
+#[derive(Iden)]
+enum FilesV6 {
+    Table,
+}
+
+#[derive(Iden)]
+enum FilesV8 {
+    Table,
+}
+
+#[cfg(test)]
+#[derive(Iden)]
+enum FilesV9 {
+    Table,
+}
+
+#[derive(Iden)]
+enum SiteEntries {
+    Table,
+    SiteId,
+    Path,
+    Kind,
+}
+
+#[derive(Iden)]
+enum UndoFileDeltas {
+    Table,
+    Token,
+    Path,
+    Existed,
+    Kind,
+    Hash,
+    Size,
+}
+
+#[derive(Iden)]
+enum AllocatedEntries {
+    Table,
+    SiteId,
+    Path,
+    Kind,
+    Hash,
+    Size,
+    NamingMode,
+    Prefix,
+    Suffix,
+    Extension,
+    MediaType,
+}
+
+#[derive(Iden)]
+enum AllocatedEntriesV8 {
+    Table,
+}
+
+#[derive(Iden)]
+enum PendingAllocations {
+    Table,
+    Token,
+    SiteId,
+    Folder,
+    Hash,
+    Size,
+    MediaType,
+    RequestFingerprint,
+    Created,
+    Expires,
+}
+
+#[derive(Iden)]
+enum UndoAllocatedDeltas {
+    Table,
+    Token,
+    Path,
+    Existed,
+    Hash,
+    Size,
+    NamingMode,
+    Prefix,
+    Suffix,
+    Extension,
+    MediaType,
+}
+
+#[derive(Iden)]
+enum Aliases {
+    Table,
+    SiteId,
+    Path,
+    Kind,
+    CanonicalTarget,
+    ResolvedKind,
+    ResolvedHash,
+    ResolvedSize,
+}
+
+#[derive(Iden)]
+enum UndoAliasDeltas {
+    Table,
+    Token,
+    Path,
+    Existed,
+    CanonicalTarget,
+    ResolvedKind,
+    ResolvedHash,
+    ResolvedSize,
 }
 
 #[derive(Iden)]
@@ -171,6 +285,7 @@ pub fn tables() -> Vec<TableCreateStatement> {
     vec![
         sites_table(),
         blobs_table(),
+        site_entries_table(),
         files_table(),
         metadata_table(),
         undo_operations_table(),
@@ -184,11 +299,130 @@ pub fn tables() -> Vec<TableCreateStatement> {
         management_audit_table(),
         management_idempotency_table(),
         path_aggregates_table(),
+        undo_file_deltas_table(),
+        allocated_entries_table(),
+        pending_allocations_table(),
+        undo_allocated_deltas_table(),
+        aliases_table(),
+        undo_alias_deltas_table(),
     ]
 }
 
 pub fn indexes() -> Vec<IndexCreateStatement> {
     vec![
+        index("files_hash", Files::Table, [Files::Hash]),
+        index(
+            "files_site_prefix",
+            Files::Table,
+            [Files::SiteId, Files::Path],
+        ),
+        index(
+            "files_site_hash",
+            Files::Table,
+            [Files::SiteId, Files::Hash],
+        ),
+        index(
+            "undo_operations_retention",
+            UndoOperations::Table,
+            [
+                UndoOperations::Consumed,
+                UndoOperations::Expires,
+                UndoOperations::Created,
+            ],
+        ),
+        index(
+            "undo_names_stack",
+            UndoNames::Table,
+            [UndoNames::Name, UndoNames::Token],
+        ),
+        index("undo_files_hash", UndoFiles::Table, [UndoFiles::Hash]),
+        index(
+            "expiry_policies_deadline",
+            ExpiryPolicies::Table,
+            [ExpiryPolicies::OwnDeadline],
+        ),
+        index(
+            "expiry_policies_site_kind",
+            ExpiryPolicies::Table,
+            [
+                ExpiryPolicies::SiteId,
+                ExpiryPolicies::TargetKind,
+                ExpiryPolicies::Path,
+            ],
+        ),
+        index(
+            "idempotency_records_expiry",
+            IdempotencyRecords::Table,
+            [IdempotencyRecords::Expires],
+        ),
+        index(
+            "management_idempotency_expiry",
+            ManagementIdempotency::Table,
+            [ManagementIdempotency::Expires],
+        ),
+        index(
+            "management_audit_site",
+            ManagementAudit::Table,
+            [ManagementAudit::SiteName, ManagementAudit::Occurred],
+        ),
+        index(
+            "pending_allocations_expiry",
+            PendingAllocations::Table,
+            [PendingAllocations::Expires],
+        ),
+        index(
+            "aliases_dependency",
+            Aliases::Table,
+            [Aliases::SiteId, Aliases::CanonicalTarget],
+        ),
+        index(
+            "aliases_cache",
+            Aliases::Table,
+            [
+                Aliases::SiteId,
+                Aliases::ResolvedKind,
+                Aliases::ResolvedHash,
+                Aliases::ResolvedSize,
+            ],
+        ),
+    ]
+}
+
+pub fn schema_sql() -> String {
+    let mut sql = String::from("-- AUTO-GENERATED FROM crates/symbol/src/database/schema.rs\n");
+    sql.push_str("PRAGMA foreign_keys = ON;\n\n");
+    for table in tables() {
+        sql.push_str(&table.to_string(SqliteQueryBuilder));
+        sql.push_str(";\n\n");
+    }
+    for index in indexes() {
+        sql.push_str(&index.to_string(SqliteQueryBuilder));
+        sql.push_str(";\n");
+    }
+    writeln!(sql, "\nPRAGMA user_version = {LATEST_SCHEMA_VERSION};")
+        .expect("writing to String cannot fail");
+    sql
+}
+
+pub fn schema_v6_sql() -> String {
+    let tables = vec![
+        sites_table(),
+        blobs_table(),
+        files_v6_table(),
+        metadata_table(),
+        undo_operations_table(),
+        undo_names_table(),
+        undo_sites_table(),
+        undo_files_table(),
+        expiry_policies_table(),
+        undo_expiry_policies_table(),
+        idempotency_records_table(),
+        management_tombstones_table(),
+        management_audit_table(),
+        management_idempotency_table(),
+        path_aggregates_table(),
+    ];
+    let indexes = vec![
         index("files_hash", Files::Table, [Files::Hash]),
         index(
             "files_site_prefix",
@@ -239,22 +473,18 @@ pub fn indexes() -> Vec<IndexCreateStatement> {
             ManagementAudit::Table,
             [ManagementAudit::SiteName, ManagementAudit::Occurred],
         ),
-    ]
-}
-
-pub fn schema_sql() -> String {
+    ];
     let mut sql = String::from("-- AUTO-GENERATED FROM crates/symbol/src/database/schema.rs\n");
     sql.push_str("PRAGMA foreign_keys = ON;\n\n");
-    for table in tables() {
+    for table in tables {
         sql.push_str(&table.to_string(SqliteQueryBuilder));
         sql.push_str(";\n\n");
     }
-    for index in indexes() {
+    for index in indexes {
         sql.push_str(&index.to_string(SqliteQueryBuilder));
         sql.push_str(";\n");
     }
-    writeln!(sql, "\nPRAGMA user_version = {LATEST_SCHEMA_VERSION};")
-        .expect("writing to String cannot fail");
+    sql.push_str("\nPRAGMA user_version = 6;\n");
     sql
 }
 
@@ -327,6 +557,188 @@ pub fn upgrade_v2_to_v6() -> Vec<String> {
             .to_string(SqliteQueryBuilder),
         path_aggregates_table().to_string(SqliteQueryBuilder),
     ]
+}
+
+pub fn upgrade_v6_to_v7_before_copy() -> Vec<String> {
+    vec![site_entries_table().to_string(SqliteQueryBuilder)]
+}
+
+pub fn upgrade_v6_to_v7_after_backfill() -> Vec<String> {
+    vec![
+        Table::rename()
+            .table(Files::Table, FilesV6::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        files_table().to_string(SqliteQueryBuilder),
+    ]
+}
+
+pub fn upgrade_v6_to_v7_after_file_copy() -> Vec<String> {
+    vec![
+        Table::drop()
+            .table(FilesV6::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        index("files_hash", Files::Table, [Files::Hash]).to_string(SqliteQueryBuilder),
+        index(
+            "files_site_prefix",
+            Files::Table,
+            [Files::SiteId, Files::Path],
+        )
+        .to_string(SqliteQueryBuilder),
+        undo_file_deltas_table().to_string(SqliteQueryBuilder),
+    ]
+}
+
+pub fn upgrade_v7_to_v8() -> Vec<String> {
+    vec![
+        allocated_entries_table().to_string(SqliteQueryBuilder),
+        pending_allocations_table().to_string(SqliteQueryBuilder),
+        undo_allocated_deltas_table().to_string(SqliteQueryBuilder),
+        index(
+            "files_site_hash",
+            Files::Table,
+            [Files::SiteId, Files::Hash],
+        )
+        .to_string(SqliteQueryBuilder),
+        index(
+            "pending_allocations_expiry",
+            PendingAllocations::Table,
+            [PendingAllocations::Expires],
+        )
+        .to_string(SqliteQueryBuilder),
+    ]
+}
+
+pub fn upgrade_v8_to_v9() -> Vec<String> {
+    vec![
+        Table::rename()
+            .table(Files::Table, FilesV8::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        Table::rename()
+            .table(AllocatedEntries::Table, AllocatedEntriesV8::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        files_table().to_string(SqliteQueryBuilder),
+        allocated_entries_table().to_string(SqliteQueryBuilder),
+        "INSERT INTO \"files\" (\"site_id\", \"path\", \"kind\", \"hash\", \"size\")
+         SELECT \"site_id\", \"path\", \"kind\", \"hash\", \"size\" FROM \"files_v8\""
+            .to_string(),
+        "INSERT INTO \"allocated_entries\"
+            (\"site_id\", \"path\", \"kind\", \"hash\", \"size\", \"naming_mode\", \"prefix\",
+             \"suffix\", \"extension\", \"media_type\")
+         SELECT \"site_id\", \"path\", \"kind\", \"hash\", \"size\", \"naming_mode\", \"prefix\",
+                \"suffix\", \"extension\", \"media_type\"
+         FROM \"allocated_entries_v8\""
+            .to_string(),
+        Table::drop()
+            .table(FilesV8::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        Table::drop()
+            .table(AllocatedEntriesV8::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        index("files_hash", Files::Table, [Files::Hash]).to_string(SqliteQueryBuilder),
+        index(
+            "files_site_prefix",
+            Files::Table,
+            [Files::SiteId, Files::Path],
+        )
+        .to_string(SqliteQueryBuilder),
+        index(
+            "files_site_hash",
+            Files::Table,
+            [Files::SiteId, Files::Hash],
+        )
+        .to_string(SqliteQueryBuilder),
+        aliases_table().to_string(SqliteQueryBuilder),
+        undo_alias_deltas_table().to_string(SqliteQueryBuilder),
+        index(
+            "aliases_dependency",
+            Aliases::Table,
+            [Aliases::SiteId, Aliases::CanonicalTarget],
+        )
+        .to_string(SqliteQueryBuilder),
+        index(
+            "aliases_cache",
+            Aliases::Table,
+            [
+                Aliases::SiteId,
+                Aliases::ResolvedKind,
+                Aliases::ResolvedHash,
+                Aliases::ResolvedSize,
+            ],
+        )
+        .to_string(SqliteQueryBuilder),
+    ]
+}
+
+#[cfg(test)]
+pub fn downgrade_v9_to_v6_before_copy() -> Vec<String> {
+    vec![
+        Table::drop()
+            .table(UndoAliasDeltas::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        Table::drop()
+            .table(Aliases::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        Table::drop()
+            .table(UndoAllocatedDeltas::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        Table::drop()
+            .table(PendingAllocations::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        Table::drop()
+            .table(AllocatedEntries::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        Table::drop()
+            .table(UndoFileDeltas::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        Table::rename()
+            .table(Files::Table, FilesV9::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        files_v6_table().to_string(SqliteQueryBuilder),
+    ]
+}
+
+#[cfg(test)]
+pub fn downgrade_v9_to_v6_after_copy() -> Vec<String> {
+    vec![
+        Table::drop()
+            .table(FilesV9::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        Table::drop()
+            .table(SiteEntries::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        index("files_hash", Files::Table, [Files::Hash]).to_string(SqliteQueryBuilder),
+        index(
+            "files_site_prefix",
+            Files::Table,
+            [Files::SiteId, Files::Path],
+        )
+        .to_string(SqliteQueryBuilder),
+    ]
+}
+
+#[cfg(test)]
+pub fn insert_v6_file(site_id: i64, path: &str, hash: &str, size: i64) -> String {
+    Query::insert()
+        .into_table(Files::Table)
+        .columns([Files::SiteId, Files::Path, Files::Hash, Files::Size])
+        .values_panic([site_id.into(), path.into(), hash.into(), size.into()])
+        .to_owned()
+        .to_string(SqliteQueryBuilder)
 }
 
 #[cfg(test)]
@@ -459,6 +871,42 @@ fn files_table() -> TableCreateStatement {
         .if_not_exists()
         .col(ColumnDef::new(Files::SiteId).integer().not_null())
         .col(ColumnDef::new(Files::Path).text().not_null())
+        .col(
+            ColumnDef::new(Files::Kind)
+                .integer()
+                .not_null()
+                .default(FILE_ENTRY_KIND)
+                .check(Expr::col(Files::Kind).eq(FILE_ENTRY_KIND)),
+        )
+        .col(ColumnDef::new(Files::Hash).text().not_null())
+        .col(ColumnDef::new(Files::Size).integer().not_null())
+        .primary_key(Index::create().col(Files::SiteId).col(Files::Path))
+        .foreign_key(
+            ForeignKey::create()
+                .from_tbl(Files::Table)
+                .from_col(Files::SiteId)
+                .from_col(Files::Path)
+                .from_col(Files::Kind)
+                .to_tbl(SiteEntries::Table)
+                .to_col(SiteEntries::SiteId)
+                .to_col(SiteEntries::Path)
+                .to_col(SiteEntries::Kind)
+                .on_delete(ForeignKeyAction::Cascade),
+        )
+        .foreign_key(
+            ForeignKey::create()
+                .from(Files::Table, Files::Hash)
+                .to(Blobs::Table, Blobs::Hash),
+        )
+        .to_owned()
+}
+
+fn files_v6_table() -> TableCreateStatement {
+    Table::create()
+        .table(Files::Table)
+        .if_not_exists()
+        .col(ColumnDef::new(Files::SiteId).integer().not_null())
+        .col(ColumnDef::new(Files::Path).text().not_null())
         .col(ColumnDef::new(Files::Hash).text().not_null())
         .col(ColumnDef::new(Files::Size).integer().not_null())
         .primary_key(Index::create().col(Files::SiteId).col(Files::Path))
@@ -472,6 +920,34 @@ fn files_table() -> TableCreateStatement {
             ForeignKey::create()
                 .from(Files::Table, Files::Hash)
                 .to(Blobs::Table, Blobs::Hash),
+        )
+        .to_owned()
+}
+
+fn site_entries_table() -> TableCreateStatement {
+    Table::create()
+        .table(SiteEntries::Table)
+        .if_not_exists()
+        .col(ColumnDef::new(SiteEntries::SiteId).integer().not_null())
+        .col(ColumnDef::new(SiteEntries::Path).text().not_null())
+        .col(ColumnDef::new(SiteEntries::Kind).integer().not_null())
+        .primary_key(
+            Index::create()
+                .col(SiteEntries::SiteId)
+                .col(SiteEntries::Path),
+        )
+        .index(
+            Index::create()
+                .unique()
+                .col(SiteEntries::SiteId)
+                .col(SiteEntries::Path)
+                .col(SiteEntries::Kind),
+        )
+        .foreign_key(
+            ForeignKey::create()
+                .from(SiteEntries::Table, SiteEntries::SiteId)
+                .to(Sites::Table, Sites::Id)
+                .on_delete(ForeignKeyAction::Cascade),
         )
         .to_owned()
 }
@@ -749,6 +1225,236 @@ fn path_aggregates_table() -> TableCreateStatement {
             ForeignKey::create()
                 .from(PathAggregates::Table, PathAggregates::SiteId)
                 .to(Sites::Table, Sites::Id)
+                .on_delete(ForeignKeyAction::Cascade),
+        )
+        .to_owned()
+}
+
+fn undo_file_deltas_table() -> TableCreateStatement {
+    Table::create()
+        .table(UndoFileDeltas::Table)
+        .if_not_exists()
+        .col(ColumnDef::new(UndoFileDeltas::Token).text().not_null())
+        .col(ColumnDef::new(UndoFileDeltas::Path).text().not_null())
+        .col(ColumnDef::new(UndoFileDeltas::Existed).integer().not_null())
+        .col(ColumnDef::new(UndoFileDeltas::Kind).integer())
+        .col(ColumnDef::new(UndoFileDeltas::Hash).text())
+        .col(ColumnDef::new(UndoFileDeltas::Size).integer())
+        .primary_key(
+            Index::create()
+                .col(UndoFileDeltas::Token)
+                .col(UndoFileDeltas::Path),
+        )
+        .foreign_key(
+            ForeignKey::create()
+                .from(UndoFileDeltas::Table, UndoFileDeltas::Token)
+                .to(UndoOperations::Table, UndoOperations::Token)
+                .on_delete(ForeignKeyAction::Cascade),
+        )
+        .to_owned()
+}
+
+fn allocated_entries_table() -> TableCreateStatement {
+    Table::create()
+        .table(AllocatedEntries::Table)
+        .if_not_exists()
+        .col(
+            ColumnDef::new(AllocatedEntries::SiteId)
+                .integer()
+                .not_null(),
+        )
+        .col(ColumnDef::new(AllocatedEntries::Path).text().not_null())
+        .col(
+            ColumnDef::new(AllocatedEntries::Kind)
+                .integer()
+                .not_null()
+                .default(ALLOCATED_ENTRY_KIND)
+                .check(Expr::col(AllocatedEntries::Kind).eq(ALLOCATED_ENTRY_KIND)),
+        )
+        .col(ColumnDef::new(AllocatedEntries::Hash).text().not_null())
+        .col(ColumnDef::new(AllocatedEntries::Size).integer().not_null())
+        .col(
+            ColumnDef::new(AllocatedEntries::NamingMode)
+                .integer()
+                .not_null(),
+        )
+        .col(ColumnDef::new(AllocatedEntries::Prefix).text().not_null())
+        .col(ColumnDef::new(AllocatedEntries::Suffix).text().not_null())
+        .col(ColumnDef::new(AllocatedEntries::Extension).text())
+        .col(
+            ColumnDef::new(AllocatedEntries::MediaType)
+                .text()
+                .not_null(),
+        )
+        .primary_key(
+            Index::create()
+                .col(AllocatedEntries::SiteId)
+                .col(AllocatedEntries::Path),
+        )
+        .foreign_key(
+            ForeignKey::create()
+                .from_tbl(AllocatedEntries::Table)
+                .from_col(AllocatedEntries::SiteId)
+                .from_col(AllocatedEntries::Path)
+                .from_col(AllocatedEntries::Kind)
+                .to_tbl(SiteEntries::Table)
+                .to_col(SiteEntries::SiteId)
+                .to_col(SiteEntries::Path)
+                .to_col(SiteEntries::Kind)
+                .on_delete(ForeignKeyAction::Cascade),
+        )
+        .foreign_key(
+            ForeignKey::create()
+                .from(AllocatedEntries::Table, AllocatedEntries::Hash)
+                .to(Blobs::Table, Blobs::Hash),
+        )
+        .to_owned()
+}
+
+fn pending_allocations_table() -> TableCreateStatement {
+    Table::create()
+        .table(PendingAllocations::Table)
+        .if_not_exists()
+        .col(
+            ColumnDef::new(PendingAllocations::Token)
+                .text()
+                .primary_key(),
+        )
+        .col(
+            ColumnDef::new(PendingAllocations::SiteId)
+                .integer()
+                .not_null(),
+        )
+        .col(ColumnDef::new(PendingAllocations::Folder).text().not_null())
+        .col(ColumnDef::new(PendingAllocations::Hash).text().not_null())
+        .col(
+            ColumnDef::new(PendingAllocations::Size)
+                .integer()
+                .not_null(),
+        )
+        .col(
+            ColumnDef::new(PendingAllocations::MediaType)
+                .text()
+                .not_null(),
+        )
+        .col(
+            ColumnDef::new(PendingAllocations::RequestFingerprint)
+                .text()
+                .not_null(),
+        )
+        .col(
+            ColumnDef::new(PendingAllocations::Created)
+                .integer()
+                .not_null(),
+        )
+        .col(
+            ColumnDef::new(PendingAllocations::Expires)
+                .integer()
+                .not_null(),
+        )
+        .foreign_key(
+            ForeignKey::create()
+                .from(PendingAllocations::Table, PendingAllocations::SiteId)
+                .to(Sites::Table, Sites::Id)
+                .on_delete(ForeignKeyAction::Cascade),
+        )
+        .foreign_key(
+            ForeignKey::create()
+                .from(PendingAllocations::Table, PendingAllocations::Hash)
+                .to(Blobs::Table, Blobs::Hash),
+        )
+        .to_owned()
+}
+
+fn undo_allocated_deltas_table() -> TableCreateStatement {
+    Table::create()
+        .table(UndoAllocatedDeltas::Table)
+        .if_not_exists()
+        .col(ColumnDef::new(UndoAllocatedDeltas::Token).text().not_null())
+        .col(ColumnDef::new(UndoAllocatedDeltas::Path).text().not_null())
+        .col(
+            ColumnDef::new(UndoAllocatedDeltas::Existed)
+                .integer()
+                .not_null(),
+        )
+        .col(ColumnDef::new(UndoAllocatedDeltas::Hash).text())
+        .col(ColumnDef::new(UndoAllocatedDeltas::Size).integer())
+        .col(ColumnDef::new(UndoAllocatedDeltas::NamingMode).integer())
+        .col(ColumnDef::new(UndoAllocatedDeltas::Prefix).text())
+        .col(ColumnDef::new(UndoAllocatedDeltas::Suffix).text())
+        .col(ColumnDef::new(UndoAllocatedDeltas::Extension).text())
+        .col(ColumnDef::new(UndoAllocatedDeltas::MediaType).text())
+        .primary_key(
+            Index::create()
+                .col(UndoAllocatedDeltas::Token)
+                .col(UndoAllocatedDeltas::Path),
+        )
+        .foreign_key(
+            ForeignKey::create()
+                .from(UndoAllocatedDeltas::Table, UndoAllocatedDeltas::Token)
+                .to(UndoOperations::Table, UndoOperations::Token)
+                .on_delete(ForeignKeyAction::Cascade),
+        )
+        .to_owned()
+}
+
+fn aliases_table() -> TableCreateStatement {
+    Table::create()
+        .table(Aliases::Table)
+        .if_not_exists()
+        .col(ColumnDef::new(Aliases::SiteId).integer().not_null())
+        .col(ColumnDef::new(Aliases::Path).text().not_null())
+        .col(
+            ColumnDef::new(Aliases::Kind)
+                .integer()
+                .not_null()
+                .default(ALIAS_ENTRY_KIND)
+                .check(Expr::col(Aliases::Kind).eq(ALIAS_ENTRY_KIND)),
+        )
+        .col(ColumnDef::new(Aliases::CanonicalTarget).text().not_null())
+        .col(ColumnDef::new(Aliases::ResolvedKind).integer())
+        .col(ColumnDef::new(Aliases::ResolvedHash).text())
+        .col(ColumnDef::new(Aliases::ResolvedSize).integer())
+        .primary_key(Index::create().col(Aliases::SiteId).col(Aliases::Path))
+        .foreign_key(
+            ForeignKey::create()
+                .from_tbl(Aliases::Table)
+                .from_col(Aliases::SiteId)
+                .from_col(Aliases::Path)
+                .from_col(Aliases::Kind)
+                .to_tbl(SiteEntries::Table)
+                .to_col(SiteEntries::SiteId)
+                .to_col(SiteEntries::Path)
+                .to_col(SiteEntries::Kind)
+                .on_delete(ForeignKeyAction::Cascade),
+        )
+        .to_owned()
+}
+
+fn undo_alias_deltas_table() -> TableCreateStatement {
+    Table::create()
+        .table(UndoAliasDeltas::Table)
+        .if_not_exists()
+        .col(ColumnDef::new(UndoAliasDeltas::Token).text().not_null())
+        .col(ColumnDef::new(UndoAliasDeltas::Path).text().not_null())
+        .col(
+            ColumnDef::new(UndoAliasDeltas::Existed)
+                .integer()
+                .not_null(),
+        )
+        .col(ColumnDef::new(UndoAliasDeltas::CanonicalTarget).text())
+        .col(ColumnDef::new(UndoAliasDeltas::ResolvedKind).integer())
+        .col(ColumnDef::new(UndoAliasDeltas::ResolvedHash).text())
+        .col(ColumnDef::new(UndoAliasDeltas::ResolvedSize).integer())
+        .primary_key(
+            Index::create()
+                .col(UndoAliasDeltas::Token)
+                .col(UndoAliasDeltas::Path),
+        )
+        .foreign_key(
+            ForeignKey::create()
+                .from(UndoAliasDeltas::Table, UndoAliasDeltas::Token)
+                .to(UndoOperations::Table, UndoOperations::Token)
                 .on_delete(ForeignKeyAction::Cascade),
         )
         .to_owned()

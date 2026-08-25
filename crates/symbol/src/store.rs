@@ -1,7 +1,9 @@
+#![cfg_attr(not(test), allow(dead_code))]
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -32,8 +34,9 @@ use crate::name::{NameError, generate_id, parse_site_name};
 use crate::pathutil::{PathError, is_junk, is_noise_path, looks_like_apple_fork, safe_rel_path};
 use crate::sanitize::{self, TokenCounts};
 use crate::schema::{
-    blobs, expiry_policies, files, idempotency_records, management_audit, management_idempotency,
-    management_tombstones, metadata, path_aggregates, sites, undo_expiry_policies, undo_files,
+    allocated_entries, blobs, expiry_policies, files, idempotency_records, management_audit,
+    management_idempotency, management_tombstones, metadata, path_aggregates, pending_allocations,
+    site_entries, sites, undo_allocated_deltas, undo_expiry_policies, undo_file_deltas, undo_files,
     undo_names, undo_operations, undo_sites,
 };
 use crate::secrets::{ClaimToken, ClaimTokenHash, ManagementToken, ManagementTokenHash};
@@ -62,6 +65,11 @@ const DEFAULT_BLOB_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_BLOB_CACHE_ENTRIES: usize = 16 * 1024;
 const BLOB_CACHE_ENTRY_OVERHEAD: usize = 128;
 const MAX_READ_CONNECTIONS: usize = 8;
+const PENDING_RETENTION_MILLIS: i64 = 15 * 60 * 1000;
+const MAX_SPLICE_RESULT_SIZE: u64 = 4 * 1024 * 1024 * 1024;
+
+#[cfg(test)]
+type ContentCommitHook = Box<dyn FnOnce() + Send>;
 
 #[derive(Clone)]
 pub struct Store {
@@ -79,6 +87,8 @@ struct Inner {
     public_url: String,
     clock: Arc<dyn Clock>,
     expiry_defaults: DecayPolicy,
+    #[cfg(test)]
+    before_content_commit: Mutex<Option<ContentCommitHook>>,
 }
 
 trait Clock: Send + Sync {
@@ -142,6 +152,7 @@ struct NewSite<'a> {
 struct FileRow {
     site_id: i64,
     path: String,
+    kind: i64,
     hash: String,
     size: i64,
 }
@@ -153,6 +164,90 @@ struct NewFile<'a> {
     path: &'a str,
     hash: &'a str,
     size: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i64)]
+pub enum AllocatedNamingMode {
+    ContentAddressed = 1,
+    Custom = 2,
+}
+
+impl TryFrom<i64> for AllocatedNamingMode {
+    type Error = StoreError;
+
+    fn try_from(value: i64) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::ContentAddressed),
+            2 => Ok(Self::Custom),
+            _ => Err(StoreError::InvalidAllocatedName),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AllocatedMetadata {
+    hash: String,
+    size: i64,
+    naming_mode: AllocatedNamingMode,
+    prefix: String,
+    suffix: String,
+    extension: Option<String>,
+    media_type: String,
+}
+
+#[derive(Debug, Clone)]
+struct PendingMetadata {
+    folder: String,
+    hash: String,
+    size: i64,
+    media_type: String,
+    request_fingerprint: String,
+}
+
+struct AllocationDestination {
+    path: String,
+    naming_mode: AllocatedNamingMode,
+    prefix: String,
+    suffix: String,
+    extension: Option<String>,
+    media_type: String,
+}
+
+#[derive(Queryable, Selectable)]
+#[diesel(table_name = undo_allocated_deltas)]
+struct UndoAllocatedMetadata {
+    path: String,
+    existed: i64,
+    hash: Option<String>,
+    size: Option<i64>,
+    naming_mode: Option<i64>,
+    prefix: Option<String>,
+    suffix: Option<String>,
+    extension: Option<String>,
+    media_type: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+enum PendingFinalName<'a> {
+    Generated(AllocatedName<'a>),
+    Custom(&'a str),
+}
+
+fn ensure_file_entry(
+    db: &mut SqliteConnection,
+    site_id: i64,
+    path: &str,
+) -> Result<(), diesel::result::Error> {
+    diesel::insert_into(site_entries::table)
+        .values((
+            site_entries::site_id.eq(site_id),
+            site_entries::path.eq(path),
+            site_entries::kind.eq(database::schema::FILE_ENTRY_KIND),
+        ))
+        .on_conflict_do_nothing()
+        .execute(db)?;
+    Ok(())
 }
 
 #[derive(Queryable, Selectable)]
@@ -305,6 +400,130 @@ pub struct Idempotency {
     pub key: String,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AllocatedName<'a> {
+    pub prefix: &'a str,
+    pub suffix: &'a str,
+    pub extension: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AllocationSpec<'a> {
+    pub folder: &'a str,
+    pub naming: AllocatedName<'a>,
+    pub media_type: &'a str,
+}
+
+impl Default for AllocationSpec<'_> {
+    fn default() -> Self {
+        Self {
+            folder: "",
+            naming: AllocatedName::default(),
+            media_type: "application/octet-stream",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PendingAllocationSpec<'a> {
+    pub folder: &'a str,
+    pub media_type: &'a str,
+}
+
+impl Default for PendingAllocationSpec<'_> {
+    fn default() -> Self {
+        Self {
+            folder: "",
+            media_type: "application/octet-stream",
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct AllocatedFile {
+    pub path: String,
+    pub hash: String,
+    pub size: u64,
+    pub changed: bool,
+    #[serde(default)]
+    pub replayed: bool,
+    pub mutation: Option<MutationResult>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingAllocation {
+    pub token: String,
+    pub folder: String,
+    pub hash: String,
+    pub size: u64,
+    pub media_type: String,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum AllocationSource<'a> {
+    Bytes(&'a [u8]),
+    File(&'a Path),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum SpliceSource<'a> {
+    Empty,
+    Bytes(&'a [u8]),
+    File(&'a Path),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Splice<'a> {
+    pub offset: u64,
+    pub delete: u64,
+    pub insert: SpliceSource<'a>,
+}
+
+enum PreparedSpliceSource {
+    Empty,
+    Bytes(Vec<u8>),
+    File {
+        path: PathBuf,
+        size: u64,
+        hash: String,
+    },
+}
+
+struct PreparedSplice {
+    offset: u64,
+    delete: u64,
+    insert: PreparedSpliceSource,
+}
+
+struct TemporaryDirectory {
+    path: PathBuf,
+}
+
+impl TemporaryDirectory {
+    fn create(path: PathBuf) -> io::Result<Self> {
+        fs::create_dir_all(&path)?;
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TemporaryDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FileMutationOptions<'a> {
+    pub expected_tree_hash: Option<&'a str>,
+    pub idempotency: Option<&'a Idempotency>,
+    pub authorization: Option<&'a ManagementToken>,
+}
+
 #[derive(Clone, Copy, Default)]
 pub struct PublishOptions<'a> {
     pub expected_tree_hash: Option<&'a str>,
@@ -401,6 +620,17 @@ struct StagedFile {
 enum StagedSource {
     Bytes(Vec<u8>),
     File(PathBuf),
+    Temporary(PathBuf),
+}
+
+impl Drop for StagedFile {
+    fn drop(&mut self) {
+        if let StagedSource::Temporary(path) = &self.source
+            && let Some(parent) = path.parent()
+        {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -442,6 +672,20 @@ pub enum StoreError {
     InvalidIdempotencyKey,
     #[error("error: upstream changed; nothing was written")]
     PreconditionFailed { revision: u64, tree_hash: String },
+    #[error("error: file content hash is stale; current hash is {0}")]
+    StaleContentHash(String),
+    #[error("error: invalid allocated file name")]
+    InvalidAllocatedName,
+    #[error("error: pending allocation token is invalid, expired, or already consumed")]
+    InvalidPendingAllocation,
+    #[error("error: splice ranges must be ordered and non-overlapping")]
+    InvalidSpliceOrder,
+    #[error("error: splice range is outside the original file")]
+    SpliceRange,
+    #[error("error: splice result exceeds the configured limit")]
+    SpliceResultTooLarge,
+    #[error("error: generated content contains recognizable management secrets")]
+    SecretContent,
     #[error("error: reserved path already exists: {0}")]
     #[allow(dead_code)]
     ReservedCollision(String),
@@ -768,6 +1012,8 @@ impl Store {
                 public_url,
                 clock,
                 expiry_defaults,
+                #[cfg(test)]
+                before_content_commit: Mutex::new(None),
             }),
         };
         store.migrate_sqlite_blobs()?;
@@ -809,24 +1055,37 @@ impl Store {
         let mut db = self.inner.readers.get();
         let site_count = sites::table.select(count_star()).first::<i64>(&mut *db)?;
         let sites = site_count.cast_unsigned();
-        let file_values = files::table
+        let mut file_values = files::table
             .filter(files::path.ne(MANIFEST_PATH))
             .select(files::size)
-            .order(files::size)
             .load::<i64>(&mut *db)?
             .into_iter()
             .map(i64::cast_unsigned)
             .collect::<Vec<_>>();
-        let blob_values = blobs::table
-            .inner_join(files::table.on(files::hash.eq(blobs::hash)))
+        file_values.extend(
+            allocated_entries::table
+                .select(allocated_entries::size)
+                .load::<i64>(&mut *db)?
+                .into_iter()
+                .map(i64::cast_unsigned),
+        );
+        file_values.sort_unstable();
+        let mut referenced_blobs = files::table
             .filter(files::path.ne(MANIFEST_PATH))
-            .group_by((blobs::hash, blobs::size))
-            .select(blobs::size)
-            .order(blobs::size)
-            .load::<i64>(&mut *db)?
+            .select((files::hash, files::size))
+            .load::<(String, i64)>(&mut *db)?;
+        referenced_blobs.extend(
+            allocated_entries::table
+                .select((allocated_entries::hash, allocated_entries::size))
+                .load::<(String, i64)>(&mut *db)?,
+        );
+        referenced_blobs.sort_unstable();
+        referenced_blobs.dedup_by(|left, right| left.0 == right.0);
+        let mut blob_values = referenced_blobs
             .into_iter()
-            .map(i64::cast_unsigned)
+            .map(|(_, size)| size.cast_unsigned())
             .collect::<Vec<_>>();
+        blob_values.sort_unstable();
         let files = u64::try_from(file_values.len()).expect("file count fits in u64");
         let blobs = u64::try_from(blob_values.len()).expect("blob count fits in u64");
         let logical_bytes = file_values.iter().sum();
@@ -860,10 +1119,17 @@ impl Store {
             .load::<(i64, String)>(&mut *db)?;
         let mut entries = Vec::with_capacity(site_rows.len());
         for (site_id, name) in site_rows {
-            let sizes = files::table
+            let mut sizes = files::table
                 .filter(files::site_id.eq(site_id))
+                .filter(files::path.ne(MANIFEST_PATH))
                 .select(files::size)
                 .load::<i64>(&mut *db)?;
+            sizes.extend(
+                allocated_entries::table
+                    .filter(allocated_entries::site_id.eq(site_id))
+                    .select(allocated_entries::size)
+                    .load::<i64>(&mut *db)?,
+            );
             entries.push(SiteEnt {
                 name,
                 files: u64::try_from(sizes.len()).expect("file count fits in u64"),
@@ -887,11 +1153,18 @@ impl Store {
             return Err(StoreError::NotFound);
         }
         let site_id = site_id_locked(&mut db, name)?;
-        let paths = files::table
+        let mut paths = files::table
             .filter(files::site_id.eq(site_id))
             .select(files::path)
             .order(files::path)
             .load::<String>(&mut *db)?;
+        paths.extend(
+            allocated_entries::table
+                .filter(allocated_entries::site_id.eq(site_id))
+                .select(allocated_entries::path)
+                .load::<String>(&mut *db)?,
+        );
+        paths.sort_unstable();
         Ok(paths)
     }
 
@@ -925,19 +1198,35 @@ impl Store {
             .select((files::path, files::hash, files::size))
             .order(files::path)
             .load::<(String, String, i64)>(&mut *db)?;
-        let files = rows
+        let mut inventory = rows
             .into_iter()
             .map(|(path, hash, size)| InventoryFile {
                 path,
                 hash: format!("blake3:{hash}"),
                 size: size.cast_unsigned(),
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let allocated = allocated_entries::table
+            .filter(allocated_entries::site_id.eq(site_id))
+            .select((
+                allocated_entries::path,
+                allocated_entries::hash,
+                allocated_entries::size,
+            ))
+            .load::<(String, String, i64)>(&mut *db)?;
+        for (path, hash, size) in allocated {
+            inventory.push(InventoryFile {
+                hash: format!("blake3:{hash}"),
+                path,
+                size: size.cast_unsigned(),
+            });
+        }
+        inventory.sort_unstable_by(|left, right| left.path.cmp(&right.path));
         Ok(SiteInventory {
             site: name.to_string(),
             content_revision: revision,
             tree_hash,
-            files,
+            files: inventory,
         })
     }
 
@@ -1230,6 +1519,15 @@ impl Store {
             .filter(files::hash.eq(hash))
             .select(count_star())
             .first::<i64>(&mut *db)?;
+        if count != 0 {
+            return Ok(true);
+        }
+        let site_id = site_id_locked(&mut db, name)?;
+        let count = allocated_entries::table
+            .filter(allocated_entries::site_id.eq(site_id))
+            .filter(allocated_entries::hash.eq(hash))
+            .select(count_star())
+            .first::<i64>(&mut *db)?;
         Ok(count != 0)
     }
 
@@ -1365,6 +1663,436 @@ impl Store {
             options.creation,
             options.authorization,
         )
+    }
+
+    pub fn allocate_bytes(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        spec: AllocationSpec<'_>,
+        options: FileMutationOptions<'_>,
+    ) -> Result<AllocatedFile, StoreError> {
+        self.allocate_source(name, AllocationSource::Bytes(bytes), spec, options)
+    }
+
+    pub fn allocate_file(
+        &self,
+        name: &str,
+        source: &Path,
+        spec: AllocationSpec<'_>,
+        options: FileMutationOptions<'_>,
+    ) -> Result<AllocatedFile, StoreError> {
+        self.allocate_source(name, AllocationSource::File(source), spec, options)
+    }
+
+    pub fn allocate_source(
+        &self,
+        name: &str,
+        source: AllocationSource<'_>,
+        spec: AllocationSpec<'_>,
+        options: FileMutationOptions<'_>,
+    ) -> Result<AllocatedFile, StoreError> {
+        let staged = self.stage_allocation_source(source, "")?;
+        reject_staged_secrets(&staged)?;
+        let destination = allocation_destination(&staged.hash, spec)?;
+        self.run_before_content_commit();
+        self.commit_allocated(
+            name,
+            None,
+            &destination,
+            &staged,
+            None,
+            None,
+            options,
+            UndoKind::Allocate,
+        )
+    }
+
+    pub fn replace_allocated(
+        &self,
+        name: &str,
+        current_path: &str,
+        source: AllocationSource<'_>,
+        options: FileMutationOptions<'_>,
+    ) -> Result<AllocatedFile, StoreError> {
+        let current_path = normalize_rel(current_path)?;
+        let staged = self.stage_allocation_source(source, "")?;
+        reject_staged_secrets(&staged)?;
+        let request_fingerprint = content_mutation_request_fingerprint(
+            name,
+            &current_path,
+            &staged.hash,
+            None,
+            UndoKind::Replace,
+        );
+        if let Some(replay) = self.replay_content_request(name, options, &request_fingerprint)? {
+            return Ok(replay);
+        }
+        let metadata = self.allocated_metadata(name, &current_path)?;
+        let destination = relocated_destination(&staged.hash, &current_path, &metadata)?;
+        self.run_before_content_commit();
+        self.commit_allocated(
+            name,
+            Some(&current_path),
+            &destination,
+            &staged,
+            None,
+            None,
+            options,
+            UndoKind::Replace,
+        )
+    }
+
+    pub fn propose_allocation(
+        &self,
+        name: &str,
+        source: AllocationSource<'_>,
+        spec: PendingAllocationSpec<'_>,
+        authorization: Option<&ManagementToken>,
+    ) -> Result<PendingAllocation, StoreError> {
+        let name = parse_site_name(name)?;
+        let staged = self.stage_allocation_source(source, "")?;
+        reject_staged_secrets(&staged)?;
+        let folder = normalize_folder(spec.folder)?;
+        let media_type = normalize_media_type(spec.media_type)?;
+        let now = self.now_millis();
+        let expires = now + PENDING_RETENTION_MILLIS;
+        let token = undo_token()?;
+        self.run_before_content_commit();
+        let mut db = self.inner.writer.lock().unwrap();
+        let mut tx = DbTransaction::begin(&mut db)?;
+        authorize_locked(&mut tx, name, authorization)?;
+        let site_id = site_id_locked(&mut tx, name)?;
+        self.materialize(&staged)?;
+        prune_pending_locked(&mut tx, now)?;
+        ensure_blob_locked(&mut tx, &staged)?;
+        diesel::insert_into(pending_allocations::table)
+            .values((
+                pending_allocations::token.eq(&token),
+                pending_allocations::site_id.eq(site_id),
+                pending_allocations::folder.eq(&folder),
+                pending_allocations::hash.eq(&staged.hash),
+                pending_allocations::size.eq(staged.size),
+                pending_allocations::media_type.eq(&media_type),
+                pending_allocations::request_fingerprint.eq(pending_fingerprint(
+                    name,
+                    &folder,
+                    &staged.hash,
+                    staged.size.cast_unsigned(),
+                    &media_type,
+                )),
+                pending_allocations::created.eq(now),
+                pending_allocations::expires.eq(expires),
+            ))
+            .execute(&mut *tx)?;
+        tx.commit()?;
+        drop(db);
+        Ok(PendingAllocation {
+            token,
+            folder,
+            hash: staged.hash.clone(),
+            size: staged.size.cast_unsigned(),
+            media_type,
+            expires_at: format_timestamp(expires),
+        })
+    }
+
+    pub fn finalize_allocation(
+        &self,
+        name: &str,
+        token: &str,
+        naming: AllocatedName<'_>,
+        options: FileMutationOptions<'_>,
+    ) -> Result<AllocatedFile, StoreError> {
+        self.finalize_pending(name, token, PendingFinalName::Generated(naming), options)
+    }
+
+    pub fn finalize_allocation_custom(
+        &self,
+        name: &str,
+        token: &str,
+        basename: &str,
+        options: FileMutationOptions<'_>,
+    ) -> Result<AllocatedFile, StoreError> {
+        self.finalize_pending(name, token, PendingFinalName::Custom(basename), options)
+    }
+
+    fn finalize_pending(
+        &self,
+        name: &str,
+        token: &str,
+        final_name: PendingFinalName<'_>,
+        options: FileMutationOptions<'_>,
+    ) -> Result<AllocatedFile, StoreError> {
+        let name = parse_site_name(name)?;
+        let now = self.now_millis();
+        let mut db = self.inner.writer.lock().unwrap();
+        let mut tx = DbTransaction::begin(&mut db)?;
+        authorize_locked(&mut tx, name, options.authorization)?;
+        let finalize_fingerprint = pending_finalize_fingerprint(name, token, final_name);
+        prune_idempotency_locked(&mut tx, now)?;
+        if let Some(replay) =
+            entry_mutation_replay(&mut tx, options.idempotency, &finalize_fingerprint)?
+        {
+            return Ok(replay);
+        }
+        check_tree_precondition(&mut tx, name, options.expected_tree_hash)?;
+        let site_id = site_id_locked(&mut tx, name)?;
+        let pending = pending_allocations::table
+            .find(token)
+            .filter(pending_allocations::site_id.eq(site_id))
+            .filter(pending_allocations::expires.gt(now))
+            .select((
+                pending_allocations::folder,
+                pending_allocations::hash,
+                pending_allocations::size,
+                pending_allocations::media_type,
+                pending_allocations::request_fingerprint,
+            ))
+            .first::<(String, String, i64, String, String)>(&mut *tx)
+            .optional()?
+            .map(|row| PendingMetadata {
+                folder: row.0,
+                hash: row.1,
+                size: row.2,
+                media_type: row.3,
+                request_fingerprint: row.4,
+            })
+            .ok_or(StoreError::InvalidPendingAllocation)?;
+        if pending.request_fingerprint
+            != pending_fingerprint(
+                name,
+                &pending.folder,
+                &pending.hash,
+                pending.size.cast_unsigned(),
+                &pending.media_type,
+            )
+        {
+            return Err(StoreError::InvalidPendingAllocation);
+        }
+        let destination = match final_name {
+            PendingFinalName::Generated(naming) => allocation_destination(
+                &pending.hash,
+                AllocationSpec {
+                    folder: &pending.folder,
+                    naming,
+                    media_type: &pending.media_type,
+                },
+            )?,
+            PendingFinalName::Custom(basename) => {
+                custom_destination(&pending.folder, basename, &pending.media_type)?
+            }
+        };
+        let staged = StagedFile {
+            path: destination.path.clone(),
+            size: pending.size,
+            hash: pending.hash.clone(),
+            source: StagedSource::File(self.inner.blob_files.path(&pending.hash)),
+            sanitized: TokenCounts::default(),
+        };
+        let result = self.commit_allocated_locked(
+            &mut tx,
+            name,
+            None,
+            &destination,
+            &staged,
+            None,
+            options,
+            UndoKind::Allocate,
+            now,
+        )?;
+        store_entry_mutation(
+            &mut tx,
+            options.idempotency,
+            &finalize_fingerprint,
+            &result,
+            now,
+        )?;
+        diesel::delete(pending_allocations::table.find(token)).execute(&mut *tx)?;
+        let removed = gc_blobs(&mut tx, now)?;
+        tx.commit()?;
+        drop(db);
+        self.remove_blob_files(&removed);
+        Ok(result)
+    }
+
+    pub fn cancel_allocation(
+        &self,
+        name: &str,
+        token: &str,
+        authorization: Option<&ManagementToken>,
+    ) -> Result<(), StoreError> {
+        let name = parse_site_name(name)?;
+        let now = self.now_millis();
+        let mut db = self.inner.writer.lock().unwrap();
+        let mut tx = DbTransaction::begin(&mut db)?;
+        authorize_locked(&mut tx, name, authorization)?;
+        let site_id = site_id_locked(&mut tx, name)?;
+        let deleted = diesel::delete(
+            pending_allocations::table
+                .find(token)
+                .filter(pending_allocations::site_id.eq(site_id)),
+        )
+        .execute(&mut *tx)?;
+        if deleted == 0 {
+            return Err(StoreError::InvalidPendingAllocation);
+        }
+        let removed = gc_blobs(&mut tx, now)?;
+        tx.commit()?;
+        drop(db);
+        self.remove_blob_files(&removed);
+        Ok(())
+    }
+
+    pub fn prune_pending_allocations(&self) -> Result<usize, StoreError> {
+        let now = self.now_millis();
+        let mut db = self.inner.writer.lock().unwrap();
+        let mut tx = DbTransaction::begin(&mut db)?;
+        let removed_pending = prune_pending_locked(&mut tx, now)?;
+        let removed = gc_blobs(&mut tx, now)?;
+        tx.commit()?;
+        drop(db);
+        self.remove_blob_files(&removed);
+        Ok(removed_pending)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn replace_file_content(
+        &self,
+        name: &str,
+        path: &str,
+        base_hash: &str,
+        source: AllocationSource<'_>,
+        options: FileMutationOptions<'_>,
+    ) -> Result<AllocatedFile, StoreError> {
+        let name = parse_site_name(name)?;
+        let path = normalize_rel(path)?;
+        reject_reserved_path(&path)?;
+        let staged = self.stage_allocation_source(source, &path)?;
+        reject_staged_secrets(&staged)?;
+        let request_fingerprint = content_mutation_request_fingerprint(
+            name,
+            &path,
+            &staged.hash,
+            Some(base_hash),
+            UndoKind::Replace,
+        );
+        if let Some(replay) = self.replay_content_request(name, options, &request_fingerprint)? {
+            return Ok(replay);
+        }
+        let mut db = self.inner.readers.get();
+        let site_id = site_id_locked(&mut db, name)?;
+        let kind = site_entries::table
+            .find((site_id, path.as_str()))
+            .select(site_entries::kind)
+            .first::<i64>(&mut *db)
+            .map_err(map_sql)?;
+        let current_hash = entry_hash_locked(&mut db, site_id, &path, kind)?;
+        drop(db);
+        if current_hash != base_hash {
+            return Err(StoreError::StaleContentHash(current_hash));
+        }
+        if kind == database::schema::ALLOCATED_ENTRY_KIND {
+            let metadata = self.allocated_metadata(name, &path)?;
+            let destination = relocated_destination(&staged.hash, &path, &metadata)?;
+            self.run_before_content_commit();
+            self.commit_allocated(
+                name,
+                Some(&path),
+                &destination,
+                &staged,
+                Some(base_hash),
+                None,
+                options,
+                UndoKind::Replace,
+            )
+        } else {
+            self.run_before_content_commit();
+            self.commit_regular(
+                name,
+                &path,
+                &staged,
+                Some(base_hash),
+                None,
+                options,
+                UndoKind::Replace,
+            )
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn splice_file(
+        &self,
+        name: &str,
+        path: &str,
+        base_hash: &str,
+        splices: &[Splice<'_>],
+        options: FileMutationOptions<'_>,
+    ) -> Result<AllocatedFile, StoreError> {
+        let name = parse_site_name(name)?;
+        let path = normalize_rel(path)?;
+        reject_reserved_path(&path)?;
+        let temporary = TemporaryDirectory::create(self.tmp_dir("splice"))?;
+        let output = temporary.path().join("result");
+        let prepared = prepare_splices(splices, temporary.path(), MAX_SPLICE_RESULT_SIZE)?;
+        let request_fingerprint = splice_request_fingerprint(name, &path, base_hash, &prepared);
+        if let Some(replay) = self.replay_content_request(name, options, &request_fingerprint)? {
+            return Ok(replay);
+        }
+        let mut db = self.inner.readers.get();
+        let site_id = site_id_locked(&mut db, name)?;
+        let kind = site_entries::table
+            .find((site_id, path.as_str()))
+            .select(site_entries::kind)
+            .first::<i64>(&mut *db)
+            .map_err(map_sql)?;
+        let current_hash = entry_hash_locked(&mut db, site_id, &path, kind)?;
+        if current_hash != base_hash {
+            return Err(StoreError::StaleContentHash(current_hash));
+        }
+        let old_size = entry_size_locked(&mut db, site_id, &path, kind)?;
+        drop(db);
+        self.run_before_content_commit();
+        let (hash, size) = splice_blob_to_path(
+            &self.inner.blob_files.path(base_hash),
+            old_size,
+            &prepared,
+            &output,
+        )?;
+        let staged = StagedFile {
+            path: path.clone(),
+            size: i64::try_from(size).map_err(|_| StoreError::SpliceResultTooLarge)?,
+            hash,
+            source: StagedSource::File(output),
+            sanitized: TokenCounts::default(),
+        };
+        reject_staged_secrets(&staged)?;
+        if kind == database::schema::ALLOCATED_ENTRY_KIND {
+            let metadata = self.allocated_metadata(name, &path)?;
+            let destination = relocated_destination(&staged.hash, &path, &metadata)?;
+            self.run_before_content_commit();
+            self.commit_allocated(
+                name,
+                Some(&path),
+                &destination,
+                &staged,
+                Some(base_hash),
+                Some(&request_fingerprint),
+                options,
+                UndoKind::Splice,
+            )
+        } else {
+            self.run_before_content_commit();
+            self.commit_regular(
+                name,
+                &path,
+                &staged,
+                Some(base_hash),
+                Some(&request_fingerprint),
+                options,
+                UndoKind::Splice,
+            )
+        }
     }
 
     #[cfg(test)]
@@ -1533,6 +2261,7 @@ impl Store {
             .select((files::path, files::hash, files::size))
             .load::<(String, String, i64)>(&mut *tx)?;
         for (path, hash, size) in copied_files {
+            ensure_file_entry(&mut tx, destination_id, &path)?;
             diesel::insert_into(files::table)
                 .values(NewFile {
                     site_id: destination_id,
@@ -1540,6 +2269,53 @@ impl Store {
                     hash: &hash,
                     size,
                 })
+                .execute(&mut *tx)?;
+        }
+        let copied_allocated = allocated_entries::table
+            .filter(allocated_entries::site_id.eq(source_id))
+            .select((
+                allocated_entries::path,
+                allocated_entries::hash,
+                allocated_entries::size,
+                allocated_entries::naming_mode,
+                allocated_entries::prefix,
+                allocated_entries::suffix,
+                allocated_entries::extension,
+                allocated_entries::media_type,
+            ))
+            .load::<(
+                String,
+                String,
+                i64,
+                i64,
+                String,
+                String,
+                Option<String>,
+                String,
+            )>(&mut *tx)?;
+        for (path, hash, size, naming_mode, prefix, suffix, extension, media_type) in
+            copied_allocated
+        {
+            diesel::insert_into(site_entries::table)
+                .values((
+                    site_entries::site_id.eq(destination_id),
+                    site_entries::path.eq(&path),
+                    site_entries::kind.eq(database::schema::ALLOCATED_ENTRY_KIND),
+                ))
+                .execute(&mut *tx)?;
+            diesel::insert_into(allocated_entries::table)
+                .values((
+                    allocated_entries::site_id.eq(destination_id),
+                    allocated_entries::path.eq(path),
+                    allocated_entries::kind.eq(database::schema::ALLOCATED_ENTRY_KIND),
+                    allocated_entries::hash.eq(hash),
+                    allocated_entries::size.eq(size),
+                    allocated_entries::naming_mode.eq(naming_mode),
+                    allocated_entries::prefix.eq(prefix),
+                    allocated_entries::suffix.eq(suffix),
+                    allocated_entries::extension.eq(extension),
+                    allocated_entries::media_type.eq(media_type),
+                ))
                 .execute(&mut *tx)?;
         }
         let aggregates = path_aggregates::table
@@ -1561,8 +2337,10 @@ impl Store {
                 .execute(&mut *tx)?;
         }
         copy_expiry_policies_locked(&mut tx, source_id, destination_id, now)?;
-        let files = files::table
-            .filter(files::site_id.eq(destination_id))
+        let files = site_entries::table
+            .filter(site_entries::site_id.eq(destination_id))
+            .filter(site_entries::path.ne(MANIFEST_PATH))
+            .filter(site_entries::kind.ne(database::schema::ALIAS_ENTRY_KIND))
             .select(count_star())
             .first::<i64>(&mut *tx)?;
         let tree_hash = regenerate_site(&mut tx, &self.inner.blob_files, destination_id, now)?;
@@ -1645,9 +2423,10 @@ impl Store {
             .filter(sites::name.eq(destination))
             .select((sites::id, sites::content_revision))
             .first::<(i64, i64)>(&mut *tx)?;
-        let files = files::table
-            .filter(files::site_id.eq(site_id))
-            .filter(files::path.ne(MANIFEST_PATH))
+        let files = site_entries::table
+            .filter(site_entries::site_id.eq(site_id))
+            .filter(site_entries::path.ne(MANIFEST_PATH))
+            .filter(site_entries::kind.ne(database::schema::ALIAS_ENTRY_KIND))
             .select(count_star())
             .first::<i64>(&mut *tx)?;
         let tree_hash = regenerate_site(&mut tx, &self.inner.blob_files, site_id, now)?;
@@ -1690,28 +2469,46 @@ impl Store {
         authorize_locked(&mut tx, name, authorization)?;
         reject_reserved_path(&rel)?;
         let site_id = site_id_locked(&mut tx, name)?;
-        let undo = snapshot_site_with_description(
+        let paths = site_entries::table
+            .filter(site_entries::site_id.eq(site_id))
+            .filter(
+                site_entries::path.eq(&rel).or(site_entries::path
+                    .ge(&prefix_start)
+                    .and(site_entries::path.lt(&prefix_end))),
+            )
+            .select(site_entries::path)
+            .load::<String>(&mut *tx)?;
+        if paths.is_empty() {
+            return Err(StoreError::NotFound);
+        }
+        let path_refs = paths.iter().map(String::as_str).collect::<Vec<_>>();
+        let undo = snapshot_entry_deltas(
             &mut tx,
             name,
             UndoKind::DeletePath,
             &format!("restore deleted {rel}"),
+            &path_refs,
             self.now_millis(),
         )?;
-        let target = files::table.filter(files::site_id.eq(site_id)).filter(
-            files::path.eq(&rel).or(files::path
-                .ge(&prefix_start)
-                .and(files::path.lt(&prefix_end))),
-        );
-        let removed_files = target
+        let removed_files = files::table
+            .filter(files::site_id.eq(site_id))
+            .filter(files::path.eq_any(&paths))
             .select((files::path, files::size))
             .load::<(String, i64)>(&mut *tx)?;
-        let deleted = diesel::delete(target).execute(&mut *tx)?;
-        if deleted == 0 {
-            return Err(StoreError::NotFound);
+        let removed_allocated = allocated_entries::table
+            .filter(allocated_entries::site_id.eq(site_id))
+            .filter(allocated_entries::path.eq_any(&paths))
+            .select((allocated_entries::path, allocated_entries::size))
+            .load::<(String, i64)>(&mut *tx)?;
+        for (path, size) in removed_files.iter().chain(&removed_allocated) {
+            adjust_aggregates_locked(&mut tx, site_id, path, -*size, -1)?;
         }
-        for (path, size) in removed_files {
-            adjust_aggregates_locked(&mut tx, site_id, &path, -size, -1)?;
-        }
+        let deleted = diesel::delete(
+            site_entries::table
+                .filter(site_entries::site_id.eq(site_id))
+                .filter(site_entries::path.eq_any(&paths)),
+        )
+        .execute(&mut *tx)?;
         diesel::delete(
             expiry_policies::table
                 .filter(expiry_policies::site_id.eq(site_id))
@@ -1969,7 +2766,15 @@ impl Store {
         } else {
             format!("remove newly created site {name}")
         };
-        let undo = snapshot_site_with_description(tx, name, kind, &description, now)?;
+        let changed_paths = files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+        let undo = if existed {
+            snapshot_entry_deltas(tx, name, kind, &description, &changed_paths, now)?
+        } else {
+            snapshot_site_with_description(tx, name, kind, &description, now)?
+        };
         for file in files {
             diesel::insert_into(blobs::table)
                 .values((
@@ -2004,6 +2809,7 @@ impl Store {
                 .select(files::size)
                 .first::<i64>(tx)
                 .optional()?;
+            ensure_file_entry(tx, site_id, &file.path)?;
             diesel::insert_into(files::table)
                 .values(NewFile {
                     site_id,
@@ -2037,10 +2843,6 @@ impl Store {
         diesel::update(sites::table.find(site_id))
             .set((sites::updated.eq(now), sites::content_revision.eq(revision)))
             .execute(tx)?;
-        let changed_paths = files
-            .iter()
-            .map(|file| file.path.as_str())
-            .collect::<Vec<_>>();
         refresh_expiry_for_changes_locked(tx, site_id, &changed_paths, now)?;
         let tree_hash = regenerate_site(tx, &self.inner.blob_files, site_id, now)?;
         prune_undo_locked(tx, now)?;
@@ -2056,12 +2858,419 @@ impl Store {
         })
     }
 
+    fn replay_content_request(
+        &self,
+        name: &str,
+        options: FileMutationOptions<'_>,
+        request_fingerprint: &str,
+    ) -> Result<Option<AllocatedFile>, StoreError> {
+        let now = self.now_millis();
+        let mut db = self.inner.writer.lock().unwrap();
+        let mut tx = DbTransaction::begin(&mut db)?;
+        authorize_locked(&mut tx, name, options.authorization)?;
+        prune_idempotency_locked(&mut tx, now)?;
+        let replay =
+            entry_mutation_request_replay(&mut tx, options.idempotency, request_fingerprint);
+        drop(tx);
+        drop(db);
+        replay
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn commit_regular(
+        &self,
+        name: &str,
+        path: &str,
+        staged: &StagedFile,
+        expected_content_hash: Option<&str>,
+        request_fingerprint: Option<&str>,
+        options: FileMutationOptions<'_>,
+        kind: UndoKind,
+    ) -> Result<AllocatedFile, StoreError> {
+        let now = self.now_millis();
+        let fingerprint = entry_mutation_fingerprint(name, Some(path), path, &staged.hash, kind);
+        let computed_request_fingerprint;
+        let request_fingerprint = if let Some(request_fingerprint) = request_fingerprint {
+            request_fingerprint
+        } else {
+            computed_request_fingerprint = content_mutation_request_fingerprint(
+                name,
+                path,
+                &staged.hash,
+                expected_content_hash,
+                kind,
+            );
+            &computed_request_fingerprint
+        };
+        let mut db = self.inner.writer.lock().unwrap();
+        let mut tx = DbTransaction::begin(&mut db)?;
+        authorize_locked(&mut tx, name, options.authorization)?;
+        prune_idempotency_locked(&mut tx, now)?;
+        if let Some(replay) = entry_mutation_replay(&mut tx, options.idempotency, &fingerprint)? {
+            return Ok(replay);
+        }
+        check_tree_precondition(&mut tx, name, options.expected_tree_hash)?;
+        let site_id = site_id_locked(&mut tx, name)?;
+        let current = files::table
+            .find((site_id, path))
+            .select((files::hash, files::size))
+            .first::<(String, i64)>(&mut *tx)
+            .optional()?;
+        let Some((current_hash, current_size)) = current else {
+            return Err(StoreError::NotFound);
+        };
+        if expected_content_hash.is_some_and(|expected| expected != current_hash) {
+            return Err(StoreError::StaleContentHash(current_hash));
+        }
+        if current_hash == staged.hash {
+            let result = AllocatedFile {
+                path: path.to_string(),
+                hash: current_hash,
+                size: current_size.cast_unsigned(),
+                changed: false,
+                replayed: false,
+                mutation: None,
+            };
+            store_entry_mutation_with_request(
+                &mut tx,
+                options.idempotency,
+                &fingerprint,
+                request_fingerprint,
+                &result,
+                now,
+            )?;
+            tx.commit()?;
+            return Ok(result);
+        }
+        self.materialize(staged)?;
+        let undo = snapshot_entry_deltas(
+            &mut tx,
+            name,
+            kind,
+            &format!("restore previous {path}"),
+            &[path],
+            now,
+        )?;
+        ensure_blob_locked(&mut tx, staged)?;
+        diesel::update(files::table.find((site_id, path)))
+            .set((files::hash.eq(&staged.hash), files::size.eq(staged.size)))
+            .execute(&mut *tx)?;
+        adjust_aggregates_locked(&mut tx, site_id, path, staged.size - current_size, 0)?;
+        finish_entry_mutation(&mut tx, &self.inner.blob_files, site_id, &[path], now)?;
+        let (revision, tree_hash) = site_revision_locked(&mut tx, name)?;
+        let mutation = MutationResult {
+            created: false,
+            changed: true,
+            replayed: false,
+            files: 1,
+            revision,
+            tree_hash,
+            undo: Some(undo),
+            sanitized: TokenCounts::default(),
+        };
+        let result = AllocatedFile {
+            path: path.to_string(),
+            hash: staged.hash.clone(),
+            size: staged.size.cast_unsigned(),
+            changed: true,
+            replayed: false,
+            mutation: Some(mutation),
+        };
+        store_entry_mutation_with_request(
+            &mut tx,
+            options.idempotency,
+            &fingerprint,
+            request_fingerprint,
+            &result,
+            now,
+        )?;
+        let removed = gc_blobs(&mut tx, now)?;
+        tx.commit()?;
+        drop(db);
+        self.remove_blob_files(&removed);
+        Ok(result)
+    }
+
+    fn allocated_metadata(&self, name: &str, path: &str) -> Result<AllocatedMetadata, StoreError> {
+        let mut db = self.inner.readers.get();
+        let site_id = site_id_locked(&mut db, name)?;
+        allocated_metadata_locked(&mut db, site_id, path)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn commit_allocated(
+        &self,
+        name: &str,
+        current_path: Option<&str>,
+        destination: &AllocationDestination,
+        staged: &StagedFile,
+        expected_content_hash: Option<&str>,
+        request_fingerprint: Option<&str>,
+        options: FileMutationOptions<'_>,
+        kind: UndoKind,
+    ) -> Result<AllocatedFile, StoreError> {
+        let now = self.now_millis();
+        let fingerprint = allocated_entry_mutation_fingerprint(
+            name,
+            current_path,
+            destination,
+            &staged.hash,
+            kind,
+        );
+        let computed_request_fingerprint;
+        let request_fingerprint = if let Some(request_fingerprint) = request_fingerprint {
+            request_fingerprint
+        } else {
+            computed_request_fingerprint = content_mutation_request_fingerprint(
+                name,
+                current_path.unwrap_or(""),
+                &staged.hash,
+                expected_content_hash,
+                kind,
+            );
+            &computed_request_fingerprint
+        };
+        let mut db = self.inner.writer.lock().unwrap();
+        let mut tx = DbTransaction::begin(&mut db)?;
+        authorize_locked(&mut tx, name, options.authorization)?;
+        prune_idempotency_locked(&mut tx, now)?;
+        if let Some(replay) = entry_mutation_replay(&mut tx, options.idempotency, &fingerprint)? {
+            return Ok(replay);
+        }
+        check_tree_precondition(&mut tx, name, options.expected_tree_hash)?;
+        let site_id = site_id_locked(&mut tx, name)?;
+        let needs_materialization = validate_allocated_commit_locked(
+            &mut tx,
+            site_id,
+            current_path,
+            destination,
+            &staged.hash,
+            expected_content_hash,
+        )?;
+        if needs_materialization {
+            self.materialize(staged)?;
+        }
+        let result = self.commit_allocated_locked(
+            &mut tx,
+            name,
+            current_path,
+            destination,
+            staged,
+            expected_content_hash,
+            options,
+            kind,
+            now,
+        )?;
+        store_entry_mutation_with_request(
+            &mut tx,
+            options.idempotency,
+            &fingerprint,
+            request_fingerprint,
+            &result,
+            now,
+        )?;
+        let removed = gc_blobs(&mut tx, now)?;
+        tx.commit()?;
+        drop(db);
+        self.remove_blob_files(&removed);
+        Ok(result)
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn commit_allocated_locked(
+        &self,
+        tx: &mut SqliteConnection,
+        name: &str,
+        current_path: Option<&str>,
+        destination: &AllocationDestination,
+        staged: &StagedFile,
+        expected_content_hash: Option<&str>,
+        _options: FileMutationOptions<'_>,
+        kind: UndoKind,
+        now: i64,
+    ) -> Result<AllocatedFile, StoreError> {
+        let site_id = site_id_locked(tx, name)?;
+        if let Some(current_path) = current_path {
+            let current_kind = site_entries::table
+                .find((site_id, current_path))
+                .select(site_entries::kind)
+                .first::<i64>(tx)
+                .map_err(map_sql)?;
+            if current_kind != database::schema::ALLOCATED_ENTRY_KIND {
+                return Err(StoreError::NotFound);
+            }
+            let (current_hash, current_size) = allocated_entries::table
+                .find((site_id, current_path))
+                .select((allocated_entries::hash, allocated_entries::size))
+                .first::<(String, i64)>(tx)?;
+            if expected_content_hash.is_some_and(|expected| expected != current_hash) {
+                return Err(StoreError::StaleContentHash(current_hash));
+            }
+            if current_hash == staged.hash {
+                return Ok(AllocatedFile {
+                    path: current_path.to_string(),
+                    hash: current_hash,
+                    size: current_size.cast_unsigned(),
+                    changed: false,
+                    replayed: false,
+                    mutation: None,
+                });
+            }
+        }
+        let same_path = current_path == Some(destination.path.as_str());
+        let destination_kind = if same_path {
+            None
+        } else {
+            site_entries::table
+                .find((site_id, destination.path.as_str()))
+                .select(site_entries::kind)
+                .first::<i64>(tx)
+                .optional()?
+        };
+        if destination_kind
+            .is_some_and(|entry_kind| entry_kind != database::schema::ALLOCATED_ENTRY_KIND)
+        {
+            return Err(StoreError::DestinationConflict);
+        }
+        let reused_size = if destination_kind.is_some() {
+            let metadata = allocated_metadata_locked(tx, site_id, &destination.path)?;
+            if metadata.hash != staged.hash || !allocation_metadata_matches(&metadata, destination)
+            {
+                return Err(StoreError::DestinationConflict);
+            }
+            Some(metadata.size)
+        } else {
+            None
+        };
+        if current_path.is_none()
+            && let Some(size) = reused_size
+        {
+            return Ok(AllocatedFile {
+                path: destination.path.clone(),
+                hash: staged.hash.clone(),
+                size: size.cast_unsigned(),
+                changed: false,
+                replayed: false,
+                mutation: None,
+            });
+        }
+        let mut changed_paths = Vec::with_capacity(2);
+        if let Some(current_path) = current_path {
+            changed_paths.push(current_path);
+        }
+        if reused_size.is_none() && current_path != Some(destination.path.as_str()) {
+            changed_paths.push(destination.path.as_str());
+        }
+        let undo = snapshot_entry_deltas(
+            tx,
+            name,
+            kind,
+            &format!("restore previous allocated entry in {name}"),
+            &changed_paths,
+            now,
+        )?;
+        ensure_blob_locked(tx, staged)?;
+        if let Some(current_path) = current_path {
+            let previous_size = allocated_entries::table
+                .find((site_id, current_path))
+                .select(allocated_entries::size)
+                .first::<i64>(tx)?;
+            if reused_size.is_some() {
+                diesel::delete(expiry_policies::table.find((site_id, current_path))).execute(tx)?;
+            } else {
+                diesel::update(expiry_policies::table.find((site_id, current_path)))
+                    .set(expiry_policies::path.eq(&destination.path))
+                    .execute(tx)?;
+            }
+            diesel::delete(site_entries::table.find((site_id, current_path))).execute(tx)?;
+            adjust_aggregates_locked(tx, site_id, current_path, -previous_size, -1)?;
+        }
+        if reused_size.is_none() {
+            diesel::insert_into(site_entries::table)
+                .values((
+                    site_entries::site_id.eq(site_id),
+                    site_entries::path.eq(&destination.path),
+                    site_entries::kind.eq(database::schema::ALLOCATED_ENTRY_KIND),
+                ))
+                .execute(tx)?;
+            diesel::insert_into(allocated_entries::table)
+                .values((
+                    allocated_entries::site_id.eq(site_id),
+                    allocated_entries::path.eq(&destination.path),
+                    allocated_entries::kind.eq(database::schema::ALLOCATED_ENTRY_KIND),
+                    allocated_entries::hash.eq(&staged.hash),
+                    allocated_entries::size.eq(staged.size),
+                    allocated_entries::naming_mode.eq(destination.naming_mode as i64),
+                    allocated_entries::prefix.eq(&destination.prefix),
+                    allocated_entries::suffix.eq(&destination.suffix),
+                    allocated_entries::extension.eq(&destination.extension),
+                    allocated_entries::media_type.eq(&destination.media_type),
+                ))
+                .execute(tx)?;
+            adjust_aggregates_locked(tx, site_id, &destination.path, staged.size, 1)?;
+        }
+        finish_entry_mutation(tx, &self.inner.blob_files, site_id, &changed_paths, now)?;
+        let (revision, tree_hash) = site_revision_locked(tx, name)?;
+        Ok(AllocatedFile {
+            path: destination.path.clone(),
+            hash: staged.hash.clone(),
+            size: reused_size.unwrap_or(staged.size).cast_unsigned(),
+            changed: true,
+            replayed: false,
+            mutation: Some(MutationResult {
+                created: current_path.is_none(),
+                changed: true,
+                replayed: false,
+                files: 1,
+                revision,
+                tree_hash,
+                undo: Some(undo),
+                sanitized: TokenCounts::default(),
+            }),
+        })
+    }
+
     fn materialize(&self, file: &StagedFile) -> Result<(), StoreError> {
         match &file.source {
             StagedSource::Bytes(bytes) => self.inner.blob_files.put_bytes(&file.hash, bytes)?,
-            StagedSource::File(path) => self.inner.blob_files.put_file(&file.hash, path)?,
+            StagedSource::File(path) | StagedSource::Temporary(path) => {
+                self.inner.blob_files.put_file(&file.hash, path)?;
+            }
         }
         Ok(())
+    }
+
+    fn stage_allocation_source(
+        &self,
+        source: AllocationSource<'_>,
+        path: &str,
+    ) -> Result<StagedFile, StoreError> {
+        match source {
+            AllocationSource::Bytes(bytes) => Ok(StagedFile {
+                path: path.to_string(),
+                size: i64::try_from(bytes.len()).map_err(|_| StoreError::SpliceResultTooLarge)?,
+                hash: blake3::hash(bytes).to_hex().to_string(),
+                source: StagedSource::Bytes(bytes.to_vec()),
+                sanitized: TokenCounts::default(),
+            }),
+            AllocationSource::File(source) => {
+                let temporary = self.tmp_dir("source");
+                fs::create_dir_all(&temporary)?;
+                let copied = temporary.join("content");
+                let mut input = fs::File::open(source)?;
+                let mut output = fs::File::create(&copied)?;
+                let mut hasher = blake3::Hasher::new();
+                let size = copy_all_hashed(&mut input, &mut output, &mut hasher)?;
+                output.sync_all()?;
+                Ok(StagedFile {
+                    path: path.to_string(),
+                    size: i64::try_from(size).map_err(|_| StoreError::SpliceResultTooLarge)?,
+                    hash: hasher.finalize().to_hex().to_string(),
+                    source: StagedSource::Temporary(copied),
+                    sanitized: TokenCounts::default(),
+                })
+            }
+        }
     }
 
     fn remove_blob_files(&self, hashes: &[String]) {
@@ -2225,7 +3434,8 @@ impl Store {
         }
         let mut sites = HashSet::new();
         for (site_id, path) in &junk {
-            diesel::delete(files::table.find((*site_id, path.as_str()))).execute(&mut *tx)?;
+            diesel::delete(site_entries::table.find((*site_id, path.as_str())))
+                .execute(&mut *tx)?;
             sites.insert(*site_id);
         }
         for site_id in sites {
@@ -2330,6 +3540,43 @@ impl Store {
         if guard.is_some_and(|token| token != latest) {
             return Err(StoreError::StaleUndo(latest));
         }
+        let latest_kind = UndoKind::from_i64(
+            undo_operations::table
+                .find(&latest)
+                .select(undo_operations::kind)
+                .first::<i64>(&mut *tx)?,
+        )?;
+        let has_deltas = matches!(
+            latest_kind,
+            UndoKind::Put
+                | UndoKind::PutFile
+                | UndoKind::DeletePath
+                | UndoKind::Allocate
+                | UndoKind::Replace
+                | UndoKind::Splice
+        ) && (undo_file_deltas::table
+            .filter(undo_file_deltas::token.eq(&latest))
+            .select(count_star())
+            .first::<i64>(&mut *tx)?
+            + undo_allocated_deltas::table
+                .filter(undo_allocated_deltas::token.eq(&latest))
+                .select(count_star())
+                .first::<i64>(&mut *tx)?
+            > 0);
+        if has_deltas {
+            let restored = restore_entry_deltas(&mut tx, &self.inner.blob_files, name, &latest)?;
+            diesel::update(undo_operations::table.find(&latest))
+                .set(undo_operations::consumed.eq(1_i64))
+                .execute(&mut *tx)?;
+            prune_undo_locked(&mut tx, now)?;
+            let removed = gc_blobs(&mut tx, now)?;
+            tx.commit()?;
+            drop(db);
+            self.remove_blob_files(&removed);
+            return Ok(UndoResult {
+                restored_at: format_timestamp(restored),
+            });
+        }
         let (snapshot_name, existed, public_url, updated, content_revision, tree_hash) =
             undo_sites::table
                 .find(&latest)
@@ -2393,6 +3640,7 @@ impl Store {
                 .select((undo_files::path, undo_files::hash, undo_files::size))
                 .load::<(String, String, i64)>(&mut *tx)?;
             for (path, hash, size) in saved_files {
+                ensure_file_entry(&mut tx, site_id, &path)?;
                 diesel::insert_into(files::table)
                     .values(NewFile {
                         site_id,
@@ -2400,6 +3648,64 @@ impl Store {
                         hash: &hash,
                         size,
                     })
+                    .execute(&mut *tx)?;
+            }
+            let saved_allocated = undo_allocated_deltas::table
+                .filter(undo_allocated_deltas::token.eq(&latest))
+                .filter(undo_allocated_deltas::existed.eq(1_i64))
+                .select((
+                    undo_allocated_deltas::path,
+                    undo_allocated_deltas::hash,
+                    undo_allocated_deltas::size,
+                    undo_allocated_deltas::naming_mode,
+                    undo_allocated_deltas::prefix,
+                    undo_allocated_deltas::suffix,
+                    undo_allocated_deltas::extension,
+                    undo_allocated_deltas::media_type,
+                ))
+                .load::<(
+                    String,
+                    Option<String>,
+                    Option<i64>,
+                    Option<i64>,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                )>(&mut *tx)?;
+            for (path, hash, size, naming_mode, prefix, suffix, extension, media_type) in
+                saved_allocated
+            {
+                diesel::insert_into(site_entries::table)
+                    .values((
+                        site_entries::site_id.eq(site_id),
+                        site_entries::path.eq(&path),
+                        site_entries::kind.eq(database::schema::ALLOCATED_ENTRY_KIND),
+                    ))
+                    .execute(&mut *tx)?;
+                diesel::insert_into(allocated_entries::table)
+                    .values(
+                        (
+                            allocated_entries::site_id.eq(site_id),
+                            allocated_entries::path.eq(path),
+                            allocated_entries::kind.eq(database::schema::ALLOCATED_ENTRY_KIND),
+                            allocated_entries::hash
+                                .eq(hash.expect("whole-site allocated snapshot has hash")),
+                            allocated_entries::size
+                                .eq(size.expect("whole-site allocated snapshot has size")),
+                            allocated_entries::naming_mode
+                                .eq(naming_mode
+                                    .expect("whole-site allocated snapshot has naming mode")),
+                            allocated_entries::prefix
+                                .eq(prefix.expect("whole-site allocated snapshot has prefix")),
+                            allocated_entries::suffix
+                                .eq(suffix.expect("whole-site allocated snapshot has suffix")),
+                            allocated_entries::extension.eq(extension),
+                            allocated_entries::media_type
+                                .eq(media_type
+                                    .expect("whole-site allocated snapshot has media type")),
+                        ),
+                    )
                     .execute(&mut *tx)?;
             }
             restore_expiry_policies_locked(&mut tx, &latest, site_id)?;
@@ -2653,11 +3959,14 @@ impl Store {
                     diesel::delete(sites::table.find(site_id)).execute(&mut *tx)?;
                 }
                 ExpiryTargetKind::File => {
-                    let size = files::table
+                    let entry_kind = site_entries::table
                         .find((site_id, path.as_str()))
-                        .select(files::size)
+                        .select(site_entries::kind)
                         .first::<i64>(&mut *tx)?;
-                    diesel::delete(files::table.find((site_id, path.as_str())))
+                    let size =
+                        i64::try_from(entry_size_locked(&mut tx, site_id, &path, entry_kind)?)
+                            .expect("stored size fits in i64");
+                    diesel::delete(site_entries::table.find((site_id, path.as_str())))
                         .execute(&mut *tx)?;
                     adjust_aggregates_locked(&mut tx, site_id, &path, -size, -1)?;
                     diesel::delete(expiry_policies::table.find((site_id, path.as_str())))
@@ -2678,14 +3987,20 @@ impl Store {
                         .filter(files::path.lt(&end))
                         .select((files::path, files::size))
                         .load::<(String, i64)>(&mut *tx)?;
+                    let removed_allocated = allocated_entries::table
+                        .filter(allocated_entries::site_id.eq(site_id))
+                        .filter(allocated_entries::path.ge(&start))
+                        .filter(allocated_entries::path.lt(&end))
+                        .select((allocated_entries::path, allocated_entries::size))
+                        .load::<(String, i64)>(&mut *tx)?;
                     diesel::delete(
-                        files::table
-                            .filter(files::site_id.eq(site_id))
-                            .filter(files::path.ge(&start))
-                            .filter(files::path.lt(&end)),
+                        site_entries::table
+                            .filter(site_entries::site_id.eq(site_id))
+                            .filter(site_entries::path.ge(&start))
+                            .filter(site_entries::path.lt(&end)),
                     )
                     .execute(&mut *tx)?;
-                    for (removed_path, size) in removed_files {
+                    for (removed_path, size) in removed_files.into_iter().chain(removed_allocated) {
                         adjust_aggregates_locked(&mut tx, site_id, &removed_path, -size, -1)?;
                     }
                     diesel::delete(
@@ -2750,6 +4065,7 @@ impl Store {
         let mut tx = DbTransaction::begin(&mut db)?;
         prune_undo_locked(&mut tx, now)?;
         prune_idempotency_locked(&mut tx, now)?;
+        prune_pending_locked(&mut tx, now)?;
         let removed = gc_blobs(&mut tx, now)?;
         tx.commit()?;
         drop(db);
@@ -2760,6 +4076,23 @@ impl Store {
     fn now_millis(&self) -> i64 {
         self.inner.clock.now_millis()
     }
+
+    #[cfg(test)]
+    fn set_before_content_commit(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.inner.before_content_commit.lock().unwrap() = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn run_before_content_commit(&self) {
+        let hook = self.inner.before_content_commit.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(not(test))]
+    #[allow(clippy::missing_const_for_fn, clippy::unused_self)]
+    fn run_before_content_commit(&self) {}
 
     fn tmp_dir(&self, name: &str) -> PathBuf {
         let t = self.now_millis();
@@ -2782,6 +4115,9 @@ enum UndoKind {
     Expiry = 6,
     ExpireSweep = 7,
     PutFile = 8,
+    Allocate = 9,
+    Replace = 10,
+    Splice = 11,
 }
 
 impl UndoKind {
@@ -2795,6 +4131,9 @@ impl UndoKind {
             Self::Expiry => "expiry",
             Self::ExpireSweep => "expire_sweep",
             Self::PutFile => "put_file",
+            Self::Allocate => "allocate",
+            Self::Replace => "replace",
+            Self::Splice => "splice",
         }
     }
 
@@ -2808,6 +4147,9 @@ impl UndoKind {
             6 => Ok(Self::Expiry),
             7 => Ok(Self::ExpireSweep),
             8 => Ok(Self::PutFile),
+            9 => Ok(Self::Allocate),
+            10 => Ok(Self::Replace),
+            11 => Ok(Self::Splice),
             _ => Err(StoreError::UnsupportedUndoKind(value)),
         }
     }
@@ -2818,12 +4160,20 @@ impl UndoKind {
 enum IdempotencyKind {
     UnnamedPut = 1,
     AutoCopy = 2,
+    EntryMutation = 3,
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
 struct PublishedMutation {
     name: String,
     mutation: MutationResult,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct EntryMutationRecord {
+    result: AllocatedFile,
+    #[serde(default)]
+    request_fingerprint: String,
 }
 
 #[derive(Clone, Copy)]
@@ -2894,6 +4244,592 @@ fn run_migrations(db: &mut SqliteConnection) -> Result<(), StoreError> {
         .into());
     }
     Ok(())
+}
+
+fn allocation_destination(
+    hash: &str,
+    spec: AllocationSpec<'_>,
+) -> Result<AllocationDestination, StoreError> {
+    if hash.len() != 64
+        || !hash
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        || !safe_name_fragment(spec.naming.prefix)
+        || !safe_name_fragment(spec.naming.suffix)
+    {
+        return Err(StoreError::InvalidAllocatedName);
+    }
+    let folder = normalize_folder(spec.folder)?;
+    let extension = spec.naming.extension.map(normalize_extension).transpose()?;
+    let media_type = normalize_media_type(spec.media_type)?;
+    let mut basename = String::with_capacity(
+        spec.naming.prefix.len()
+            + hash.len()
+            + spec.naming.suffix.len()
+            + extension.as_ref().map_or(0, |value| value.len() + 1),
+    );
+    basename.push_str(spec.naming.prefix);
+    basename.push_str(hash);
+    basename.push_str(spec.naming.suffix);
+    if let Some(extension) = &extension {
+        basename.push('.');
+        basename.push_str(extension);
+    }
+    let path = join_folder(&folder, &basename);
+    safe_rel_path(&path).map_err(|_| StoreError::InvalidAllocatedName)?;
+    reject_reserved_path(&path)?;
+    Ok(AllocationDestination {
+        path,
+        naming_mode: AllocatedNamingMode::ContentAddressed,
+        prefix: spec.naming.prefix.to_string(),
+        suffix: spec.naming.suffix.to_string(),
+        extension,
+        media_type,
+    })
+}
+
+fn custom_destination(
+    folder: &str,
+    basename: &str,
+    media_type: &str,
+) -> Result<AllocationDestination, StoreError> {
+    let folder = normalize_folder(folder)?;
+    if basename.is_empty()
+        || basename == "."
+        || basename == ".."
+        || basename.contains(['/', '\\'])
+        || !safe_name_fragment(basename)
+        || is_reserved_path(basename)
+    {
+        return Err(StoreError::InvalidAllocatedName);
+    }
+    safe_rel_path(basename).map_err(|_| StoreError::InvalidAllocatedName)?;
+    Ok(AllocationDestination {
+        path: join_folder(&folder, basename),
+        naming_mode: AllocatedNamingMode::Custom,
+        prefix: basename.to_string(),
+        suffix: String::new(),
+        extension: None,
+        media_type: normalize_media_type(media_type)?,
+    })
+}
+
+fn relocated_destination(
+    hash: &str,
+    current_path: &str,
+    metadata: &AllocatedMetadata,
+) -> Result<AllocationDestination, StoreError> {
+    let folder = current_path
+        .rsplit_once('/')
+        .map_or("", |(folder, _)| folder);
+    match metadata.naming_mode {
+        AllocatedNamingMode::ContentAddressed => allocation_destination(
+            hash,
+            AllocationSpec {
+                folder,
+                naming: AllocatedName {
+                    prefix: &metadata.prefix,
+                    suffix: &metadata.suffix,
+                    extension: metadata.extension.as_deref(),
+                },
+                media_type: &metadata.media_type,
+            },
+        ),
+        AllocatedNamingMode::Custom => {
+            let basename = current_path.rsplit('/').next().unwrap_or(current_path);
+            custom_destination(folder, basename, &metadata.media_type)
+        }
+    }
+}
+
+fn normalize_folder(folder: &str) -> Result<String, StoreError> {
+    if folder.is_empty() {
+        Ok(String::new())
+    } else {
+        normalize_rel(folder)
+    }
+}
+
+fn join_folder(folder: &str, basename: &str) -> String {
+    if folder.is_empty() {
+        basename.to_string()
+    } else {
+        format!("{folder}/{basename}")
+    }
+}
+
+fn normalize_media_type(media_type: &str) -> Result<String, StoreError> {
+    let media_type = media_type.trim();
+    if media_type.is_empty()
+        || media_type
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return Err(StoreError::InvalidAllocatedName);
+    }
+    Ok(media_type.to_ascii_lowercase())
+}
+
+fn pending_fingerprint(
+    site: &str,
+    folder: &str,
+    hash: &str,
+    content_size: u64,
+    media_type: &str,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"symbol-pending-allocation-v1\0");
+    for value in [site, folder, hash, media_type] {
+        hasher.update(&(value.len() as u64).to_le_bytes());
+        hasher.update(value.as_bytes());
+    }
+    hasher.update(&content_size.to_le_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
+fn pending_finalize_fingerprint(
+    site: &str,
+    token: &str,
+    final_name: PendingFinalName<'_>,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"symbol-pending-finalize-v1\0");
+    hasher.update(site.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(token.as_bytes());
+    hasher.update(&[0]);
+    match final_name {
+        PendingFinalName::Generated(naming) => {
+            hasher.update(&[1]);
+            for value in [naming.prefix, naming.suffix, naming.extension.unwrap_or("")] {
+                hasher.update(&(value.len() as u64).to_le_bytes());
+                hasher.update(value.as_bytes());
+            }
+        }
+        PendingFinalName::Custom(basename) => {
+            hasher.update(&[2]);
+            hasher.update(basename.as_bytes());
+        }
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn allocated_metadata_locked(
+    db: &mut SqliteConnection,
+    site_id: i64,
+    path: &str,
+) -> Result<AllocatedMetadata, StoreError> {
+    let (hash, size, naming_mode, prefix, suffix, extension, media_type) = allocated_entries::table
+        .find((site_id, path))
+        .select((
+            allocated_entries::hash,
+            allocated_entries::size,
+            allocated_entries::naming_mode,
+            allocated_entries::prefix,
+            allocated_entries::suffix,
+            allocated_entries::extension,
+            allocated_entries::media_type,
+        ))
+        .first::<(String, i64, i64, String, String, Option<String>, String)>(db)
+        .map_err(map_sql)?;
+    Ok(AllocatedMetadata {
+        hash,
+        size,
+        naming_mode: AllocatedNamingMode::try_from(naming_mode)?,
+        prefix,
+        suffix,
+        extension,
+        media_type,
+    })
+}
+
+fn allocation_metadata_matches(
+    metadata: &AllocatedMetadata,
+    destination: &AllocationDestination,
+) -> bool {
+    metadata.naming_mode == destination.naming_mode
+        && metadata.prefix == destination.prefix
+        && metadata.suffix == destination.suffix
+        && metadata.extension == destination.extension
+        && metadata.media_type == destination.media_type
+}
+
+fn validate_allocated_commit_locked(
+    tx: &mut SqliteConnection,
+    site_id: i64,
+    current_path: Option<&str>,
+    destination: &AllocationDestination,
+    staged_hash: &str,
+    expected_content_hash: Option<&str>,
+) -> Result<bool, StoreError> {
+    if let Some(current_path) = current_path {
+        let current_kind = site_entries::table
+            .find((site_id, current_path))
+            .select(site_entries::kind)
+            .first::<i64>(tx)
+            .map_err(map_sql)?;
+        if current_kind != database::schema::ALLOCATED_ENTRY_KIND {
+            return Err(StoreError::NotFound);
+        }
+        let current_hash = allocated_entries::table
+            .find((site_id, current_path))
+            .select(allocated_entries::hash)
+            .first::<String>(tx)?;
+        if expected_content_hash.is_some_and(|expected| expected != current_hash) {
+            return Err(StoreError::StaleContentHash(current_hash));
+        }
+        if current_hash == staged_hash {
+            return Ok(false);
+        }
+    }
+    if current_path == Some(destination.path.as_str()) {
+        return Ok(true);
+    }
+    let destination_kind = site_entries::table
+        .find((site_id, destination.path.as_str()))
+        .select(site_entries::kind)
+        .first::<i64>(tx)
+        .optional()?;
+    let Some(destination_kind) = destination_kind else {
+        return Ok(true);
+    };
+    if destination_kind != database::schema::ALLOCATED_ENTRY_KIND {
+        return Err(StoreError::DestinationConflict);
+    }
+    let metadata = allocated_metadata_locked(tx, site_id, &destination.path)?;
+    if metadata.hash != staged_hash || !allocation_metadata_matches(&metadata, destination) {
+        return Err(StoreError::DestinationConflict);
+    }
+    Ok(false)
+}
+
+fn safe_name_fragment(fragment: &str) -> bool {
+    fragment.bytes().all(|byte| {
+        byte.is_ascii_graphic() && byte != b'/' && byte != b'\\' && byte != b'?' && byte != b'#'
+    })
+}
+
+fn normalize_extension(extension: &str) -> Result<String, StoreError> {
+    let mut normalized = String::new();
+    let mut separator = false;
+    for character in extension.trim_matches('.').chars() {
+        if character.is_ascii_alphanumeric() {
+            if separator && !normalized.is_empty() {
+                normalized.push('-');
+            }
+            normalized.push(character.to_ascii_lowercase());
+            separator = false;
+        } else {
+            separator = true;
+        }
+    }
+    if normalized.is_empty() {
+        Err(StoreError::InvalidAllocatedName)
+    } else {
+        Ok(normalized)
+    }
+}
+
+fn reject_staged_secrets(staged: &StagedFile) -> Result<(), StoreError> {
+    let counts = match &staged.source {
+        StagedSource::Bytes(bytes) => sanitize::redact_tokens(bytes).counts(),
+        StagedSource::File(path) | StagedSource::Temporary(path) => {
+            sanitize::count_reader(fs::File::open(path)?)?
+        }
+    };
+    if counts.total() == 0 {
+        Ok(())
+    } else {
+        Err(StoreError::SecretContent)
+    }
+}
+
+fn ensure_blob_locked(
+    tx: &mut SqliteConnection,
+    staged: &StagedFile,
+) -> Result<(), diesel::result::Error> {
+    diesel::insert_into(blobs::table)
+        .values((
+            blobs::hash.eq(&staged.hash),
+            blobs::bytes.eq(Vec::<u8>::new()),
+            blobs::size.eq(staged.size),
+        ))
+        .on_conflict_do_nothing()
+        .execute(tx)?;
+    Ok(())
+}
+
+fn check_tree_precondition(
+    tx: &mut SqliteConnection,
+    name: &str,
+    expected: Option<&str>,
+) -> Result<(), StoreError> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let (revision, tree_hash) = site_revision_locked(tx, name)?;
+    if expected == tree_hash {
+        Ok(())
+    } else {
+        Err(StoreError::PreconditionFailed {
+            revision,
+            tree_hash,
+        })
+    }
+}
+
+fn entry_hash_locked(
+    db: &mut SqliteConnection,
+    site_id: i64,
+    path: &str,
+    kind: i64,
+) -> Result<String, StoreError> {
+    if kind == database::schema::FILE_ENTRY_KIND {
+        files::table
+            .find((site_id, path))
+            .select(files::hash)
+            .first::<String>(db)
+            .map_err(map_sql)
+    } else if kind == database::schema::ALLOCATED_ENTRY_KIND {
+        allocated_entries::table
+            .find((site_id, path))
+            .select(allocated_entries::hash)
+            .first::<String>(db)
+            .map_err(map_sql)
+    } else {
+        Err(StoreError::NotFound)
+    }
+}
+
+fn entry_size_locked(
+    db: &mut SqliteConnection,
+    site_id: i64,
+    path: &str,
+    kind: i64,
+) -> Result<u64, StoreError> {
+    let size = if kind == database::schema::FILE_ENTRY_KIND {
+        files::table
+            .find((site_id, path))
+            .select(files::size)
+            .first::<i64>(db)?
+    } else if kind == database::schema::ALLOCATED_ENTRY_KIND {
+        allocated_entries::table
+            .find((site_id, path))
+            .select(allocated_entries::size)
+            .first::<i64>(db)?
+    } else {
+        return Err(StoreError::NotFound);
+    };
+    Ok(size.cast_unsigned())
+}
+
+fn finish_entry_mutation(
+    tx: &mut SqliteConnection,
+    blob_files: &BlobFiles,
+    site_id: i64,
+    paths: &[&str],
+    now: i64,
+) -> Result<(), StoreError> {
+    diesel::update(sites::table.find(site_id))
+        .set((
+            sites::updated.eq(now),
+            sites::content_revision.eq(sites::content_revision + 1),
+        ))
+        .execute(tx)?;
+    refresh_expiry_for_changes_locked(tx, site_id, paths, now)?;
+    regenerate_site(tx, blob_files, site_id, now)?;
+    prune_undo_locked(tx, now)?;
+    Ok(())
+}
+
+fn prune_pending_locked(
+    tx: &mut SqliteConnection,
+    now: i64,
+) -> Result<usize, diesel::result::Error> {
+    diesel::delete(pending_allocations::table.filter(pending_allocations::expires.le(now)))
+        .execute(tx)
+}
+
+fn prepare_splices(
+    splices: &[Splice<'_>],
+    temporary: &Path,
+    maximum_staged_bytes: u64,
+) -> Result<Vec<PreparedSplice>, StoreError> {
+    let mut prepared = Vec::with_capacity(splices.len());
+    let mut staged_bytes = 0_u64;
+    for (index, splice) in splices.iter().enumerate() {
+        let insert = match splice.insert {
+            SpliceSource::Empty => PreparedSpliceSource::Empty,
+            SpliceSource::Bytes(bytes) => {
+                staged_bytes = staged_bytes
+                    .checked_add(u64::try_from(bytes.len()).expect("slice length fits in u64"))
+                    .ok_or(StoreError::SpliceResultTooLarge)?;
+                if staged_bytes > maximum_staged_bytes {
+                    return Err(StoreError::SpliceResultTooLarge);
+                }
+                PreparedSpliceSource::Bytes(bytes.to_vec())
+            }
+            SpliceSource::File(path) => {
+                let copied = temporary.join(format!("insert-{index}"));
+                let mut source = fs::File::open(path)?;
+                let mut target = fs::File::create(&copied)?;
+                let remaining = maximum_staged_bytes
+                    .checked_sub(staged_bytes)
+                    .ok_or(StoreError::SpliceResultTooLarge)?;
+                let mut limited = (&mut source).take(remaining.saturating_add(1));
+                let mut hasher = blake3::Hasher::new();
+                let size = copy_all_hashed(&mut limited, &mut target, &mut hasher)?;
+                if size > remaining {
+                    return Err(StoreError::SpliceResultTooLarge);
+                }
+                staged_bytes += size;
+                target.sync_all()?;
+                PreparedSpliceSource::File {
+                    path: copied,
+                    size,
+                    hash: hasher.finalize().to_hex().to_string(),
+                }
+            }
+        };
+        prepared.push(PreparedSplice {
+            offset: splice.offset,
+            delete: splice.delete,
+            insert,
+        });
+    }
+    Ok(prepared)
+}
+
+fn splice_request_fingerprint(
+    site: &str,
+    path: &str,
+    base_hash: &str,
+    splices: &[PreparedSplice],
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"symbol-splice-request-v1\0");
+    for value in [site, path, base_hash] {
+        hasher.update(&(value.len() as u64).to_le_bytes());
+        hasher.update(value.as_bytes());
+    }
+    for splice in splices {
+        hasher.update(&splice.offset.to_le_bytes());
+        hasher.update(&splice.delete.to_le_bytes());
+        match &splice.insert {
+            PreparedSpliceSource::Empty => {
+                hasher.update(&[0]);
+            }
+            PreparedSpliceSource::Bytes(bytes) => {
+                hasher.update(&[1]);
+                hasher.update(&(bytes.len() as u64).to_le_bytes());
+                hasher.update(blake3::hash(bytes).as_bytes());
+            }
+            PreparedSpliceSource::File { size, hash, .. } => {
+                hasher.update(&[2]);
+                hasher.update(&size.to_le_bytes());
+                hasher.update(hash.as_bytes());
+            }
+        }
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn splice_blob_to_path(
+    source: &Path,
+    old_size: u64,
+    splices: &[PreparedSplice],
+    output: &Path,
+) -> Result<(String, u64), StoreError> {
+    let mut previous_end = 0_u64;
+    let mut result_size = old_size;
+    for splice in splices {
+        let end = splice
+            .offset
+            .checked_add(splice.delete)
+            .ok_or(StoreError::SpliceRange)?;
+        if splice.offset < previous_end {
+            return Err(StoreError::InvalidSpliceOrder);
+        }
+        if splice.offset > old_size || end > old_size {
+            return Err(StoreError::SpliceRange);
+        }
+        previous_end = end;
+        let insertion_size = match &splice.insert {
+            PreparedSpliceSource::Empty => 0,
+            PreparedSpliceSource::Bytes(bytes) => {
+                u64::try_from(bytes.len()).expect("slice length fits in u64")
+            }
+            PreparedSpliceSource::File { size, .. } => *size,
+        };
+        result_size = result_size
+            .checked_sub(splice.delete)
+            .and_then(|size| size.checked_add(insertion_size))
+            .ok_or(StoreError::SpliceResultTooLarge)?;
+        if result_size > MAX_SPLICE_RESULT_SIZE {
+            return Err(StoreError::SpliceResultTooLarge);
+        }
+    }
+    let mut input = fs::File::open(source)?;
+    let mut output = fs::File::create(output)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut cursor = 0_u64;
+    for splice in splices {
+        copy_hashed(&mut input, &mut output, &mut hasher, splice.offset - cursor)?;
+        input.seek(SeekFrom::Current(
+            i64::try_from(splice.delete).map_err(|_| StoreError::SpliceRange)?,
+        ))?;
+        match &splice.insert {
+            PreparedSpliceSource::Empty => {}
+            PreparedSpliceSource::Bytes(bytes) => {
+                output.write_all(bytes)?;
+                hasher.update(bytes);
+            }
+            PreparedSpliceSource::File { path, .. } => {
+                let mut insertion = fs::File::open(path)?;
+                copy_all_hashed(&mut insertion, &mut output, &mut hasher)?;
+            }
+        }
+        cursor = splice.offset + splice.delete;
+    }
+    copy_hashed(&mut input, &mut output, &mut hasher, old_size - cursor)?;
+    output.sync_all()?;
+    Ok((hasher.finalize().to_hex().to_string(), result_size))
+}
+
+fn copy_hashed(
+    input: &mut fs::File,
+    output: &mut fs::File,
+    hasher: &mut blake3::Hasher,
+    mut remaining: u64,
+) -> io::Result<()> {
+    let mut buffer = [0_u8; 64 * 1024];
+    while remaining != 0 {
+        let wanted = usize::try_from(remaining.min(buffer.len() as u64))
+            .expect("bounded read size fits in usize");
+        input.read_exact(&mut buffer[..wanted])?;
+        output.write_all(&buffer[..wanted])?;
+        hasher.update(&buffer[..wanted]);
+        remaining -= u64::try_from(wanted).expect("buffer size fits in u64");
+    }
+    Ok(())
+}
+
+fn copy_all_hashed(
+    input: &mut impl Read,
+    output: &mut fs::File,
+    hasher: &mut blake3::Hasher,
+) -> io::Result<u64> {
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut size = 0_u64;
+    loop {
+        let read = input.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(size);
+        }
+        output.write_all(&buffer[..read])?;
+        hasher.update(&buffer[..read]);
+        size += u64::try_from(read).expect("read size fits in u64");
+    }
 }
 
 fn reject_reserved_path(path: &str) -> Result<(), StoreError> {
@@ -2995,6 +4931,181 @@ fn store_idempotency(
             idempotency_records::key_hash.eq(idempotency_key_hash(key)),
             idempotency_records::fingerprint.eq(fingerprint),
             idempotency_records::operation_kind.eq(kind as i64),
+            idempotency_records::result_metadata.eq(metadata),
+            idempotency_records::expires.eq(now + IDEMPOTENCY_RETENTION_MILLIS),
+        ))
+        .execute(tx)?;
+    Ok(())
+}
+
+fn entry_mutation_fingerprint(
+    name: &str,
+    current_path: Option<&str>,
+    destination: &str,
+    hash: &str,
+    kind: UndoKind,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"symbol-entry-mutation-v1\0");
+    hasher.update(name.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(current_path.unwrap_or("").as_bytes());
+    hasher.update(&[0]);
+    hasher.update(destination.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(hash.as_bytes());
+    hasher.update(&(kind as i64).to_le_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
+fn content_mutation_request_fingerprint(
+    name: &str,
+    current_path: &str,
+    hash: &str,
+    expected_content_hash: Option<&str>,
+    kind: UndoKind,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"symbol-content-mutation-request-v1\0");
+    for value in [
+        name,
+        current_path,
+        hash,
+        expected_content_hash.unwrap_or(""),
+    ] {
+        hasher.update(&(value.len() as u64).to_le_bytes());
+        hasher.update(value.as_bytes());
+    }
+    hasher.update(&(kind as i64).to_le_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
+fn allocated_entry_mutation_fingerprint(
+    name: &str,
+    current_path: Option<&str>,
+    destination: &AllocationDestination,
+    hash: &str,
+    kind: UndoKind,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"symbol-allocated-entry-mutation-v2\0");
+    for value in [
+        name,
+        current_path.unwrap_or(""),
+        &destination.path,
+        hash,
+        &destination.prefix,
+        &destination.suffix,
+        destination.extension.as_deref().unwrap_or(""),
+        &destination.media_type,
+    ] {
+        hasher.update(&(value.len() as u64).to_le_bytes());
+        hasher.update(value.as_bytes());
+    }
+    hasher.update(&(destination.naming_mode as i64).to_le_bytes());
+    hasher.update(&(kind as i64).to_le_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
+fn entry_mutation_replay(
+    tx: &mut SqliteConnection,
+    idempotency: Option<&Idempotency>,
+    fingerprint: &str,
+) -> Result<Option<AllocatedFile>, StoreError> {
+    let Some(idempotency) = idempotency else {
+        return Ok(None);
+    };
+    validate_idempotency_key(&idempotency.key)?;
+    let record = idempotency_records::table
+        .find(idempotency_key_hash(&idempotency.key))
+        .select((
+            idempotency_records::fingerprint,
+            idempotency_records::operation_kind,
+            idempotency_records::result_metadata,
+        ))
+        .first::<(String, i64, String)>(tx)
+        .optional()?;
+    let Some((stored_fingerprint, stored_kind, metadata)) = record else {
+        return Ok(None);
+    };
+    if stored_fingerprint != fingerprint || stored_kind != IdempotencyKind::EntryMutation as i64 {
+        return Err(StoreError::IdempotencyConflict);
+    }
+    let mut record: EntryMutationRecord = serde_json::from_str(&metadata)
+        .map_err(|error| StoreError::Io(io::Error::new(io::ErrorKind::InvalidData, error)))?;
+    record.result.replayed = true;
+    if let Some(mutation) = &mut record.result.mutation {
+        mutation.replayed = true;
+    }
+    Ok(Some(record.result))
+}
+
+fn entry_mutation_request_replay(
+    tx: &mut SqliteConnection,
+    idempotency: Option<&Idempotency>,
+    request_fingerprint: &str,
+) -> Result<Option<AllocatedFile>, StoreError> {
+    let Some(idempotency) = idempotency else {
+        return Ok(None);
+    };
+    validate_idempotency_key(&idempotency.key)?;
+    let record = idempotency_records::table
+        .find(idempotency_key_hash(&idempotency.key))
+        .select((
+            idempotency_records::operation_kind,
+            idempotency_records::result_metadata,
+        ))
+        .first::<(i64, String)>(tx)
+        .optional()?;
+    let Some((stored_kind, metadata)) = record else {
+        return Ok(None);
+    };
+    if stored_kind != IdempotencyKind::EntryMutation as i64 {
+        return Err(StoreError::IdempotencyConflict);
+    }
+    let mut record: EntryMutationRecord = serde_json::from_str(&metadata)
+        .map_err(|error| StoreError::Io(io::Error::new(io::ErrorKind::InvalidData, error)))?;
+    if record.request_fingerprint != request_fingerprint {
+        return Err(StoreError::IdempotencyConflict);
+    }
+    record.result.replayed = true;
+    if let Some(mutation) = &mut record.result.mutation {
+        mutation.replayed = true;
+    }
+    Ok(Some(record.result))
+}
+
+fn store_entry_mutation(
+    tx: &mut SqliteConnection,
+    idempotency: Option<&Idempotency>,
+    fingerprint: &str,
+    result: &AllocatedFile,
+    now: i64,
+) -> Result<(), StoreError> {
+    store_entry_mutation_with_request(tx, idempotency, fingerprint, fingerprint, result, now)
+}
+
+fn store_entry_mutation_with_request(
+    tx: &mut SqliteConnection,
+    idempotency: Option<&Idempotency>,
+    fingerprint: &str,
+    request_fingerprint: &str,
+    result: &AllocatedFile,
+    now: i64,
+) -> Result<(), StoreError> {
+    let Some(idempotency) = idempotency else {
+        return Ok(());
+    };
+    let metadata = serde_json::to_string(&EntryMutationRecord {
+        result: result.clone(),
+        request_fingerprint: request_fingerprint.to_string(),
+    })
+    .map_err(|error| StoreError::Io(io::Error::new(io::ErrorKind::InvalidData, error)))?;
+    diesel::insert_into(idempotency_records::table)
+        .values((
+            idempotency_records::key_hash.eq(idempotency_key_hash(&idempotency.key)),
+            idempotency_records::fingerprint.eq(fingerprint),
+            idempotency_records::operation_kind.eq(IdempotencyKind::EntryMutation as i64),
             idempotency_records::result_metadata.eq(metadata),
             idempotency_records::expires.eq(now + IDEMPOTENCY_RETENTION_MILLIS),
         ))
@@ -3135,10 +5246,38 @@ fn snapshot_site(
         UndoKind::Move => format!("restore previous name {name}"),
         UndoKind::Expiry => format!("restore previous expiry policy for {name}"),
         UndoKind::ExpireSweep => format!("restore expired content in {name}"),
+        UndoKind::Allocate => format!("remove allocated content from {name}"),
+        UndoKind::Replace => format!("restore replaced content in {name}"),
+        UndoKind::Splice => format!("restore spliced content in {name}"),
     };
     snapshot_site_with_description(tx, name, kind, &description, now)
 }
 
+fn insert_undo_allocated(
+    tx: &mut SqliteConnection,
+    token: &str,
+    path: &str,
+    metadata: Option<&AllocatedMetadata>,
+) -> Result<(), diesel::result::Error> {
+    diesel::insert_into(undo_allocated_deltas::table)
+        .values((
+            undo_allocated_deltas::token.eq(token),
+            undo_allocated_deltas::path.eq(path),
+            undo_allocated_deltas::existed.eq(i64::from(metadata.is_some())),
+            undo_allocated_deltas::hash.eq(metadata.map(|value| value.hash.as_str())),
+            undo_allocated_deltas::size.eq(metadata.map(|value| value.size)),
+            undo_allocated_deltas::naming_mode.eq(metadata.map(|value| value.naming_mode as i64)),
+            undo_allocated_deltas::prefix.eq(metadata.map(|value| value.prefix.as_str())),
+            undo_allocated_deltas::suffix.eq(metadata.map(|value| value.suffix.as_str())),
+            undo_allocated_deltas::extension
+                .eq(metadata.and_then(|value| value.extension.as_deref())),
+            undo_allocated_deltas::media_type.eq(metadata.map(|value| value.media_type.as_str())),
+        ))
+        .execute(tx)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
 fn snapshot_site_with_description(
     tx: &mut SqliteConnection,
     name: &str,
@@ -3218,12 +5357,253 @@ fn snapshot_site_with_description(
                 ))
                 .execute(tx)?;
         }
+        let saved_allocated = allocated_entries::table
+            .filter(allocated_entries::site_id.eq(site_id))
+            .select((
+                allocated_entries::path,
+                allocated_entries::hash,
+                allocated_entries::size,
+                allocated_entries::naming_mode,
+                allocated_entries::prefix,
+                allocated_entries::suffix,
+                allocated_entries::extension,
+                allocated_entries::media_type,
+            ))
+            .load::<(
+                String,
+                String,
+                i64,
+                i64,
+                String,
+                String,
+                Option<String>,
+                String,
+            )>(tx)?;
+        for (path, hash, size, naming_mode, prefix, suffix, extension, media_type) in
+            saved_allocated
+        {
+            insert_undo_allocated(
+                tx,
+                &token,
+                &path,
+                Some(&AllocatedMetadata {
+                    hash,
+                    size,
+                    naming_mode: AllocatedNamingMode::try_from(naming_mode)?,
+                    prefix,
+                    suffix,
+                    extension,
+                    media_type,
+                }),
+            )?;
+        }
         snapshot_expiry_policies_locked(tx, &token, site_id)?;
     }
     Ok(UndoInfo {
         token,
         expires_at: format_timestamp(expires),
     })
+}
+
+#[allow(clippy::too_many_lines)]
+fn snapshot_entry_deltas(
+    tx: &mut SqliteConnection,
+    name: &str,
+    kind: UndoKind,
+    description: &str,
+    paths: &[&str],
+    now: i64,
+) -> Result<UndoInfo, StoreError> {
+    let token = undo_token()?;
+    let expires = now + UNDO_RETENTION_MILLIS;
+    diesel::insert_into(undo_operations::table)
+        .values((
+            undo_operations::token.eq(&token),
+            undo_operations::kind.eq(kind as i64),
+            undo_operations::description.eq(description),
+            undo_operations::created.eq(now),
+            undo_operations::expires.eq(expires),
+            undo_operations::consumed.eq(0_i64),
+        ))
+        .execute(tx)?;
+    diesel::insert_into(undo_names::table)
+        .values((undo_names::token.eq(&token), undo_names::name.eq(name)))
+        .execute(tx)?;
+    let (site_id, public_url, updated, content_revision, tree_hash) = sites::table
+        .filter(sites::name.eq(name))
+        .select((
+            sites::id,
+            sites::public_url,
+            sites::updated,
+            sites::content_revision,
+            sites::tree_hash,
+        ))
+        .first::<(i64, String, i64, i64, String)>(tx)?;
+    diesel::insert_into(undo_sites::table)
+        .values((
+            undo_sites::token.eq(&token),
+            undo_sites::name.eq(name),
+            undo_sites::existed.eq(1_i64),
+            undo_sites::public_url.eq(public_url),
+            undo_sites::updated.eq(updated),
+            undo_sites::content_revision.eq(content_revision),
+            undo_sites::tree_hash.eq(tree_hash),
+        ))
+        .execute(tx)?;
+    let operation_is_allocated = matches!(kind, UndoKind::Allocate)
+        || (matches!(kind, UndoKind::Replace | UndoKind::Splice)
+            && site_entries::table
+                .filter(site_entries::site_id.eq(site_id))
+                .filter(site_entries::path.eq_any(paths))
+                .filter(site_entries::kind.eq(database::schema::ALLOCATED_ENTRY_KIND))
+                .select(count_star())
+                .first::<i64>(tx)?
+                > 0);
+    for path in paths {
+        let entry_kind = site_entries::table
+            .find((site_id, *path))
+            .select(site_entries::kind)
+            .first::<i64>(tx)
+            .optional()?;
+        match entry_kind {
+            Some(entry_kind) if entry_kind == database::schema::FILE_ENTRY_KIND => {
+                let (hash, size) = files::table
+                    .find((site_id, *path))
+                    .select((files::hash, files::size))
+                    .first::<(String, i64)>(tx)?;
+                diesel::insert_into(undo_file_deltas::table)
+                    .values((
+                        undo_file_deltas::token.eq(&token),
+                        undo_file_deltas::path.eq(*path),
+                        undo_file_deltas::existed.eq(1_i64),
+                        undo_file_deltas::kind.eq(Some(entry_kind)),
+                        undo_file_deltas::hash.eq(Some(hash)),
+                        undo_file_deltas::size.eq(Some(size)),
+                    ))
+                    .execute(tx)?;
+            }
+            Some(entry_kind) if entry_kind == database::schema::ALLOCATED_ENTRY_KIND => {
+                let metadata = allocated_metadata_locked(tx, site_id, path)?;
+                insert_undo_allocated(tx, &token, path, Some(&metadata))?;
+            }
+            Some(_) => return Err(StoreError::DestinationConflict),
+            None if operation_is_allocated => {
+                insert_undo_allocated(tx, &token, path, None)?;
+            }
+            None => {
+                diesel::insert_into(undo_file_deltas::table)
+                    .values((
+                        undo_file_deltas::token.eq(&token),
+                        undo_file_deltas::path.eq(*path),
+                        undo_file_deltas::existed.eq(0_i64),
+                        undo_file_deltas::kind.eq(Option::<i64>::None),
+                        undo_file_deltas::hash.eq(Option::<String>::None),
+                        undo_file_deltas::size.eq(Option::<i64>::None),
+                    ))
+                    .execute(tx)?;
+            }
+        }
+    }
+    snapshot_expiry_policies_locked(tx, &token, site_id)?;
+    Ok(UndoInfo {
+        token,
+        expires_at: format_timestamp(expires),
+    })
+}
+
+fn restore_entry_deltas(
+    tx: &mut SqliteConnection,
+    blob_files: &BlobFiles,
+    name: &str,
+    token: &str,
+) -> Result<i64, StoreError> {
+    let (updated, content_revision) = undo_sites::table
+        .find(token)
+        .select((undo_sites::updated, undo_sites::content_revision))
+        .first::<(i64, i64)>(tx)?;
+    let site_id = site_id_locked(tx, name)?;
+    let file_deltas = undo_file_deltas::table
+        .filter(undo_file_deltas::token.eq(token))
+        .select((
+            undo_file_deltas::path,
+            undo_file_deltas::existed,
+            undo_file_deltas::hash,
+            undo_file_deltas::size,
+        ))
+        .load::<(String, i64, Option<String>, Option<i64>)>(tx)?;
+    let allocated_deltas = undo_allocated_deltas::table
+        .filter(undo_allocated_deltas::token.eq(token))
+        .select(UndoAllocatedMetadata::as_select())
+        .load::<UndoAllocatedMetadata>(tx)?;
+    let changed_paths = file_deltas
+        .iter()
+        .map(|row| row.0.as_str())
+        .chain(allocated_deltas.iter().map(|row| row.path.as_str()))
+        .collect::<Vec<_>>();
+    diesel::delete(
+        site_entries::table
+            .filter(site_entries::site_id.eq(site_id))
+            .filter(site_entries::path.eq_any(&changed_paths)),
+    )
+    .execute(tx)?;
+    for (path, existed, hash, size) in file_deltas {
+        if existed == 0 {
+            continue;
+        }
+        let hash = hash.expect("existing file delta has hash");
+        let size = size.expect("existing file delta has size");
+        ensure_file_entry(tx, site_id, &path)?;
+        diesel::insert_into(files::table)
+            .values(NewFile {
+                site_id,
+                path: &path,
+                hash: &hash,
+                size,
+            })
+            .execute(tx)?;
+    }
+    for delta in allocated_deltas {
+        if delta.existed == 0 {
+            continue;
+        }
+        let path = delta.path;
+        diesel::insert_into(site_entries::table)
+            .values((
+                site_entries::site_id.eq(site_id),
+                site_entries::path.eq(&path),
+                site_entries::kind.eq(database::schema::ALLOCATED_ENTRY_KIND),
+            ))
+            .execute(tx)?;
+        diesel::insert_into(allocated_entries::table)
+            .values((
+                allocated_entries::site_id.eq(site_id),
+                allocated_entries::path.eq(&path),
+                allocated_entries::kind.eq(database::schema::ALLOCATED_ENTRY_KIND),
+                allocated_entries::hash.eq(delta.hash.expect("existing allocated delta has hash")),
+                allocated_entries::size.eq(delta.size.expect("existing allocated delta has size")),
+                allocated_entries::naming_mode.eq(delta
+                    .naming_mode
+                    .expect("existing allocated delta has naming mode")),
+                allocated_entries::prefix
+                    .eq(delta.prefix.expect("existing allocated delta has prefix")),
+                allocated_entries::suffix
+                    .eq(delta.suffix.expect("existing allocated delta has suffix")),
+                allocated_entries::extension.eq(delta.extension),
+                allocated_entries::media_type.eq(delta
+                    .media_type
+                    .expect("existing allocated delta has media type")),
+            ))
+            .execute(tx)?;
+    }
+    diesel::delete(expiry_policies::table.filter(expiry_policies::site_id.eq(site_id)))
+        .execute(tx)?;
+    restore_expiry_policies_locked(tx, token, site_id)?;
+    rebuild_aggregates_locked(tx, site_id)?;
+    diesel::update(sites::table.find(site_id))
+        .set(sites::content_revision.eq(content_revision))
+        .execute(tx)?;
+    regenerate_site(tx, blob_files, site_id, updated)?;
+    Ok(updated)
 }
 
 fn snapshot_expiry_policies_locked(
@@ -3374,6 +5754,13 @@ fn rebuild_aggregates_locked(tx: &mut SqliteConnection, site_id: i64) -> Result<
     for (path, size) in files {
         adjust_aggregates_locked(tx, site_id, &path, size, 1)?;
     }
+    let allocated = allocated_entries::table
+        .filter(allocated_entries::site_id.eq(site_id))
+        .select((allocated_entries::path, allocated_entries::size))
+        .load::<(String, i64)>(tx)?;
+    for (path, size) in allocated {
+        adjust_aggregates_locked(tx, site_id, &path, size, 1)?;
+    }
     Ok(())
 }
 
@@ -3390,10 +5777,21 @@ fn expiry_target_size_locked(
             .first::<i64>(db)
             .optional()?
             .unwrap_or(0),
-        ExpiryTargetKind::File => files::table
-            .find((site_id, rel))
-            .select(files::size)
-            .first::<i64>(db)?,
+        ExpiryTargetKind::File => {
+            if let Some(size) = files::table
+                .find((site_id, rel))
+                .select(files::size)
+                .first::<i64>(db)
+                .optional()?
+            {
+                size
+            } else {
+                allocated_entries::table
+                    .find((site_id, rel))
+                    .select(allocated_entries::size)
+                    .first::<i64>(db)?
+            }
+        }
         ExpiryTargetKind::Folder => path_aggregates::table
             .find((site_id, rel))
             .select(path_aggregates::logical_bytes)
@@ -3694,9 +6092,14 @@ fn finish_partial_expiry_locked(
     changed_path: &str,
     now: i64,
 ) -> Result<(), StoreError> {
-    let remaining = files::table
-        .filter(files::site_id.eq(site_id))
-        .filter(files::path.ne(MANIFEST_PATH))
+    let remaining = site_entries::table
+        .filter(site_entries::site_id.eq(site_id))
+        .filter(site_entries::path.ne(MANIFEST_PATH))
+        .filter(
+            site_entries::kind
+                .eq(database::schema::FILE_ENTRY_KIND)
+                .or(site_entries::kind.eq(database::schema::ALLOCATED_ENTRY_KIND)),
+        )
         .select(count_star())
         .first::<i64>(tx)?;
     if remaining == 0 {
@@ -3733,12 +6136,20 @@ fn regenerate_site(
         ))
         .first::<(String, String, i64, i64)>(tx)?;
     let managed = management_status != 0;
-    let entries = files::table
+    let mut entries = files::table
         .filter(files::site_id.eq(site_id))
         .filter(files::path.ne(MANIFEST_PATH))
         .select((files::path, files::hash))
         .order(files::path)
         .load::<(String, String)>(tx)?;
+    let allocated = allocated_entries::table
+        .filter(allocated_entries::site_id.eq(site_id))
+        .select((allocated_entries::path, allocated_entries::hash))
+        .load::<(String, String)>(tx)?;
+    for (path, hash) in allocated {
+        entries.push((path, hash));
+    }
+    entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
     let mut hasher = blake3::Hasher::new();
     for (path, hash) in &entries {
         hasher.update(&(path.len() as u64).to_le_bytes());
@@ -3808,6 +6219,7 @@ fn regenerate_site(
         ))
         .on_conflict_do_nothing()
         .execute(tx)?;
+    ensure_file_entry(tx, site_id, MANIFEST_PATH)?;
     diesel::insert_into(files::table)
         .values(NewFile {
             site_id,
@@ -3996,16 +6408,32 @@ fn node_locked(db: &mut SqliteConnection, name: &str, rel: &str) -> Result<NodeK
     if let Some(hash) = hash {
         return Ok(NodeKind::File { hash });
     }
+    let allocated = allocated_entries::table
+        .find((site_id, rel))
+        .select(allocated_entries::hash)
+        .first::<String>(db)
+        .optional()?;
+    if let Some(hash) = allocated {
+        return Ok(NodeKind::File { hash });
+    }
     let (prefix_start, prefix_end) = descendant_bounds(rel);
-    let dir_exists = files::table
+    let regular_dir_exists = files::table
         .filter(files::site_id.eq(site_id))
-        .filter(files::path.ge(prefix_start))
-        .filter(files::path.lt(prefix_end))
+        .filter(files::path.ge(&prefix_start))
+        .filter(files::path.lt(&prefix_end))
         .select(files::site_id)
         .first::<i64>(db)
         .optional()?
         .is_some();
-    Ok(if dir_exists {
+    let allocated_dir_exists = allocated_entries::table
+        .filter(allocated_entries::site_id.eq(site_id))
+        .filter(allocated_entries::path.ge(&prefix_start))
+        .filter(allocated_entries::path.lt(&prefix_end))
+        .select(allocated_entries::site_id)
+        .first::<i64>(db)
+        .optional()?
+        .is_some();
+    Ok(if regular_dir_exists || allocated_dir_exists {
         NodeKind::Dir
     } else {
         NodeKind::Missing
@@ -4017,11 +6445,18 @@ fn load_root_files(
     name: &str,
 ) -> Result<Vec<(String, u64)>, StoreError> {
     let site_id = site_id_locked(db, name)?;
-    let rows = files::table
+    let mut rows = files::table
         .filter(files::site_id.eq(site_id))
         .select((files::path, files::size))
         .order(files::path)
         .load::<(String, i64)>(db)?;
+    rows.extend(
+        allocated_entries::table
+            .filter(allocated_entries::site_id.eq(site_id))
+            .select((allocated_entries::path, allocated_entries::size))
+            .load::<(String, i64)>(db)?,
+    );
+    rows.sort_unstable_by(|left, right| left.0.cmp(&right.0));
     Ok(rows
         .into_iter()
         .map(|(path, size)| (path, size.cast_unsigned()))
@@ -4035,13 +6470,22 @@ fn load_descendant_files(
 ) -> Result<Vec<(String, u64)>, StoreError> {
     let site_id = site_id_locked(db, name)?;
     let (prefix_start, prefix_end) = descendant_bounds(rel);
-    let rows = files::table
+    let mut rows = files::table
         .filter(files::site_id.eq(site_id))
-        .filter(files::path.ge(prefix_start))
-        .filter(files::path.lt(prefix_end))
+        .filter(files::path.ge(&prefix_start))
+        .filter(files::path.lt(&prefix_end))
         .select((files::path, files::size))
         .order(files::path)
         .load::<(String, i64)>(db)?;
+    rows.extend(
+        allocated_entries::table
+            .filter(allocated_entries::site_id.eq(site_id))
+            .filter(allocated_entries::path.ge(&prefix_start))
+            .filter(allocated_entries::path.lt(&prefix_end))
+            .select((allocated_entries::path, allocated_entries::size))
+            .load::<(String, i64)>(db)?,
+    );
+    rows.sort_unstable_by(|left, right| left.0.cmp(&right.0));
     Ok(rows
         .into_iter()
         .map(|(path, size)| (path, size.cast_unsigned()))
@@ -4261,19 +6705,35 @@ fn site_files(
 
 fn site_manifest(db: &mut SqliteConnection, name: &str) -> Result<Vec<ArchiveEntry>, StoreError> {
     let site_id = site_id_locked(db, name)?;
-    let rows = files::table
+    let mut entries = files::table
         .filter(files::site_id.eq(site_id))
         .select((files::path, files::hash, files::size))
         .order(files::path)
-        .load::<(String, String, i64)>(db)?;
-    Ok(rows
+        .load::<(String, String, i64)>(db)?
         .into_iter()
         .map(|(path, hash, size)| ArchiveEntry {
             path,
             hash,
             size: size.cast_unsigned(),
         })
-        .collect())
+        .collect::<Vec<_>>();
+    let allocated = allocated_entries::table
+        .filter(allocated_entries::site_id.eq(site_id))
+        .select((
+            allocated_entries::path,
+            allocated_entries::hash,
+            allocated_entries::size,
+        ))
+        .load::<(String, String, i64)>(db)?;
+    for (path, hash, size) in allocated {
+        entries.push(ArchiveEntry {
+            hash,
+            path,
+            size: size.cast_unsigned(),
+        });
+    }
+    entries.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+    Ok(entries)
 }
 
 fn write_site_archive(
@@ -4387,8 +6847,38 @@ fn gc_blobs(tx: &mut SqliteConnection, now: i64) -> Result<Vec<String>, diesel::
         .select(undo_files::hash)
         .distinct()
         .load::<String>(tx)?;
+    let live_delta = undo_file_deltas::table
+        .inner_join(undo_operations::table.on(undo_operations::token.eq(undo_file_deltas::token)))
+        .filter(undo_operations::consumed.eq(0_i64))
+        .filter(undo_operations::expires.gt(now))
+        .filter(undo_file_deltas::hash.is_not_null())
+        .select(undo_file_deltas::hash)
+        .load::<Option<String>>(tx)?
+        .into_iter()
+        .flatten();
+    let live_allocated = allocated_entries::table
+        .select(allocated_entries::hash)
+        .load::<String>(tx)?;
+    let live_undo_allocated = undo_allocated_deltas::table
+        .inner_join(
+            undo_operations::table.on(undo_operations::token.eq(undo_allocated_deltas::token)),
+        )
+        .filter(undo_operations::consumed.eq(0_i64))
+        .filter(undo_operations::expires.gt(now))
+        .filter(undo_allocated_deltas::existed.eq(1_i64))
+        .select(undo_allocated_deltas::hash)
+        .load::<Option<String>>(tx)?
+        .into_iter()
+        .flatten();
+    let live_pending = pending_allocations::table
+        .select(pending_allocations::hash)
+        .load::<String>(tx)?;
     let mut live = live_files.into_iter().collect::<HashSet<_>>();
     live.extend(live_undo);
+    live.extend(live_delta);
+    live.extend(live_allocated);
+    live.extend(live_undo_allocated);
+    live.extend(live_pending);
     let hashes = blobs::table
         .select(blobs::hash)
         .load::<String>(tx)?
@@ -4591,6 +7081,7 @@ mod tests {
             ))
             .execute(&mut db)
             .unwrap();
+        ensure_file_entry(&mut db, site_id, "index.html").unwrap();
         diesel::insert_into(files::table)
             .values(NewFile {
                 site_id,
@@ -5258,6 +7749,7 @@ mod tests {
                 .returning(sites::id)
                 .get_result::<i64>(&mut db)
                 .unwrap();
+            ensure_file_entry(&mut db, site_id, "legacy.bin").unwrap();
             diesel::insert_into(files::table)
                 .values(NewFile {
                     site_id,
@@ -5365,6 +7857,7 @@ mod tests {
                 .unwrap();
             let site_id = site_id_locked(&mut db, "hello").unwrap();
             for path in ["._index.html", "keep.bin"] {
+                ensure_file_entry(&mut db, site_id, path).unwrap();
                 diesel::insert_into(files::table)
                     .values(NewFile {
                         site_id,
@@ -5471,10 +7964,10 @@ mod tests {
         assert_eq!(nested.bytes, 30);
 
         let sites = store.list_sites().unwrap();
-        assert_eq!(sites.files, 5);
-        assert!(sites.bytes > 42);
-        assert_eq!(sites.entries[0].files, 5);
-        assert!(sites.entries[0].bytes > 42);
+        assert_eq!(sites.files, 4);
+        assert_eq!(sites.bytes, 42);
+        assert_eq!(sites.entries[0].files, 4);
+        assert_eq!(sites.entries[0].bytes, 42);
     }
 
     #[test]
@@ -5688,5 +8181,1360 @@ mod tests {
             }
         });
         assert_eq!(paths.lock().unwrap().len(), 32);
+    }
+
+    fn node_hash(store: &Store, site: &str, path: &str) -> String {
+        let Node::File { hash, .. } = store.lookup(site, path).unwrap() else {
+            panic!("expected file");
+        };
+        hash
+    }
+
+    #[test]
+    fn single_file_mutation_on_42802_file_site_stores_one_delta() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+        store.put_file("large", "index.html", b"old").unwrap();
+        let hash = node_hash(&store, "large", "index.html");
+        {
+            let mut db = store.inner.writer.lock().unwrap();
+            let site_id = site_id_locked(&mut db, "large").unwrap();
+            diesel::sql_query(format!(
+                "WITH RECURSIVE n(x) AS (SELECT 0 UNION ALL SELECT x + 1 FROM n WHERE x < 42800)
+                 INSERT INTO site_entries(site_id, path, kind)
+                 SELECT {site_id}, printf('bulk/%05d', x), 0 FROM n"
+            ))
+            .execute(&mut *db)
+            .unwrap();
+            diesel::sql_query(format!(
+                "INSERT INTO files(site_id, path, kind, hash, size)
+                 SELECT site_id, path, 0, '{hash}', 3
+                 FROM site_entries WHERE site_id = {site_id} AND path LIKE 'bulk/%'"
+            ))
+            .execute(&mut *db)
+            .unwrap();
+        }
+        store.put_file("large", "index.html", b"new").unwrap();
+        let mut db = test_connection(&dir.path().join("symbol.db"));
+        let token = undo_operations::table
+            .inner_join(undo_names::table.on(undo_names::token.eq(undo_operations::token)))
+            .filter(undo_names::name.eq("large"))
+            .select(undo_operations::token)
+            .order(undo_operations::rowid.desc())
+            .first::<String>(&mut db)
+            .unwrap();
+        assert_eq!(
+            undo_file_deltas::table
+                .filter(undo_file_deltas::token.eq(&token))
+                .select(count_star())
+                .first::<i64>(&mut db)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            undo_files::table
+                .filter(undo_files::token.eq(&token))
+                .select(count_star())
+                .first::<i64>(&mut db)
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
+    fn allocated_names_are_exact_idempotent_and_relocate_with_undo() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+        store.put_file("assets", "index.html", b"site").unwrap();
+        let idempotency = Idempotency {
+            key: "allocated-once".to_string(),
+        };
+        let options = FileMutationOptions {
+            idempotency: Some(&idempotency),
+            ..FileMutationOptions::default()
+        };
+        let first = store
+            .allocate_bytes(
+                "assets",
+                b"payload",
+                AllocationSpec {
+                    folder: "nested/assets",
+                    naming: AllocatedName {
+                        prefix: "pre-",
+                        suffix: "-final",
+                        extension: Some("..JP G.."),
+                    },
+                    media_type: "IMAGE/JPEG",
+                },
+                options,
+            )
+            .unwrap();
+        assert_eq!(
+            first.path,
+            format!(
+                "nested/assets/pre-{}-final.jp-g",
+                blake3::hash(b"payload").to_hex()
+            )
+        );
+        assert_eq!(store.read_blob(&first.hash).unwrap().as_ref(), b"payload");
+        let first_metadata = store.allocated_metadata("assets", &first.path).unwrap();
+        assert_eq!(
+            first_metadata.naming_mode,
+            AllocatedNamingMode::ContentAddressed
+        );
+        assert_eq!(first_metadata.prefix, "pre-");
+        assert_eq!(first_metadata.suffix, "-final");
+        assert_eq!(first_metadata.extension.as_deref(), Some("jp-g"));
+        assert_eq!(first_metadata.media_type, "image/jpeg");
+        store
+            .copy_site("assets", Some("assets-copy"), None)
+            .unwrap();
+        assert_eq!(
+            store
+                .allocated_metadata("assets-copy", &first.path)
+                .unwrap(),
+            first_metadata
+        );
+        let replay = store
+            .allocate_bytes(
+                "assets",
+                b"payload",
+                AllocationSpec {
+                    folder: "nested/assets",
+                    naming: AllocatedName {
+                        prefix: "pre-",
+                        suffix: "-final",
+                        extension: Some("..JP G.."),
+                    },
+                    media_type: "image/jpeg",
+                },
+                options,
+            )
+            .unwrap();
+        assert!(replay.replayed);
+        let source = dir.path().join("from-file.bin");
+        fs::write(&source, b"file payload").unwrap();
+        let from_file = store
+            .allocate_file(
+                "assets",
+                &source,
+                AllocationSpec {
+                    folder: "",
+                    naming: AllocatedName {
+                        prefix: "file-",
+                        suffix: "",
+                        extension: Some("bin"),
+                    },
+                    media_type: "application/octet-stream",
+                },
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            store.read_blob(&from_file.hash).unwrap().as_ref(),
+            b"file payload"
+        );
+        store
+            .set_expiry(
+                "assets",
+                &first.path,
+                Some(ExpiryPolicy::Relative {
+                    duration_seconds: 600,
+                }),
+            )
+            .unwrap();
+        let moved = store
+            .replace_allocated(
+                "assets",
+                &first.path,
+                AllocationSource::Bytes(b"changed"),
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        assert_ne!(moved.path, first.path);
+        let moved_metadata = store.allocated_metadata("assets", &moved.path).unwrap();
+        assert_eq!(moved_metadata.prefix, first_metadata.prefix);
+        assert_eq!(moved_metadata.suffix, first_metadata.suffix);
+        assert_eq!(moved_metadata.extension, first_metadata.extension);
+        assert_eq!(moved_metadata.media_type, first_metadata.media_type);
+        assert!(matches!(
+            store.lookup("assets", &first.path),
+            Err(StoreError::NotFound)
+        ));
+        store.expiry_report("assets", &moved.path).unwrap();
+        assert!(store.blob_path(&first.hash).is_file());
+        store.undo("assets", None).unwrap();
+        assert_eq!(node_hash(&store, "assets", &first.path), first.hash);
+        assert_eq!(
+            store.allocated_metadata("assets", &first.path).unwrap(),
+            first_metadata
+        );
+        store.expiry_report("assets", &first.path).unwrap();
+        assert!(matches!(
+            store.lookup("assets", &moved.path),
+            Err(StoreError::NotFound)
+        ));
+        store.delete_file("assets", &first.path).unwrap();
+        assert!(store.blob_path(&first.hash).is_file());
+        store.undo("assets", None).unwrap();
+        assert_eq!(node_hash(&store, "assets", &first.path), first.hash);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn pending_allocation_finalizes_once_and_pruning_releases_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(TestClock::new(1_700_000_000_000));
+        let store = Store::with_clock(
+            dir.path().to_path_buf(),
+            "http://symbol".to_string(),
+            Arc::clone(&clock) as Arc<dyn Clock>,
+        )
+        .unwrap();
+        store.put_file("pending", "index.html", b"site").unwrap();
+        let proposal = store
+            .propose_allocation(
+                "pending",
+                AllocationSource::Bytes(b"one"),
+                PendingAllocationSpec {
+                    folder: "nested/pending",
+                    media_type: "application/custom",
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(proposal.size, 3);
+        assert_eq!(proposal.folder, "nested/pending");
+        assert_eq!(proposal.media_type, "application/custom");
+        assert!(proposal.expires_at.ends_with('Z'));
+        store.put_file("other", "index.html", b"other").unwrap();
+        assert!(matches!(
+            store.finalize_allocation(
+                "other",
+                &proposal.token,
+                AllocatedName::default(),
+                FileMutationOptions::default()
+            ),
+            Err(StoreError::InvalidPendingAllocation)
+        ));
+        let mut db = test_connection(&dir.path().join("symbol.db"));
+        assert_eq!(
+            blobs::table
+                .filter(blobs::hash.eq(&proposal.hash))
+                .select(count_star())
+                .first::<i64>(&mut db)
+                .unwrap(),
+            1
+        );
+        drop(db);
+        let finalized = store
+            .finalize_allocation(
+                "pending",
+                &proposal.token,
+                AllocatedName {
+                    prefix: "custom-",
+                    suffix: "",
+                    extension: Some("BIN"),
+                },
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(finalized.hash, proposal.hash);
+        assert!(finalized.path.starts_with("nested/pending/custom-"));
+        let mut db = test_connection(&dir.path().join("symbol.db"));
+        assert_eq!(
+            blobs::table
+                .filter(blobs::hash.eq(&proposal.hash))
+                .select(count_star())
+                .first::<i64>(&mut db)
+                .unwrap(),
+            1
+        );
+        drop(db);
+        assert!(matches!(
+            store.finalize_allocation(
+                "pending",
+                &proposal.token,
+                AllocatedName::default(),
+                FileMutationOptions::default()
+            ),
+            Err(StoreError::InvalidPendingAllocation)
+        ));
+
+        let abandoned = store
+            .propose_allocation(
+                "pending",
+                AllocationSource::Bytes(b"abandoned"),
+                PendingAllocationSpec::default(),
+                None,
+            )
+            .unwrap();
+        assert!(store.blob_path(&abandoned.hash).is_file());
+        clock.advance(u64::try_from(PENDING_RETENTION_MILLIS).unwrap() + 1);
+        assert_eq!(store.prune_pending_allocations().unwrap(), 1);
+        assert!(!store.blob_path(&abandoned.hash).exists());
+
+        let cancelled = store
+            .propose_allocation(
+                "pending",
+                AllocationSource::Bytes(b"cancelled"),
+                PendingAllocationSpec::default(),
+                None,
+            )
+            .unwrap();
+        store
+            .cancel_allocation("pending", &cancelled.token, None)
+            .unwrap();
+        assert!(!store.blob_path(&cancelled.hash).exists());
+    }
+
+    #[test]
+    fn custom_finalize_validates_basename_and_reports_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+        store.put_file("custom", "index.html", b"site").unwrap();
+        let proposal = store
+            .propose_allocation(
+                "custom",
+                AllocationSource::Bytes(b"custom payload"),
+                PendingAllocationSpec {
+                    folder: "nested/custom",
+                    media_type: "text/plain",
+                },
+                None,
+            )
+            .unwrap();
+        for invalid in ["", ".", "..", "../escape", "a/b", r"a\b", "UNDO"] {
+            assert!(matches!(
+                store.finalize_allocation_custom(
+                    "custom",
+                    &proposal.token,
+                    invalid,
+                    FileMutationOptions::default()
+                ),
+                Err(StoreError::InvalidAllocatedName)
+            ));
+        }
+        let finalized = store
+            .finalize_allocation_custom(
+                "custom",
+                &proposal.token,
+                "safe-name.txt",
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(finalized.path, "nested/custom/safe-name.txt");
+        let metadata = store.allocated_metadata("custom", &finalized.path).unwrap();
+        assert_eq!(metadata.naming_mode, AllocatedNamingMode::Custom);
+        assert_eq!(metadata.media_type, "text/plain");
+
+        store
+            .put_file("custom", "nested/custom/taken.txt", b"taken")
+            .unwrap();
+        let conflict = store
+            .propose_allocation(
+                "custom",
+                AllocationSource::Bytes(b"conflict"),
+                PendingAllocationSpec {
+                    folder: "nested/custom",
+                    media_type: "text/plain",
+                },
+                None,
+            )
+            .unwrap();
+        assert!(matches!(
+            store.finalize_allocation_custom(
+                "custom",
+                &conflict.token,
+                "taken.txt",
+                FileMutationOptions::default()
+            ),
+            Err(StoreError::DestinationConflict)
+        ));
+        store
+            .cancel_allocation("custom", &conflict.token, None)
+            .unwrap();
+    }
+
+    #[test]
+    fn allocated_expiry_sweep_and_whole_site_undo_keep_blob_reachable() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(TestClock::new(1_700_000_000_000));
+        let store = Store::with_clock(
+            dir.path().to_path_buf(),
+            "http://symbol".to_string(),
+            Arc::clone(&clock) as Arc<dyn Clock>,
+        )
+        .unwrap();
+        store
+            .put_file("expiry-allocated", "index.html", b"site")
+            .unwrap();
+        let allocated = store
+            .allocate_bytes(
+                "expiry-allocated",
+                b"expires",
+                AllocationSpec::default(),
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        store
+            .set_expiry(
+                "expiry-allocated",
+                &allocated.path,
+                Some(ExpiryPolicy::Relative {
+                    duration_seconds: 1,
+                }),
+            )
+            .unwrap();
+        clock.advance(1_001);
+        assert_eq!(store.sweep_expired().unwrap(), 1);
+        assert!(matches!(
+            store.lookup("expiry-allocated", &allocated.path),
+            Err(StoreError::NotFound)
+        ));
+        assert!(store.blob_path(&allocated.hash).is_file());
+        store.undo("expiry-allocated", None).unwrap();
+        assert_eq!(
+            node_hash(&store, "expiry-allocated", &allocated.path),
+            allocated.hash
+        );
+    }
+
+    #[test]
+    fn replacement_requires_current_hash_and_preserves_regular_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+        store.put_file("replace", "data.bin", b"old").unwrap();
+        let old_hash = node_hash(&store, "replace", "data.bin");
+        assert!(matches!(
+            store.replace_file_content(
+                "replace",
+                "data.bin",
+                "stale",
+                AllocationSource::Bytes(b"new"),
+                FileMutationOptions::default()
+            ),
+            Err(StoreError::StaleContentHash(current)) if current == old_hash
+        ));
+        let replaced = store
+            .replace_file_content(
+                "replace",
+                "data.bin",
+                &old_hash,
+                AllocationSource::Bytes(b"new"),
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(replaced.path, "data.bin");
+        store.undo("replace", None).unwrap();
+        assert_eq!(node_hash(&store, "replace", "data.bin"), old_hash);
+    }
+
+    #[test]
+    fn multi_splice_uses_original_offsets_and_validates_ranges() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+        store.put_file("splice", "data.txt", b"0123456789").unwrap();
+        let base = node_hash(&store, "splice", "data.txt");
+        let result = store
+            .splice_file(
+                "splice",
+                "data.txt",
+                &base,
+                &[
+                    Splice {
+                        offset: 0,
+                        delete: 0,
+                        insert: SpliceSource::Bytes(b"A"),
+                    },
+                    Splice {
+                        offset: 2,
+                        delete: 3,
+                        insert: SpliceSource::Bytes(b"BC"),
+                    },
+                    Splice {
+                        offset: 10,
+                        delete: 0,
+                        insert: SpliceSource::Bytes(b"Z"),
+                    },
+                ],
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            store.read_blob(&result.hash).unwrap().as_ref(),
+            b"A01BC56789Z"
+        );
+        assert!(matches!(
+            store.splice_file(
+                "splice",
+                "data.txt",
+                &result.hash,
+                &[
+                    Splice {
+                        offset: 4,
+                        delete: 2,
+                        insert: SpliceSource::Empty,
+                    },
+                    Splice {
+                        offset: 5,
+                        delete: 0,
+                        insert: SpliceSource::Empty,
+                    }
+                ],
+                FileMutationOptions::default()
+            ),
+            Err(StoreError::InvalidSpliceOrder)
+        ));
+        assert!(matches!(
+            store.splice_file(
+                "splice",
+                "data.txt",
+                &result.hash,
+                &[Splice {
+                    offset: 99,
+                    delete: 0,
+                    insert: SpliceSource::Empty,
+                }],
+                FileMutationOptions::default()
+            ),
+            Err(StoreError::SpliceRange)
+        ));
+        let secret = format!("sym_mgmt_{}\n", "a".repeat(64));
+        assert!(matches!(
+            store.splice_file(
+                "splice",
+                "data.txt",
+                &result.hash,
+                &[Splice {
+                    offset: 0,
+                    delete: 0,
+                    insert: SpliceSource::Bytes(secret.as_bytes()),
+                }],
+                FileMutationOptions::default()
+            ),
+            Err(StoreError::SecretContent)
+        ));
+        assert_eq!(node_hash(&store, "splice", "data.txt"), result.hash);
+    }
+
+    #[test]
+    fn splice_streams_large_file_and_file_insertions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+        let source = dir.path().join("large.bin");
+        let insertion = dir.path().join("insert.bin");
+        {
+            let mut file = fs::File::create(&source).unwrap();
+            for _ in 0..256 {
+                file.write_all(&[7_u8; 64 * 1024]).unwrap();
+            }
+        }
+        fs::write(&insertion, [8_u8; 64 * 1024]).unwrap();
+        store
+            .put_uploaded_file("stream", "large.bin", source, None)
+            .unwrap();
+        let base = node_hash(&store, "stream", "large.bin");
+        let result = store
+            .splice_file(
+                "stream",
+                "large.bin",
+                &base,
+                &[Splice {
+                    offset: 8 * 1024 * 1024,
+                    delete: 64 * 1024,
+                    insert: SpliceSource::File(&insertion),
+                }],
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(result.size, 16 * 1024 * 1024);
+        let mut file = fs::File::open(store.blob_path(&result.hash)).unwrap();
+        file.seek(SeekFrom::Start(8 * 1024 * 1024)).unwrap();
+        let mut marker = [0_u8; 1];
+        file.read_exact(&mut marker).unwrap();
+        assert_eq!(marker, [8]);
+    }
+
+    #[test]
+    fn writer_transaction_rechecks_replace_and_splice_hashes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+        store.put_file("cas", "data.txt", b"base").unwrap();
+        let base = node_hash(&store, "cas", "data.txt");
+        let racer = store.clone();
+        store.set_before_content_commit(move || {
+            racer.put_file("cas", "data.txt", b"racer").unwrap();
+        });
+        assert!(matches!(
+            store.replace_file_content(
+                "cas",
+                "data.txt",
+                &base,
+                AllocationSource::Bytes(b"replacement"),
+                FileMutationOptions::default(),
+            ),
+            Err(StoreError::StaleContentHash(current))
+                if current == blake3::hash(b"racer").to_hex().as_str()
+        ));
+        assert_eq!(
+            store
+                .read_blob(&node_hash(&store, "cas", "data.txt"))
+                .unwrap()
+                .as_ref(),
+            b"racer"
+        );
+
+        let splice_base = node_hash(&store, "cas", "data.txt");
+        let racer = store.clone();
+        store.set_before_content_commit(move || {
+            racer.put_file("cas", "data.txt", b"second racer").unwrap();
+        });
+        assert!(matches!(
+            store.splice_file(
+                "cas",
+                "data.txt",
+                &splice_base,
+                &[Splice {
+                    offset: 0,
+                    delete: 0,
+                    insert: SpliceSource::Bytes(b"x"),
+                }],
+                FileMutationOptions::default(),
+            ),
+            Err(StoreError::StaleContentHash(current))
+                if current == blake3::hash(b"second racer").to_hex().as_str()
+        ));
+
+        let pending = store
+            .propose_allocation(
+                "cas",
+                AllocationSource::Bytes(b"allocated base"),
+                PendingAllocationSpec::default(),
+                None,
+            )
+            .unwrap();
+        let allocated = store
+            .finalize_allocation_custom(
+                "cas",
+                &pending.token,
+                "fixed.bin",
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        let racer = store.clone();
+        let allocated_path = allocated.path.clone();
+        store.set_before_content_commit(move || {
+            racer
+                .replace_allocated(
+                    "cas",
+                    &allocated_path,
+                    AllocationSource::Bytes(b"allocated racer"),
+                    FileMutationOptions::default(),
+                )
+                .unwrap();
+        });
+        assert!(matches!(
+            store.replace_file_content(
+                "cas",
+                &allocated.path,
+                &allocated.hash,
+                AllocationSource::Bytes(b"allocated replacement"),
+                FileMutationOptions::default(),
+            ),
+            Err(StoreError::StaleContentHash(current))
+                if current == blake3::hash(b"allocated racer").to_hex().as_str()
+        ));
+        assert!(
+            !store
+                .blob_path(blake3::hash(b"allocated replacement").to_hex().as_ref())
+                .exists()
+        );
+    }
+
+    #[test]
+    fn file_sources_are_staged_once_before_later_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+        store.put_file("staged", "data.txt", b"base").unwrap();
+        let allocation_source = dir.path().join("allocation-source");
+        fs::write(&allocation_source, b"original allocation").unwrap();
+        let changed_source = allocation_source.clone();
+        store.set_before_content_commit(move || {
+            fs::write(changed_source, b"changed allocation").unwrap();
+        });
+        let allocated = store
+            .allocate_file(
+                "staged",
+                &allocation_source,
+                AllocationSpec::default(),
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(allocated.size, b"original allocation".len() as u64);
+        assert_eq!(
+            store.read_blob(&allocated.hash).unwrap().as_ref(),
+            b"original allocation"
+        );
+
+        let insertion = dir.path().join("splice-source");
+        fs::write(&insertion, b"original insertion").unwrap();
+        let changed_insertion = insertion.clone();
+        store.set_before_content_commit(move || {
+            fs::write(changed_insertion, b"changed insertion").unwrap();
+        });
+        let base = node_hash(&store, "staged", "data.txt");
+        let spliced = store
+            .splice_file(
+                "staged",
+                "data.txt",
+                &base,
+                &[Splice {
+                    offset: 4,
+                    delete: 0,
+                    insert: SpliceSource::File(&insertion),
+                }],
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            store.read_blob(&spliced.hash).unwrap().as_ref(),
+            b"baseoriginal insertion"
+        );
+    }
+
+    #[test]
+    fn allocated_replacement_reuses_existing_destination_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+        store.put_file("reuse", "index.html", b"site").unwrap();
+        let first = store
+            .allocate_bytes(
+                "reuse",
+                b"first",
+                AllocationSpec::default(),
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        let destination = store
+            .allocate_bytes(
+                "reuse",
+                b"destination",
+                AllocationSpec::default(),
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+
+        let relocated = store
+            .replace_allocated(
+                "reuse",
+                &first.path,
+                AllocationSource::Bytes(b"destination"),
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+
+        assert!(relocated.changed);
+        assert_eq!(relocated.path, destination.path);
+        assert!(matches!(
+            store.lookup("reuse", &first.path),
+            Err(StoreError::NotFound)
+        ));
+        assert_eq!(
+            node_hash(&store, "reuse", &destination.path),
+            destination.hash
+        );
+        store.undo("reuse", None).unwrap();
+        assert_eq!(node_hash(&store, "reuse", &first.path), first.hash);
+        assert_eq!(
+            node_hash(&store, "reuse", &destination.path),
+            destination.hash
+        );
+    }
+
+    #[test]
+    fn pending_finalize_and_regular_noop_replay_after_later_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+        store.put_file("replay", "data.txt", b"same").unwrap();
+        let base = node_hash(&store, "replay", "data.txt");
+        let noop_key = Idempotency {
+            key: "regular-noop".to_string(),
+        };
+        let noop_options = FileMutationOptions {
+            idempotency: Some(&noop_key),
+            ..FileMutationOptions::default()
+        };
+        let noop = store
+            .replace_file_content(
+                "replay",
+                "data.txt",
+                &base,
+                AllocationSource::Bytes(b"same"),
+                noop_options,
+            )
+            .unwrap();
+        assert!(!noop.changed);
+        store.put_file("replay", "data.txt", b"later").unwrap();
+        let replay = store
+            .replace_file_content(
+                "replay",
+                "data.txt",
+                &base,
+                AllocationSource::Bytes(b"same"),
+                noop_options,
+            )
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(
+            node_hash(&store, "replay", "data.txt"),
+            blake3::hash(b"later").to_hex().as_str()
+        );
+
+        let pending = store
+            .propose_allocation(
+                "replay",
+                AllocationSource::Bytes(b"pending"),
+                PendingAllocationSpec::default(),
+                None,
+            )
+            .unwrap();
+        let finalize_key = Idempotency {
+            key: "pending-finalize".to_string(),
+        };
+        let finalize_options = FileMutationOptions {
+            idempotency: Some(&finalize_key),
+            ..FileMutationOptions::default()
+        };
+        let naming = AllocatedName {
+            prefix: "p-",
+            suffix: "",
+            extension: Some("bin"),
+        };
+        let finalized = store
+            .finalize_allocation("replay", &pending.token, naming, finalize_options)
+            .unwrap();
+        store.put_file("replay", "later.txt", b"later").unwrap();
+        let replayed = store
+            .finalize_allocation("replay", &pending.token, naming, finalize_options)
+            .unwrap();
+        assert!(replayed.replayed);
+        assert_eq!(replayed.path, finalized.path);
+        assert!(matches!(
+            store.finalize_allocation(
+                "replay",
+                &pending.token,
+                AllocatedName {
+                    prefix: "different-",
+                    ..naming
+                },
+                finalize_options,
+            ),
+            Err(StoreError::IdempotencyConflict)
+        ));
+    }
+
+    #[test]
+    fn pending_fingerprint_detects_size_tampering() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+        store.put_file("tamper", "index.html", b"site").unwrap();
+        let pending = store
+            .propose_allocation(
+                "tamper",
+                AllocationSource::Bytes(b"payload"),
+                PendingAllocationSpec::default(),
+                None,
+            )
+            .unwrap();
+        {
+            let mut db = store.inner.writer.lock().unwrap();
+            diesel::update(pending_allocations::table.find(&pending.token))
+                .set(pending_allocations::size.eq(999_i64))
+                .execute(&mut *db)
+                .unwrap();
+        }
+        assert!(matches!(
+            store.finalize_allocation(
+                "tamper",
+                &pending.token,
+                AllocatedName::default(),
+                FileMutationOptions::default(),
+            ),
+            Err(StoreError::InvalidPendingAllocation)
+        ));
+    }
+
+    #[test]
+    fn failed_allocation_authorization_never_materializes_blobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+        let missing_hash = blake3::hash(b"missing").to_hex().to_string();
+        assert!(matches!(
+            store.allocate_bytes(
+                "missing",
+                b"missing",
+                AllocationSpec::default(),
+                FileMutationOptions::default(),
+            ),
+            Err(StoreError::NotFound)
+        ));
+        assert!(!store.blob_path(&missing_hash).exists());
+
+        store.put_file("managed", "index.html", b"site").unwrap();
+        let management = ManagementToken::generate().unwrap();
+        {
+            let mut db = store.inner.writer.lock().unwrap();
+            diesel::update(sites::table.filter(sites::name.eq("managed")))
+                .set((
+                    sites::management_hash.eq(Some(management.hash().as_bytes().as_slice())),
+                    sites::management_status.eq(1_i64),
+                ))
+                .execute(&mut *db)
+                .unwrap();
+        }
+        let forbidden_hash = blake3::hash(b"forbidden").to_hex().to_string();
+        assert!(matches!(
+            store.propose_allocation(
+                "managed",
+                AllocationSource::Bytes(b"forbidden"),
+                PendingAllocationSpec::default(),
+                None,
+            ),
+            Err(StoreError::Unauthorized)
+        ));
+        assert!(!store.blob_path(&forbidden_hash).exists());
+    }
+
+    #[test]
+    fn copy_and_move_file_counts_include_allocated_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+        store.put_file("counts", "index.html", b"site").unwrap();
+        store
+            .allocate_bytes(
+                "counts",
+                b"asset",
+                AllocationSpec::default(),
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        let (_, copied) = store
+            .copy_site("counts", Some("counts-copy"), None)
+            .unwrap();
+        assert_eq!(copied.files, 2);
+        let (_, moved) = store.move_site("counts-copy", "counts-moved").unwrap();
+        assert_eq!(moved.files, 2);
+    }
+
+    #[test]
+    fn partial_expiry_keeps_site_with_allocated_survivor() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(TestClock::new(1_700_000_000_000));
+        let store = Store::with_clock(
+            dir.path().to_path_buf(),
+            "http://symbol".to_string(),
+            Arc::clone(&clock) as Arc<dyn Clock>,
+        )
+        .unwrap();
+        store
+            .put_file("survivor", "temporary.txt", b"temporary")
+            .unwrap();
+        let survivor = store
+            .allocate_bytes(
+                "survivor",
+                b"allocated survivor",
+                AllocationSpec::default(),
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        store
+            .set_expiry(
+                "survivor",
+                "temporary.txt",
+                Some(ExpiryPolicy::Relative {
+                    duration_seconds: 1,
+                }),
+            )
+            .unwrap();
+
+        clock.advance(1_001);
+        assert_eq!(store.sweep_expired().unwrap(), 1);
+        assert!(matches!(
+            store.lookup("survivor", "temporary.txt"),
+            Err(StoreError::NotFound)
+        ));
+        assert_eq!(node_hash(&store, "survivor", &survivor.path), survivor.hash);
+    }
+
+    #[test]
+    fn allocated_replace_and_splice_replay_after_source_relocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+        store
+            .put_file("relocation-replay", "index.html", b"site")
+            .unwrap();
+        let allocated = store
+            .allocate_bytes(
+                "relocation-replay",
+                b"base",
+                AllocationSpec::default(),
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        let replace_key = Idempotency {
+            key: "allocated-replace-replay".to_string(),
+        };
+        let replace_options = FileMutationOptions {
+            idempotency: Some(&replace_key),
+            ..FileMutationOptions::default()
+        };
+        let replaced = store
+            .replace_file_content(
+                "relocation-replay",
+                &allocated.path,
+                &allocated.hash,
+                AllocationSource::Bytes(b"replaced"),
+                replace_options,
+            )
+            .unwrap();
+        assert_ne!(replaced.path, allocated.path);
+        let replace_replay = store
+            .replace_file_content(
+                "relocation-replay",
+                &allocated.path,
+                &allocated.hash,
+                AllocationSource::Bytes(b"replaced"),
+                replace_options,
+            )
+            .unwrap();
+        assert!(replace_replay.replayed);
+        assert_eq!(replace_replay.path, replaced.path);
+
+        let splice_key = Idempotency {
+            key: "allocated-splice-replay".to_string(),
+        };
+        let splice_options = FileMutationOptions {
+            idempotency: Some(&splice_key),
+            ..FileMutationOptions::default()
+        };
+        let splice = [Splice {
+            offset: 0,
+            delete: 0,
+            insert: SpliceSource::Bytes(b"x"),
+        }];
+        let spliced = store
+            .splice_file(
+                "relocation-replay",
+                &replaced.path,
+                &replaced.hash,
+                &splice,
+                splice_options,
+            )
+            .unwrap();
+        assert_ne!(spliced.path, replaced.path);
+        let splice_replay = store
+            .splice_file(
+                "relocation-replay",
+                &replaced.path,
+                &replaced.hash,
+                &splice,
+                splice_options,
+            )
+            .unwrap();
+        assert!(splice_replay.replayed);
+        assert_eq!(splice_replay.path, spliced.path);
+    }
+
+    #[test]
+    fn allocation_reuse_and_idempotency_require_metadata_compatibility() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+        store
+            .put_file("metadata-reuse", "index.html", b"site")
+            .unwrap();
+        store
+            .allocate_bytes(
+                "metadata-reuse",
+                b"destination",
+                AllocationSpec {
+                    media_type: "application/first",
+                    ..AllocationSpec::default()
+                },
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        assert!(matches!(
+            store.allocate_bytes(
+                "metadata-reuse",
+                b"destination",
+                AllocationSpec {
+                    media_type: "application/different",
+                    ..AllocationSpec::default()
+                },
+                FileMutationOptions::default(),
+            ),
+            Err(StoreError::DestinationConflict)
+        ));
+
+        let key = Idempotency {
+            key: "metadata-fingerprint".to_string(),
+        };
+        let options = FileMutationOptions {
+            idempotency: Some(&key),
+            ..FileMutationOptions::default()
+        };
+        store
+            .allocate_bytes(
+                "metadata-reuse",
+                b"fingerprinted",
+                AllocationSpec {
+                    media_type: "application/first",
+                    ..AllocationSpec::default()
+                },
+                options,
+            )
+            .unwrap();
+        assert!(matches!(
+            store.allocate_bytes(
+                "metadata-reuse",
+                b"fingerprinted",
+                AllocationSpec {
+                    media_type: "application/different",
+                    ..AllocationSpec::default()
+                },
+                options,
+            ),
+            Err(StoreError::IdempotencyConflict)
+        ));
+    }
+
+    #[test]
+    fn destination_reuse_does_not_refresh_destination_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(TestClock::new(1_700_000_000_000));
+        let store = Store::with_clock(
+            dir.path().to_path_buf(),
+            "http://symbol".to_string(),
+            Arc::clone(&clock) as Arc<dyn Clock>,
+        )
+        .unwrap();
+        store
+            .put_file("metadata-reuse", "index.html", b"site")
+            .unwrap();
+        let destination = store
+            .allocate_bytes(
+                "metadata-reuse",
+                b"destination",
+                AllocationSpec {
+                    media_type: "application/first",
+                    ..AllocationSpec::default()
+                },
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        store
+            .set_expiry(
+                "metadata-reuse",
+                &destination.path,
+                Some(ExpiryPolicy::Relative {
+                    duration_seconds: 600,
+                }),
+            )
+            .unwrap();
+        let refreshed_before = store
+            .expiry_report("metadata-reuse", &destination.path)
+            .unwrap()
+            .refreshed_at;
+        let source = store
+            .allocate_bytes(
+                "metadata-reuse",
+                b"source",
+                AllocationSpec {
+                    media_type: "application/first",
+                    ..AllocationSpec::default()
+                },
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        clock.advance(10_000);
+        store
+            .replace_allocated(
+                "metadata-reuse",
+                &source.path,
+                AllocationSource::Bytes(b"destination"),
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .expiry_report("metadata-reuse", &destination.path)
+                .unwrap()
+                .refreshed_at,
+            refreshed_before
+        );
+    }
+
+    #[test]
+    fn stats_and_site_lists_include_allocated_content_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+        store
+            .put_file("allocated-stats", "data.txt", b"same")
+            .unwrap();
+        store
+            .allocate_bytes(
+                "allocated-stats",
+                b"same",
+                AllocationSpec::default(),
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+
+        let stats = store.stats().unwrap();
+        assert_eq!(stats.sites, 1);
+        assert_eq!(stats.files, 2);
+        assert_eq!(stats.blobs, 1);
+        assert_eq!(stats.logical_bytes, 8);
+        assert_eq!(stats.bytes, 4);
+        assert_eq!(stats.saved_bytes, 4);
+        assert_eq!(stats.file_sizes.min, Some(4));
+        assert_eq!(stats.blob_sizes.min, Some(4));
+
+        let sites = store.list_sites().unwrap();
+        assert_eq!(sites.files, 2);
+        assert_eq!(sites.bytes, 8);
+        assert_eq!(sites.entries[0].files, 2);
+        assert_eq!(sites.entries[0].bytes, 8);
+    }
+
+    #[test]
+    fn splice_file_staging_stops_at_configured_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let insertion = dir.path().join("oversized");
+        fs::write(&insertion, [7_u8; 32]).unwrap();
+        let temporary = dir.path().join("staging");
+        fs::create_dir(&temporary).unwrap();
+
+        assert!(matches!(
+            prepare_splices(
+                &[Splice {
+                    offset: 0,
+                    delete: 0,
+                    insert: SpliceSource::File(&insertion),
+                }],
+                &temporary,
+                8,
+            ),
+            Err(StoreError::SpliceResultTooLarge)
+        ));
+        assert!(fs::metadata(temporary.join("insert-0")).unwrap().len() <= 9);
+    }
+
+    #[test]
+    fn splice_missing_and_stale_lookups_remove_staging_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+        store
+            .put_file("splice-cleanup", "data.txt", b"base")
+            .unwrap();
+        let base = node_hash(&store, "splice-cleanup", "data.txt");
+        let insertion = dir.path().join("insertion");
+        fs::write(&insertion, b"insert").unwrap();
+        let splice = [Splice {
+            offset: 0,
+            delete: 0,
+            insert: SpliceSource::File(&insertion),
+        }];
+        let splice_directories = || {
+            fs::read_dir(dir.path().join("tmp"))
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with("splice-"))
+                .count()
+        };
+        assert_eq!(splice_directories(), 0);
+
+        assert!(matches!(
+            store.splice_file(
+                "splice-cleanup",
+                "missing.txt",
+                &base,
+                &splice,
+                FileMutationOptions::default(),
+            ),
+            Err(StoreError::NotFound)
+        ));
+        assert_eq!(splice_directories(), 0);
+
+        assert!(matches!(
+            store.splice_file(
+                "missing-site",
+                "data.txt",
+                &base,
+                &splice,
+                FileMutationOptions::default(),
+            ),
+            Err(StoreError::NotFound)
+        ));
+        assert_eq!(splice_directories(), 0);
+
+        assert!(matches!(
+            store.splice_file(
+                "splice-cleanup",
+                "data.txt",
+                "stale",
+                &splice,
+                FileMutationOptions::default(),
+            ),
+            Err(StoreError::StaleContentHash(current)) if current == base
+        ));
+        assert_eq!(splice_directories(), 0);
+    }
+
+    #[test]
+    fn allocated_stale_and_conflicting_writes_do_not_materialize_blobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+        store.put_file("no-orphan", "index.html", b"site").unwrap();
+        let allocated = store
+            .allocate_bytes(
+                "no-orphan",
+                b"base",
+                AllocationSpec::default(),
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        let stale_bytes = b"stale result";
+        let stale_hash = blake3::hash(stale_bytes).to_hex().to_string();
+        assert!(matches!(
+            store.replace_file_content(
+                "no-orphan",
+                &allocated.path,
+                "wrong-base",
+                AllocationSource::Bytes(stale_bytes),
+                FileMutationOptions::default(),
+            ),
+            Err(StoreError::StaleContentHash(_))
+        ));
+        assert!(!store.blob_path(&stale_hash).exists());
+
+        let conflict_bytes = b"conflicting result";
+        let conflict_hash = blake3::hash(conflict_bytes).to_hex().to_string();
+        let conflict_path = conflict_hash.clone();
+        store
+            .put_file("no-orphan", &conflict_path, b"occupied")
+            .unwrap();
+        assert!(matches!(
+            store.replace_allocated(
+                "no-orphan",
+                &allocated.path,
+                AllocationSource::Bytes(conflict_bytes),
+                FileMutationOptions::default(),
+            ),
+            Err(StoreError::DestinationConflict)
+        ));
+        assert!(!store.blob_path(&conflict_hash).exists());
     }
 }

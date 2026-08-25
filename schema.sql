@@ -5,7 +5,9 @@ CREATE TABLE IF NOT EXISTS "sites" ( "id" integer PRIMARY KEY, "name" text NOT N
 
 CREATE TABLE IF NOT EXISTS "blobs" ( "hash" text PRIMARY KEY, "bytes" blob NOT NULL DEFAULT x'', "size" integer NOT NULL );
 
-CREATE TABLE IF NOT EXISTS "files" ( "site_id" integer NOT NULL, "path" text NOT NULL, "hash" text NOT NULL, "size" integer NOT NULL, PRIMARY KEY ("site_id", "path"), FOREIGN KEY ("site_id") REFERENCES "sites" ("id") ON DELETE CASCADE, FOREIGN KEY ("hash") REFERENCES "blobs" ("hash") );
+CREATE TABLE IF NOT EXISTS "site_entries" ( "site_id" integer NOT NULL, "path" text NOT NULL, "kind" integer NOT NULL, PRIMARY KEY ("site_id", "path"), UNIQUE ("site_id", "path", "kind"), FOREIGN KEY ("site_id") REFERENCES "sites" ("id") ON DELETE CASCADE );
+
+CREATE TABLE IF NOT EXISTS "files" ( "site_id" integer NOT NULL, "path" text NOT NULL, "kind" integer NOT NULL DEFAULT 0 CHECK ("kind" = 0), "hash" text NOT NULL, "size" integer NOT NULL, PRIMARY KEY ("site_id", "path"), FOREIGN KEY ("site_id", "path", "kind") REFERENCES "site_entries" ("site_id", "path", "kind") ON DELETE CASCADE, FOREIGN KEY ("hash") REFERENCES "blobs" ("hash") );
 
 CREATE TABLE IF NOT EXISTS "metadata" ( "key" text PRIMARY KEY, "value" text NOT NULL );
 
@@ -31,8 +33,21 @@ CREATE TABLE IF NOT EXISTS "management_idempotency" ( "key_hash" text PRIMARY KE
 
 CREATE TABLE IF NOT EXISTS "path_aggregates" ( "site_id" integer NOT NULL, "path" text NOT NULL, "logical_bytes" integer NOT NULL, "file_count" integer NOT NULL, PRIMARY KEY ("site_id", "path"), FOREIGN KEY ("site_id") REFERENCES "sites" ("id") ON DELETE CASCADE );
 
+CREATE TABLE IF NOT EXISTS "undo_file_deltas" ( "token" text NOT NULL, "path" text NOT NULL, "existed" integer NOT NULL, "kind" integer, "hash" text, "size" integer, PRIMARY KEY ("token", "path"), FOREIGN KEY ("token") REFERENCES "undo_operations" ("token") ON DELETE CASCADE );
+
+CREATE TABLE IF NOT EXISTS "allocated_entries" ( "site_id" integer NOT NULL, "path" text NOT NULL, "kind" integer NOT NULL DEFAULT 1 CHECK ("kind" = 1), "hash" text NOT NULL, "size" integer NOT NULL, "naming_mode" integer NOT NULL, "prefix" text NOT NULL, "suffix" text NOT NULL, "extension" text, "media_type" text NOT NULL, PRIMARY KEY ("site_id", "path"), FOREIGN KEY ("site_id", "path", "kind") REFERENCES "site_entries" ("site_id", "path", "kind") ON DELETE CASCADE, FOREIGN KEY ("hash") REFERENCES "blobs" ("hash") );
+
+CREATE TABLE IF NOT EXISTS "pending_allocations" ( "token" text PRIMARY KEY, "site_id" integer NOT NULL, "folder" text NOT NULL, "hash" text NOT NULL, "size" integer NOT NULL, "media_type" text NOT NULL, "request_fingerprint" text NOT NULL, "created" integer NOT NULL, "expires" integer NOT NULL, FOREIGN KEY ("site_id") REFERENCES "sites" ("id") ON DELETE CASCADE, FOREIGN KEY ("hash") REFERENCES "blobs" ("hash") );
+
+CREATE TABLE IF NOT EXISTS "undo_allocated_deltas" ( "token" text NOT NULL, "path" text NOT NULL, "existed" integer NOT NULL, "hash" text, "size" integer, "naming_mode" integer, "prefix" text, "suffix" text, "extension" text, "media_type" text, PRIMARY KEY ("token", "path"), FOREIGN KEY ("token") REFERENCES "undo_operations" ("token") ON DELETE CASCADE );
+
+CREATE TABLE IF NOT EXISTS "aliases" ( "site_id" integer NOT NULL, "path" text NOT NULL, "kind" integer NOT NULL DEFAULT 2 CHECK ("kind" = 2), "canonical_target" text NOT NULL, "resolved_kind" integer, "resolved_hash" text, "resolved_size" integer, PRIMARY KEY ("site_id", "path"), FOREIGN KEY ("site_id", "path", "kind") REFERENCES "site_entries" ("site_id", "path", "kind") ON DELETE CASCADE );
+
+CREATE TABLE IF NOT EXISTS "undo_alias_deltas" ( "token" text NOT NULL, "path" text NOT NULL, "existed" integer NOT NULL, "canonical_target" text, "resolved_kind" integer, "resolved_hash" text, "resolved_size" integer, PRIMARY KEY ("token", "path"), FOREIGN KEY ("token") REFERENCES "undo_operations" ("token") ON DELETE CASCADE );
+
 CREATE INDEX IF NOT EXISTS "files_hash" ON "files" ("hash");
 CREATE INDEX IF NOT EXISTS "files_site_prefix" ON "files" ("site_id", "path");
+CREATE INDEX IF NOT EXISTS "files_site_hash" ON "files" ("site_id", "hash");
 CREATE INDEX IF NOT EXISTS "undo_operations_retention" ON "undo_operations" ("consumed", "expires", "created");
 CREATE INDEX IF NOT EXISTS "undo_names_stack" ON "undo_names" ("name", "token");
 CREATE INDEX IF NOT EXISTS "undo_files_hash" ON "undo_files" ("hash");
@@ -41,5 +56,8 @@ CREATE INDEX IF NOT EXISTS "expiry_policies_site_kind" ON "expiry_policies" ("si
 CREATE INDEX IF NOT EXISTS "idempotency_records_expiry" ON "idempotency_records" ("expires");
 CREATE INDEX IF NOT EXISTS "management_idempotency_expiry" ON "management_idempotency" ("expires");
 CREATE INDEX IF NOT EXISTS "management_audit_site" ON "management_audit" ("site_name", "occurred");
+CREATE INDEX IF NOT EXISTS "pending_allocations_expiry" ON "pending_allocations" ("expires");
+CREATE INDEX IF NOT EXISTS "aliases_dependency" ON "aliases" ("site_id", "canonical_target");
+CREATE INDEX IF NOT EXISTS "aliases_cache" ON "aliases" ("site_id", "resolved_kind", "resolved_hash", "resolved_size");
 
-PRAGMA user_version = 6;
+PRAGMA user_version = 9;
