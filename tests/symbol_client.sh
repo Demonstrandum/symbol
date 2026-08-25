@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-CLIENT=${CLIENT:-$(dirname "$0")/../static/symbol.sh}
+CLIENT=${CLIENT:-$(dirname "$0")/../crates/symbol/static/symbol.sh}
 CLIENT=$(cd "$(dirname "${CLIENT}")" && pwd)/$(basename "${CLIENT}")
 ROOT=$(mktemp -d)
 trap 'rm -rf "$ROOT"' EXIT HUP INT TERM

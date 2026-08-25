@@ -7,7 +7,7 @@ export PATH
 
 cat > client-under-test <<EOF
 #!/bin/sh
-exec busybox sh "$PWD/static/symbol.sh" "\$@"
+exec busybox sh "$PWD/crates/symbol/static/symbol.sh" "\$@"
 EOF
 chmod +x client-under-test
 

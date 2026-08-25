@@ -7,7 +7,7 @@ if [ "${SYMBOL_PRODUCTION_PHASE:-}" != 10 ]; then
 fi
 
 cd "$(dirname "$0")/.."
-cargo build --release
+cargo build --release --locked -p symbol
 
 quiet_seconds=${SYMBOL_RESTART_QUIET_SECONDS:-30}
 wait_seconds=${SYMBOL_RESTART_WAIT_SECONDS:-300}

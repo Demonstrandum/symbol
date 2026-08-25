@@ -2,7 +2,8 @@
 
 Tiny static-site and media hosting for a tailnet.
 
-The public user guide is [`static/docs.md`](static/docs.md) and is served at
+The public user guide is
+[`crates/symbol/static/docs.md`](crates/symbol/static/docs.md) and is served at
 `/`. The implementation-grade HTTP contract is [`API.md`](API.md). This
 README is for building and operating the service.
 

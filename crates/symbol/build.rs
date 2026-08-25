@@ -6,6 +6,7 @@ use lightningcss::stylesheet::{ParserOptions, StyleSheet};
 const STYLESHEETS: &[&str] = &["base.css", "browse.css", "docs.css"];
 
 fn main() {
+    assert!(!symbol_contract::ENDPOINTS.is_empty());
     for name in STYLESHEETS {
         let path = Path::new("static").join(name);
         println!("cargo::rerun-if-changed={}", path.display());

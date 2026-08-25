@@ -5,7 +5,7 @@ cp -R "$src/." .
 
 cat > client-under-test <<EOF
 #!/bin/sh
-exec dash "$PWD/static/symbol.sh" "\$@"
+exec dash "$PWD/crates/symbol/static/symbol.sh" "\$@"
 EOF
 chmod +x client-under-test
 

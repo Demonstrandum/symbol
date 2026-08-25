@@ -34,14 +34,11 @@
           ./Cargo.toml
           ./Cargo.lock
           ./API.md
-          ./build.rs
           ./check
-          ./migrations
+          ./crates
           ./nix
           ./public-api-freeze.json
-          ./src
           ./ops
-          ./static
           ./tests
         ];
       };
@@ -60,6 +57,11 @@
             version = "0.1.0";
             inherit src;
             cargoLock.lockFile = ./Cargo.lock;
+            cargoTestFlags = [
+              "--workspace"
+              "--all-targets"
+              "--all-features"
+            ];
             nativeBuildInputs = [ pkgs.pkg-config ];
             meta = {
               description = "Tiny static-site hosting for the tailnet";

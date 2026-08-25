@@ -6,7 +6,6 @@ macro_rules! static_asset {
 
 mod blob_store;
 mod browse;
-mod contract;
 #[cfg(test)]
 mod contract_conformance;
 mod expiry;
@@ -41,6 +40,7 @@ use store::{
     ArchiveFormat, CreationSecurity, CreatorIdentity, Idempotency, ManagementRequest,
     PublishOptions, Store, StoreError,
 };
+use symbol_contract as contract;
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
@@ -748,7 +748,7 @@ async fn expiry_site_report(State(app): State<App>, Path(name): Path<String>) ->
         .await;
     match result {
         Ok(report) => {
-            let mut response = Json(report).into_response();
+            let mut response = Json(contract::ExpirySiteReport::from(&report)).into_response();
             response
                 .headers_mut()
                 .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
@@ -768,7 +768,7 @@ async fn expiry_report_response(app: &App, name: String, path: String) -> Respon
         .await;
     match result {
         Ok(report) => {
-            let mut response = Json(report).into_response();
+            let mut response = Json(contract::ExpiryReport::from(&report)).into_response();
             response
                 .headers_mut()
                 .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
@@ -944,7 +944,7 @@ async fn expire_target(app: &App, name: &str, path: &str, headers: &HeaderMap) -
         .await;
     match result {
         Ok(mutation) => {
-            let mut response = Json(mutation.report.clone()).into_response();
+            let mut response = Json(contract::ExpiryReport::from(&mutation.report)).into_response();
             let response_headers = response.headers_mut();
             response_headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
             if let Some(undo) = &mutation.undo {

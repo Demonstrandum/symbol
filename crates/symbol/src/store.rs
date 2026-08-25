@@ -17,6 +17,10 @@ use diesel::upsert::excluded;
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use flate2::Compression;
 use flate2::write::GzEncoder;
+pub use symbol_contract::{
+    CacheStats, InventoryFile, ManagementStatus, ReaderStats, ServingStats, SiteInventory,
+    SizeDistribution, Stats, UndoEntry, UndoStack,
+};
 
 use crate::blob_store::BlobFiles;
 use crate::expiry::{
@@ -230,27 +234,6 @@ struct Metrics {
     reader_query_micros: AtomicU64,
 }
 
-#[derive(Debug, Clone, Copy, serde::Serialize)]
-pub struct ServingStats {
-    pub cache: CacheStats,
-    pub readers: ReaderStats,
-}
-
-#[derive(Debug, Clone, Copy, serde::Serialize)]
-pub struct CacheStats {
-    pub hits: u64,
-    pub misses: u64,
-    pub evictions: u64,
-}
-
-#[derive(Debug, Clone, Copy, serde::Serialize)]
-pub struct ReaderStats {
-    pub operations: u64,
-    pub waits: u64,
-    pub wait_micros: u64,
-    pub query_micros: u64,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EntryKind {
@@ -285,32 +268,6 @@ pub struct SiteList {
     pub files: u64,
     pub bytes: u64,
     pub entries: Vec<SiteEnt>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct SizeDistribution {
-    pub min: Option<u64>,
-    pub p25: Option<f64>,
-    pub median: Option<f64>,
-    pub mean: Option<f64>,
-    pub p75: Option<f64>,
-    pub max: Option<u64>,
-    pub iqr: Option<f64>,
-    pub stddev: Option<f64>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct Stats {
-    pub sites: u64,
-    pub files: u64,
-    pub blobs: u64,
-    pub bytes: u64,
-    pub logical_bytes: u64,
-    pub saved_bytes: u64,
-    pub saved_fraction: f64,
-    pub file_sizes: SizeDistribution,
-    pub blob_sizes: SizeDistribution,
-    pub serving: ServingStats,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -411,47 +368,11 @@ pub struct CreationSecurity {
     pub management_hash: Option<ManagementTokenHash>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-pub struct ManagementStatus {
-    pub managed: bool,
-}
-
 #[derive(Debug)]
 pub struct ManagementMutation {
     pub status: ManagementStatus,
     pub token: Option<ManagementToken>,
     pub replayed: bool,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct InventoryFile {
-    pub path: String,
-    pub hash: String,
-    pub size: u64,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct SiteInventory {
-    pub site: String,
-    pub content_revision: u64,
-    pub tree_hash: String,
-    pub files: Vec<InventoryFile>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct UndoEntry {
-    pub token: String,
-    pub kind: String,
-    pub description: String,
-    pub created_at: String,
-    pub expires_at: String,
-    pub remaining_seconds: u64,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct UndoStack {
-    pub site: String,
-    pub entries: Vec<UndoEntry>,
 }
 
 #[derive(Debug, Clone)]

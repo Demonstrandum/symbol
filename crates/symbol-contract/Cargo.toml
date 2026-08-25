@@ -1,0 +1,19 @@
+[package]
+name = "symbol-contract"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.0"
+description = "Shared typed HTTP contract for Symbol"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+correctness = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }

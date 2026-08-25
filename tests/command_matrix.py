@@ -5,7 +5,7 @@ import subprocess
 import sys
 
 root = pathlib.Path(__file__).resolve().parent.parent
-client = root / "static/symbol.sh"
+client = root / "crates/symbol/static/symbol.sh"
 registry_environment = os.environ | {"SYMBOL_TEST_COMMAND_REGISTRY": "1"}
 registry_output = subprocess.check_output(
     [client], env=registry_environment, text=True

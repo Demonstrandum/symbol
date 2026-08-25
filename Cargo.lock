@@ -1409,6 +1409,7 @@ dependencies = [
  "serde",
  "serde_json",
  "subtle",
+ "symbol-contract",
  "tar",
  "tempfile",
  "thiserror",
@@ -1420,6 +1421,13 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "zip",
+]
+
+[[package]]
+name = "symbol-contract"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

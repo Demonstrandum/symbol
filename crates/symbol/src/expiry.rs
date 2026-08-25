@@ -247,6 +247,93 @@ pub struct ExpiryLimit {
     pub path: Option<String>,
 }
 
+impl From<ExpiryMode> for symbol_contract::ExpiryMode {
+    fn from(value: ExpiryMode) -> Self {
+        match value {
+            ExpiryMode::Relative => Self::Relative,
+            ExpiryMode::Absolute => Self::Absolute,
+            ExpiryMode::Decay => Self::Decay,
+        }
+    }
+}
+
+impl From<ExpiryTargetKind> for symbol_contract::ExpiryTargetKind {
+    fn from(value: ExpiryTargetKind) -> Self {
+        match value {
+            ExpiryTargetKind::Site => Self::Site,
+            ExpiryTargetKind::Folder => Self::Folder,
+            ExpiryTargetKind::File => Self::File,
+        }
+    }
+}
+
+impl From<&ExpiryTarget> for symbol_contract::ExpiryTarget {
+    fn from(value: &ExpiryTarget) -> Self {
+        Self {
+            site: value.site.clone(),
+            path: value.path.clone(),
+            kind: value.kind.into(),
+        }
+    }
+}
+
+impl From<&OwnExpiryReport> for symbol_contract::OwnExpiryReport {
+    fn from(value: &OwnExpiryReport) -> Self {
+        Self {
+            mode: value.mode.into(),
+            min_age_seconds: value.min_age_seconds,
+            max_age_seconds: value.max_age_seconds,
+            max_size_bytes: value.max_size_bytes,
+            power: value.power,
+            retention_seconds: value.retention_seconds,
+            expires_at: value.expires_at.clone(),
+        }
+    }
+}
+
+impl From<&InheritedExpiryCap> for symbol_contract::InheritedExpiryCap {
+    fn from(value: &InheritedExpiryCap) -> Self {
+        Self {
+            kind: value.kind.into(),
+            path: value.path.clone(),
+            expires_at: value.expires_at.clone(),
+        }
+    }
+}
+
+impl From<&ExpiryLimit> for symbol_contract::ExpiryLimit {
+    fn from(value: &ExpiryLimit) -> Self {
+        Self {
+            kind: value.kind.into(),
+            path: value.path.clone(),
+        }
+    }
+}
+
+impl From<&ExpiryReport> for symbol_contract::ExpiryReport {
+    fn from(value: &ExpiryReport) -> Self {
+        Self {
+            target: (&value.target).into(),
+            size: value.size,
+            refreshed_at: value.refreshed_at.clone(),
+            own_policy: value.own_policy.as_ref().map(Into::into),
+            inherited_caps: value.inherited_caps.iter().map(Into::into).collect(),
+            effective_expires_at: value.effective_expires_at.clone(),
+            remaining_seconds: value.remaining_seconds,
+            limited_by: value.limited_by.as_ref().map(Into::into),
+        }
+    }
+}
+
+impl From<&ExpirySiteReport> for symbol_contract::ExpirySiteReport {
+    fn from(value: &ExpirySiteReport) -> Self {
+        Self {
+            site: value.site.clone(),
+            entries: value.entries.iter().map(Into::into).collect(),
+        }
+    }
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HumanDuration {

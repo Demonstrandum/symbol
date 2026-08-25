@@ -4,35 +4,11 @@ use axum::body::Bytes;
 use axum::http::{HeaderMap, HeaderValue, header};
 use axum::response::Response;
 use maud::{DOCTYPE, PreEscaped, html};
+use symbol_contract::{Listing, ListingEntry, ListingKind};
 
 use crate::http_cache::{self, Representation};
 use crate::page;
 use crate::store::{DirList, EntryKind, SiteList};
-
-#[derive(serde::Serialize)]
-#[serde(rename_all = "lowercase")]
-enum ListingKind {
-    Site,
-    Directory,
-    File,
-}
-
-#[derive(serde::Serialize)]
-struct ListingEntry {
-    kind: ListingKind,
-    name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    files: Option<u64>,
-    bytes: u64,
-}
-
-#[derive(serde::Serialize)]
-struct ListingJson {
-    path: String,
-    files: u64,
-    bytes: u64,
-    entries: Vec<ListingEntry>,
-}
 
 pub fn sites(headers: &HeaderMap, list: &SiteList) -> Response {
     if wants_json(headers) {
@@ -48,7 +24,7 @@ pub fn sites(headers: &HeaderMap, list: &SiteList) -> Response {
             .collect();
         return json_response(
             headers,
-            &ListingJson {
+            &Listing {
                 path: "/".to_string(),
                 files: list.files,
                 bytes: list.bytes,
@@ -92,7 +68,7 @@ pub fn listing(
             .collect();
         return json_response(
             headers,
-            &ListingJson {
+            &Listing {
                 path: display_path(site, rel),
                 files: list.files,
                 bytes: list.bytes,
@@ -318,7 +294,7 @@ fn wants_json(headers: &HeaderMap) -> bool {
         })
 }
 
-fn json_response(headers: &HeaderMap, value: &ListingJson) -> Response {
+fn json_response(headers: &HeaderMap, value: &Listing) -> Response {
     let body = serde_json::to_vec(&value).expect("listing serializes");
     cached_response(headers, Bytes::from(body), "application/json")
 }
