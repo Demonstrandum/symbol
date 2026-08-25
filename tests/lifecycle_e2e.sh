@@ -325,7 +325,7 @@ ok "undo stack, mutation restore, and file-delete restore work"
 
 "${CLIENT}" expire e2e-main >/dev/null
 expiry=$("${CLIENT}" expire e2e-main --show)
-normalized=$(printf '%s\n' "$expiry" |
+normalized=$(printf '%s\n' "${expiry}" |
   sed -e 's/20[0-9][0-9]-[0-9T:.-]*Z/<TIME>/g' \
     -e 's/(in [^)]*)/(in <DURATION>)/g')
 expected=$(cat <<'EOF'
@@ -334,11 +334,11 @@ TARGET                       MODE      EXPIRES                LIMITED BY
 e2e-main/                    decay     <TIME> (in <DURATION>) -
 EOF
 )
-[ "$normalized" = "$expected" ] ||
+[ "${normalized}" = "${expected}" ] ||
   fail "site-wide expiry inventory differs from golden output"
 "${CLIENT}" expire e2e-main index.html >/dev/null
 expiry=$("${CLIENT}" expire e2e-main index.html --show)
-normalized=$(printf '%s\n' "$expiry" |
+normalized=$(printf '%s\n' "${expiry}" |
   sed -e 's/20[0-9][0-9]-[0-9T:.-]*Z/<TIME>/g' \
     -e 's/(in [^)]*)/(in <DURATION>)/g' \
     -e 's/^policy retention:.*/policy retention:  <DURATION>/' \
@@ -366,10 +366,10 @@ refreshed |*------------------------------------| expires
           <DURATION> elapsed; <DURATION> remaining
 EOF
 )
-[ "$normalized" = "$expected" ] ||
+[ "${normalized}" = "${expected}" ] ||
   fail "target expiry report differs from golden output"
 never=$("${CLIENT}" expire e2e-main --never)
-normalized=$(printf '%s\n' "$never" |
+normalized=$(printf '%s\n' "${never}" |
   sed -e 's/^undo within 4h: symbol undo e2e-main .*/undo within 4h: symbol undo e2e-main <TOKEN>/' \
     -e 's|^expiration disabled for .*/e2e-main$|expiration disabled for <BASE>/e2e-main|')
 expected=$(cat <<'EOF'
@@ -377,7 +377,7 @@ undo within 4h: symbol undo e2e-main <TOKEN>
 expiration disabled for <BASE>/e2e-main
 EOF
 )
-[ "$normalized" = "$expected" ] ||
+[ "${normalized}" = "${expected}" ] ||
   fail "--never differs from golden output"
 ok "site and target expiry reports work"
 
@@ -446,8 +446,8 @@ contains "${stored}" 'sym_mgmt_' &&
   fail "managed upload sanitizes token payload"
 ok "management authorization and sanitization work"
 
-if grep -F "$token" "${ROOT}/server.log" >/dev/null ||
-  grep -F "$claim" "${ROOT}/server.log" >/dev/null ||
+if grep -F "${token}" "${ROOT}/server.log" >/dev/null ||
+  grep -F "${claim}" "${ROOT}/server.log" >/dev/null ||
   grep -F 'sym_mgmt_' "${ROOT}/server.log" >/dev/null ||
   grep -F 'sym_claim_' "${ROOT}/server.log" >/dev/null; then
   fail "application tracing leaked request or one-time response secrets"

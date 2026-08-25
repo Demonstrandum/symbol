@@ -33,8 +33,12 @@
         fileset = lib.fileset.unions [
           ./Cargo.toml
           ./Cargo.lock
+          ./API.md
           ./build.rs
+          ./check
           ./migrations
+          ./nix
+          ./public-api-freeze.json
           ./src
           ./ops
           ./static
@@ -71,9 +75,41 @@
 
       checks = forEachSystem (
         pkgs:
-        import ./nix/posix-checks.nix {
-          inherit pkgs lib;
-          root = ./.;
+        let
+          posix = import ./nix/posix-checks.nix {
+            inherit pkgs lib;
+            root = ./.;
+          };
+          package = self.packages.${pkgs.stdenv.hostPlatform.system}.symbol;
+          freezeSrc = lib.fileset.toSource {
+            root = ./.;
+            fileset = lib.fileset.unions [
+              ./public-api-freeze.json
+              ./tests/public_api_freeze.py
+            ];
+          };
+          publicApiFreeze = pkgs.runCommand "symbol-public-api-freeze" {
+            src = freezeSrc;
+            nativeBuildInputs = [ pkgs.python3 ];
+          } ''
+            cp -R "$src" source
+            chmod -R u+w source
+            cd source
+            SYMBOL_BIN="${package}/bin/symbol" python3 tests/public_api_freeze.py
+            touch "$out"
+          '';
+          named = posix // {
+            inherit package;
+            public-api-freeze = publicApiFreeze;
+          };
+        in
+        named
+        // {
+          all = pkgs.linkFarm "symbol-all-checks" (
+            lib.mapAttrsToList (name: path: {
+              inherit name path;
+            }) named
+          );
         }
       );
 

@@ -3,6 +3,12 @@ set -eu
 
 cd "$(dirname "$0")"
 
+if [ "${SYMBOL_DEPLOY_CHECK:-0}" = 1 ] &&
+  [ "${SYMBOL_PRODUCTION_PHASE:-}" != 10 ]; then
+  printf 'production access is restricted to Phase 10\n' >&2
+  exit 64
+fi
+
 ./check
 cargo build --release --locked
 sudo -n nix build path:. --cores "${NIX_CORES:-8}" --max-jobs "${NIX_MAX_JOBS:-4}"
@@ -16,14 +22,14 @@ if [ "${SYMBOL_DEPLOY_CHECK:-0}" = 1 ]; then
   attempts=${SYMBOL_STARTUP_ATTEMPTS:-180}
   attempt=1
   while ! stats=$(curl -fsS http://127.0.0.1:4340/STATS 2>/dev/null); do
-    if [ "$attempt" -ge "$attempts" ]; then
-      printf 'symbol did not become ready after %s seconds\n' "$attempts" >&2
+    if [ "${attempt}" -ge "${attempts}" ]; then
+      printf 'symbol did not become ready after %s seconds\n' "${attempts}" >&2
       exit 1
     fi
     attempt=$((attempt + 1))
     sleep 1
   done
-  printf '%s' "$stats" |
+  printf '%s' "${stats}" |
     python3 -c 'import json,sys; assert isinstance(json.load(sys.stdin), dict)'
   curl -fsS -o /dev/null http://symbol/
 fi

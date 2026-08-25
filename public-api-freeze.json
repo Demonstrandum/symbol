@@ -1,0 +1,232 @@
+{
+  "format": 1,
+  "baseline_contract_sha256": "3e672acb1c1bece10c2daf485e10e2f6f6c349af4f04de53e46a9d6d5364a5cd",
+  "baseline_endpoint_sha256": {
+    "archive get": "6ae0a4026b29693b62df0ab0ff81feb1671d06c1abf4996418295bb26f0745df",
+    "archive pop": "d5873a32e83f622c84641a05fb89f04cee62889d06ec92a824e78636d138fa09",
+    "client": "63c09b272812324fb396f328db313d700b9ada488f6ae12195d52f40d39d1a37",
+    "client hash": "cb7b429a0f8f54d19fa33cf2abea1f99b9db85ebb43b57ae290c81f395500a6a",
+    "docs": "7a20c9efaf18b8a4c77631272c731fd4c294e91831bfeb5adcfd87ebcabb14b7",
+    "docs hash": "fdedf049bc96f915cf600fab4b390fa49948a75b21799507d57cb8307c3fa715",
+    "expiry inventory": "09d7137c404ab24ae5ed2f191add5071faea1809f530ccdec78559b522e662bc",
+    "expiry target": "fc05054b8c406f53fd634bdb7a54e97b7b85b0722530aa0897e7bb3c7bb3763d",
+    "file delete": "96058c7cfc8ab096b10bbb0f90215460d2e1282dabf240dcd7c02525c16070bf",
+    "file expire": "5d40ebd2418ccc618e464dc5004caf1963505158c3819760fc93aae2ecd0a459",
+    "file hash": "9213d900395ec6a3461a8a9df53894af79d9d7fb1c57320fb6ca501cc490e7bf",
+    "file put": "d3ed4c45a1b86a45dc2af3c78801aab091060ee8c2cf9935bc34db1e43812547",
+    "files inventory": "a9f6c602bbbe4e9bf73d648a2adcae25262e4782bca4a3b33ced590aeb175e32",
+    "files subtree": "4d6ec5eb00fa7757cf902d8d5b93d48728c1e96252572d163301a3ff52e4f9f7",
+    "immutable blob": "1b6687ecdd2fb8795943d7870c16e8fd6d535ffde177e2a228adf4bf38e8014d",
+    "installer": "e7869009b01bd59de3db403584847fd4cdf0ae37a364602098165c9d25939060",
+    "installer hash": "2852fead1a63a646fab838c30f81be2fd9cf7f256e0e8b3ed3b3d7276df90c3d",
+    "site copy": "1d31c421c8d9d45366e73bb9032fda6da6295387b634e572cd63e2dd0c25086d",
+    "site expire": "8c94e5726498d769d9503be78497d84e22f32b4b16afceeadf88807cf5ecdefa",
+    "site file": "9a0c881d8a61b906c7d337531837e45aa086937f37d3999a45e7952c338fc38e",
+    "site index": "e81a927421d9059b4491d85a2cd264307b52719f6783435c3953de2346a5ed65",
+    "site listing": "f66ee659e8d83066bca572901b47ea87745a40b63d14c34465e504eba84b91aa",
+    "site management": "99ebcca6eb7f6974669023fa3710c441ac52763184fbd227938fcedb38ab307c",
+    "site move": "55062e05695b05fb91545e977e3a5a7ae70f29a626bbffed85860c7d3380f5f8",
+    "site pop": "a49732d18a7acd1b93f041788d6ae8df3569093a5c36bb1c38b1c19c18e09ac7",
+    "site put": "1ace496731c16c3628e3c7322d9609dd15eec434bddb193915f7a6ec3834b0e3",
+    "site redirect": "7ef7f9b7914c060c5fb6dae97bb6e77c00b7d57f21516c6779b7292d2fe14ee6",
+    "site undo": "db53ef611b86c46c1330ec30263bc91fab1b68aa407db87c6dc8c72c00ca8ec8",
+    "stats": "1b21187d6454f2377f86e17e709f1501f80ce3d9420deab6db3d06c0e2c8eaee",
+    "undo stack": "f848e3038202d726ffc4b63b223450e4d127132f642242c1660da3da2417798e",
+    "unnamed put": "caeb00065a5385f5a788237e9301218f55a2c648a75c4f3ef6e202678791dae9"
+  },
+  "approved_additions": {
+    "endpoint_names": [
+      "alias batch",
+      "alias file",
+      "allocated file",
+      "api client asset",
+      "api client hash",
+      "api documentation",
+      "api version",
+      "file replace",
+      "file splice"
+    ],
+    "endpoint_contracts": [
+      {
+        "name": "alias batch",
+        "method": "ALIAS",
+        "head": false,
+        "path": "/{name}/",
+        "success_statuses": [200, 201],
+        "error_statuses": [400, 401, 403, 404, 409, 412, 413, 500],
+        "request_headers": ["Alias-Target", "Authorization", "Content-Type", "Idempotency-Key", "If-Match"],
+        "response_headers": ["Content-Revision", "Content-Type", "ETag", "Idempotency-Replayed", "Location", "Undo-Expires", "Undo-Token"]
+      },
+      {
+        "name": "alias file",
+        "method": "ALIAS",
+        "head": false,
+        "path": "/{name}/{path...}",
+        "success_statuses": [200, 201],
+        "error_statuses": [400, 401, 403, 404, 409, 412, 413, 500],
+        "request_headers": ["Alias-Target", "Authorization", "Idempotency-Key", "If-Match"],
+        "response_headers": ["Content-Revision", "Content-Type", "ETag", "Idempotency-Replayed", "Location", "Undo-Expires", "Undo-Token"]
+      },
+      {
+        "name": "allocated file",
+        "method": "POST",
+        "head": false,
+        "path": "/{name}/{folder...}/",
+        "success_statuses": [200, 201, 202],
+        "error_statuses": [400, 401, 403, 404, 409, 412, 413, 500],
+        "request_headers": ["Allocation-Action", "Allocation-Token", "Authorization", "Content-Type", "Expiry-At", "Expiry-In", "Expiry-Max-Age", "Expiry-Max-Size", "Expiry-Min-Age", "Expiry-Mode", "Expiry-Power", "File-Extension", "File-Name", "File-Prefix", "File-Suffix", "Idempotency-Key", "If-Match"],
+        "response_headers": ["Content-Location", "Content-Revision", "Content-Type", "ETag", "Idempotency-Replayed", "Location", "Undo-Expires", "Undo-Token"]
+      },
+      {
+        "name": "api client asset",
+        "method": "GET",
+        "head": true,
+        "path": "/{api.ts|api.js|api.global.js|api.d.ts|api.py}",
+        "success_statuses": [200, 304],
+        "error_statuses": [304],
+        "request_headers": ["If-None-Match"],
+        "response_headers": ["Cache-Control", "Content-Type", "ETag"]
+      },
+      {
+        "name": "api client hash",
+        "method": "GET",
+        "head": true,
+        "path": "/{api.ts|api.js|api.global.js|api.d.ts|api.py}/HASH",
+        "success_statuses": [200],
+        "error_statuses": [404],
+        "request_headers": [],
+        "response_headers": ["Content-Type"]
+      },
+      {
+        "name": "api documentation",
+        "method": "GET",
+        "head": true,
+        "path": "/API[/]|/API/{JS|TS|PY|PYTHON|SH|CURL|HTTP|REST|PROTOCOL}",
+        "success_statuses": [200, 304, 307],
+        "error_statuses": [304, 404],
+        "request_headers": ["Accept", "If-None-Match"],
+        "response_headers": ["Cache-Control", "Content-Type", "ETag", "Link", "Location", "Vary"]
+      },
+      {
+        "name": "api version",
+        "method": "GET",
+        "head": true,
+        "path": "/API/VERSION",
+        "success_statuses": [200, 304],
+        "error_statuses": [304],
+        "request_headers": ["If-None-Match"],
+        "response_headers": ["Cache-Control", "Content-Type", "ETag"]
+      },
+      {
+        "name": "file replace",
+        "method": "REPLACE",
+        "head": false,
+        "path": "/{name}/{path...}",
+        "success_statuses": [200],
+        "error_statuses": [400, 401, 403, 404, 409, 412, 413, 500],
+        "request_headers": ["Authorization", "Content-Type", "Idempotency-Key", "If-Content-Match", "If-Match"],
+        "response_headers": ["Content-Revision", "Content-Type", "ETag", "Idempotency-Replayed", "Location", "Undo-Expires", "Undo-Token"]
+      },
+      {
+        "name": "file splice",
+        "method": "PATCH",
+        "head": false,
+        "path": "/{name}/{path...}",
+        "success_statuses": [200],
+        "error_statuses": [400, 401, 403, 404, 409, 412, 413, 416, 500],
+        "request_headers": ["Authorization", "Content-Type", "Idempotency-Key", "If-Content-Match", "If-Match", "Splice"],
+        "response_headers": ["Content-Revision", "Content-Type", "ETag", "Idempotency-Replayed", "Location", "Undo-Expires", "Undo-Token"]
+      }
+    ],
+    "global_response_headers": [
+      "Symbol-API-Revision",
+      "Symbol-API-Source-Hash",
+      "Symbol-API-Version"
+    ],
+    "methods": [
+      "ALIAS",
+      "GET",
+      "PATCH",
+      "POST",
+      "REPLACE"
+    ],
+    "routes": [
+      "/API",
+      "/API/",
+      "/API/CURL",
+      "/API/HTTP",
+      "/API/JS",
+      "/API/PROTOCOL",
+      "/API/PY",
+      "/API/PYTHON",
+      "/API/REST",
+      "/API/SH",
+      "/API/TS",
+      "/API/VERSION",
+      "/api.d.ts",
+      "/api.d.ts/HASH",
+      "/api.global.js",
+      "/api.global.js/HASH",
+      "/api.js",
+      "/api.js/HASH",
+      "/api.py",
+      "/api.py/HASH",
+      "/api.ts",
+      "/api.ts/HASH",
+      "/{name}/",
+      "/{name}/{folder...}/",
+      "/{name}/{path...}"
+    ],
+    "request_headers": [
+      "Alias-Target",
+      "Allocation-Action",
+      "Allocation-Token",
+      "File-Extension",
+      "File-Name",
+      "File-Prefix",
+      "File-Suffix",
+      "If-Content-Match",
+      "Splice"
+    ],
+    "response_headers": [
+      "Content-Location",
+      "Symbol-API-Revision",
+      "Symbol-API-Source-Hash",
+      "Symbol-API-Version"
+    ],
+    "success_statuses": [
+      200,
+      201,
+      202
+    ],
+    "error_statuses": [
+      400,
+      401,
+      403,
+      404,
+      405,
+      409,
+      412,
+      413,
+      416,
+      500
+    ],
+    "shell_commands": [
+      "alias"
+    ],
+    "sdk_assets": [
+      "api.d.ts",
+      "api.global.js",
+      "api.js",
+      "api.py",
+      "api.ts"
+    ],
+    "sdk_entry_points": {
+      "javascript": "SymbolClient",
+      "python": "Symbol"
+    },
+    "allocated_name_formula": "prefix + hash + suffix + (extension == '' ? '' : '.' + extension)",
+    "splice_media_type": "application/vnd.symbol.splice; version=1",
+    "alias_semantics": "live-path"
+  }
+}

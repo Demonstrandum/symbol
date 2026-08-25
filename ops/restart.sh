@@ -1,6 +1,11 @@
 #!/bin/sh
 set -eu
 
+if [ "${SYMBOL_PRODUCTION_PHASE:-}" != 10 ]; then
+  printf 'production access is restricted to Phase 10\n' >&2
+  exit 64
+fi
+
 cd "$(dirname "$0")/.."
 cargo build --release
 
@@ -15,13 +20,13 @@ while sudo journalctl -u symbol --since "${quiet_seconds} seconds ago" --no-page
     END { exit !active }
   '
 do
-  if [ "$waited" -ge "$wait_seconds" ]; then
+  if [ "${waited}" -ge "${wait_seconds}" ]; then
     printf 'refusing to restart: Symbol received mutations in the last %ss\n' \
-      "$quiet_seconds" >&2
+      "${quiet_seconds}" >&2
     exit 1
   fi
   printf 'waiting for %ss without Symbol mutations before restart\n' \
-    "$quiet_seconds" >&2
+    "${quiet_seconds}" >&2
   sleep 5
   waited=$((waited + 5))
 done

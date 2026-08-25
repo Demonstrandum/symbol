@@ -11,6 +11,7 @@ let
       (root + "/static/symbol.sh")
       (root + "/tests/concurrency_soak.sh")
       (root + "/tests/lifecycle_e2e.sh")
+      (root + "/tests/production_guard.sh")
       (root + "/tests/symbol_client.sh")
     ];
   };

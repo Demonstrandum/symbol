@@ -13,6 +13,7 @@ for script in \
   static/symbol.sh \
   tests/concurrency_soak.sh \
   tests/lifecycle_e2e.sh \
+  tests/production_guard.sh \
   tests/symbol_client.sh
 do
   shellcheck -s sh -o require-variable-braces -e SC2015,SC2016 "$script" || failed=1
