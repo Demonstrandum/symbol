@@ -5,7 +5,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-targets --all-features --locked
 cargo build --workspace --locked
-sh -n crates/symbol/static/symbol.sh
+sh -n static/symbol.sh
 sh -n tests/symbol_client.sh
 sh -n tests/lifecycle_e2e.sh
 sh -n tests/production_guard.sh

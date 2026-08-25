@@ -8,7 +8,9 @@ const STYLESHEETS: &[&str] = &["base.css", "browse.css", "docs.css"];
 fn main() {
     assert!(!symbol_contract::ENDPOINTS.is_empty());
     for name in STYLESHEETS {
-        let path = Path::new("static").join(name);
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../static")
+            .join(name);
         println!("cargo::rerun-if-changed={}", path.display());
         let source = fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));

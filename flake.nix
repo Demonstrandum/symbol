@@ -38,7 +38,9 @@
           ./crates
           ./nix
           ./public-api-freeze.json
+          ./schema.sql
           ./ops
+          ./static
           ./tests
         ];
       };

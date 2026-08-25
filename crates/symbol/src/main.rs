@@ -1,6 +1,6 @@
 macro_rules! static_asset {
     ($name:literal) => {
-        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/static/", $name))
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../static/", $name))
     };
 }
 
@@ -8,6 +8,7 @@ mod blob_store;
 mod browse;
 #[cfg(test)]
 mod contract_conformance;
+mod database;
 mod expiry;
 mod http_cache;
 mod name;

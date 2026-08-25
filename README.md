@@ -2,8 +2,7 @@
 
 Tiny static-site and media hosting for a tailnet.
 
-The public user guide is
-[`crates/symbol/static/docs.md`](crates/symbol/static/docs.md) and is served at
+The public user guide is [`static/docs.md`](static/docs.md) and is served at
 `/`. The implementation-grade HTTP contract is [`API.md`](API.md). This
 README is for building and operating the service.
 
@@ -70,8 +69,11 @@ SQLite stores sites, paths, hashes, sizes, and other metadata in
 `SYMBOL_ROOT/blobs/`; transient uploads use `SYMBOL_ROOT/tmp/`.
 
 Startup enables WAL, normal synchronous mode, foreign keys, and a five-second
-SQLite busy timeout. Schema migrations run automatically through schema
-version 6, followed by an integrity check. Startup also:
+SQLite busy timeout. The canonical schema and versioned migrations are typed
+Rust/SeaQuery definitions under `crates/symbol/src/database/`; `schema.sql` is
+their generated inspection snapshot and is never executed as migration input.
+Migrations run automatically through schema version 6, followed by an
+integrity check. Startup also:
 
 - migrates legacy inline SQLite BLOBs to external blob files and verifies
   their size and Blake3 hash;

@@ -3,7 +3,7 @@
 This is the implementation reference for the current public HTTP surface.
 Examples use `SYMBOL_BASE=https://symbol.example`; set it to the configured
 `SYMBOL_PUBLIC_URL`. The human-facing client guide is
-[`crates/symbol/static/docs.md`](crates/symbol/static/docs.md), and deployment details are in
+[`static/docs.md`](static/docs.md), and deployment details are in
 [`README.md`](README.md).
 
 `symbol contract` on the server binary emits the typed route, method, header,

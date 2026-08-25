@@ -14,7 +14,6 @@ use diesel::prelude::*;
 use diesel::sql_types::{BigInt, Text};
 use diesel::sqlite::SqliteConnection;
 use diesel::upsert::excluded;
-use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 pub use symbol_contract::{
@@ -23,6 +22,7 @@ pub use symbol_contract::{
 };
 
 use crate::blob_store::BlobFiles;
+use crate::database;
 use crate::expiry::{
     DecayPolicy, ExpiryError, ExpiryLimit, ExpiryMode, ExpiryPolicy, ExpiryReport,
     ExpirySiteReport, ExpiryTarget, ExpiryTargetKind, InheritedExpiryCap, OwnExpiryReport,
@@ -44,8 +44,6 @@ use crate::upload::{Kind, UploadError, write_payload_file};
 #[cfg(test)]
 use std::io::Cursor;
 
-const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
-const LATEST_SCHEMA_VERSION: i64 = 6;
 const UNDO_RETENTION_MILLIS: i64 = 4 * 60 * 60 * 1000;
 const UNDO_LIMIT_PER_SITE: i64 = 10;
 const IDEMPOTENCY_RETENTION_MILLIS: i64 = 4 * 60 * 60 * 1000;
@@ -192,15 +190,15 @@ struct UndoExpiryPolicyRow {
 }
 
 #[derive(QueryableByName)]
-struct SchemaVersion {
-    #[diesel(sql_type = BigInt)]
-    user_version: i64,
-}
-
-#[derive(QueryableByName)]
 struct IntegrityCheck {
     #[diesel(sql_type = Text)]
     integrity_check: String,
+}
+
+#[derive(QueryableByName)]
+struct ForeignKeyViolationCount {
+    #[diesel(sql_type = BigInt)]
+    violation_count: i64,
 }
 
 struct BlobCache {
@@ -2867,24 +2865,9 @@ struct ExpiryPolicyWrite<'a> {
 }
 
 fn run_migrations(db: &mut SqliteConnection) -> Result<(), StoreError> {
-    let version = diesel::sql_query("PRAGMA user_version")
-        .get_result::<SchemaVersion>(db)?
-        .user_version;
-    let legacy_v2 = version == 2;
-    if legacy_v2 {
-        db.batch_execute(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/migrations/legacy_v2_to_v6.sql"
-        )))?;
-    } else if version != 0 && version != LATEST_SCHEMA_VERSION {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unsupported database schema version {version}"),
-        )
-        .into());
-    }
-    db.run_pending_migrations(MIGRATIONS)?;
-    if legacy_v2 {
+    let outcome = database::migrations::migrate(db)
+        .map_err(|error| StoreError::Migration(Box::new(error)))?;
+    if outcome.upgraded_from_v2 {
         db.transaction::<_, StoreError, _>(|connection| {
             let site_ids = sites::table.select(sites::id).load::<i64>(connection)?;
             for site_id in site_ids {
@@ -2898,6 +2881,17 @@ fn run_migrations(db: &mut SqliteConnection) -> Result<(), StoreError> {
         .integrity_check;
     if integrity != "ok" {
         return Err(io::Error::new(io::ErrorKind::InvalidData, integrity).into());
+    }
+    let foreign_key_violations =
+        diesel::sql_query("SELECT COUNT(*) AS violation_count FROM pragma_foreign_key_check")
+            .get_result::<ForeignKeyViolationCount>(db)?
+            .violation_count;
+    if foreign_key_violations != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{foreign_key_violations} foreign-key violations"),
+        )
+        .into());
     }
     Ok(())
 }
@@ -4442,10 +4436,7 @@ mod tests {
     }
 
     fn schema_version(db: &mut SqliteConnection) -> i64 {
-        diesel::sql_query("PRAGMA user_version")
-            .get_result::<SchemaVersion>(db)
-            .unwrap()
-            .user_version
+        database::migrations::schema_version(db).unwrap()
     }
 
     struct TestClock {
@@ -4503,7 +4494,10 @@ mod tests {
             Err(StoreError::Upload(UploadError::ReservedPath))
         ));
         let mut db = test_connection(&dir.path().join("symbol.db"));
-        assert_eq!(schema_version(&mut db), LATEST_SCHEMA_VERSION);
+        assert_eq!(
+            schema_version(&mut db),
+            database::schema::LATEST_SCHEMA_VERSION
+        );
     }
 
     #[test]
@@ -4511,11 +4505,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("symbol.db");
         let mut db = test_connection(&path);
-        db.batch_execute(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/migrations/00000000000000_schema_v6/up.sql"
-        )))
-        .unwrap();
+        database::migrations::migrate(&mut db).unwrap();
         diesel::insert_into(sites::table)
             .values(NewSite {
                 name: "existing",
@@ -4533,7 +4523,10 @@ mod tests {
             .unwrap();
         run_migrations(&mut db).unwrap();
         run_migrations(&mut db).unwrap();
-        assert_eq!(schema_version(&mut db), LATEST_SCHEMA_VERSION);
+        assert_eq!(
+            schema_version(&mut db),
+            database::schema::LATEST_SCHEMA_VERSION
+        );
         assert_eq!(
             sites::table
                 .filter(sites::name.eq("existing"))
@@ -4545,15 +4538,35 @@ mod tests {
     }
 
     #[test]
+    fn migration_integrity_gate_rejects_foreign_key_violations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("symbol.db");
+        let mut db = test_connection(&path);
+        run_migrations(&mut db).unwrap();
+        db.batch_execute("PRAGMA foreign_keys = OFF").unwrap();
+        diesel::insert_into(files::table)
+            .values(NewFile {
+                site_id: 999,
+                path: "orphan.txt",
+                hash: "missing",
+                size: 1,
+            })
+            .execute(&mut db)
+            .unwrap();
+        db.batch_execute("PRAGMA foreign_keys = ON").unwrap();
+        assert!(matches!(
+            run_migrations(&mut db),
+            Err(StoreError::Io(error))
+                if error.to_string() == "2 foreign-key violations"
+        ));
+    }
+
+    #[test]
     fn production_shaped_v2_database_migrates_through_current_schema() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("symbol.db");
         let mut db = test_connection(&path);
-        db.batch_execute(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/migrations/00000000000000_schema_v6/up.sql"
-        )))
-        .unwrap();
+        database::migrations::migrate(&mut db).unwrap();
         diesel::insert_into(sites::table)
             .values(NewSite {
                 name: "legacy",
@@ -4587,15 +4600,14 @@ mod tests {
             })
             .execute(&mut db)
             .unwrap();
-        db.batch_execute(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/downgrade_v6_to_v2.sql"
-        )))
-        .unwrap();
+        database::migrations::downgrade_to_v2(&mut db).unwrap();
 
         run_migrations(&mut db).unwrap();
 
-        assert_eq!(schema_version(&mut db), LATEST_SCHEMA_VERSION);
+        assert_eq!(
+            schema_version(&mut db),
+            database::schema::LATEST_SCHEMA_VERSION
+        );
         assert_eq!(
             path_aggregates::table
                 .find((site_id, ""))

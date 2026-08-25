@@ -9,8 +9,8 @@ for script in \
   check \
   ops/restart.sh \
   release-check \
-  crates/symbol/static/install.sh \
-  crates/symbol/static/symbol.sh \
+  static/install.sh \
+  static/symbol.sh \
   tests/concurrency_soak.sh \
   tests/lifecycle_e2e.sh \
   tests/production_guard.sh \

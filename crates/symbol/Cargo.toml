@@ -29,8 +29,8 @@ time = { version = "0.3.55", features = ["formatting"] }
 subtle = "2.6.1"
 symbol-contract = { path = "../symbol-contract" }
 diesel = { version = "2.3.12", features = ["sqlite", "returning_clauses_for_sqlite_3_35"] }
-diesel_migrations = "2.3.2"
 libsqlite3-sys = { version = "0.38.2", features = ["bundled"] }
+sea-query = { version = "1.0.2", features = ["backend-sqlite", "derive"], default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
