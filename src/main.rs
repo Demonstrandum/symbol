@@ -7,6 +7,8 @@ macro_rules! static_asset {
 mod blob_store;
 mod browse;
 mod contract;
+#[cfg(test)]
+mod contract_conformance;
 mod expiry;
 mod http_cache;
 mod name;
@@ -1977,7 +1979,7 @@ async fn serve_from(app: &App, name: &str, rel: &str, headers: &HeaderMap) -> Re
         .run_store({
             let name = name.to_string();
             let rel = rel.to_string();
-            move |store| store.lookup(&name, &rel)
+            move |store| lookup_with_html_fallback(&store, &name, &rel)
         })
         .await;
     match node {
@@ -2008,6 +2010,35 @@ async fn serve_from(app: &App, name: &str, rel: &str, headers: &HeaderMap) -> Re
         }
         Err(err) => err.into_response(),
     }
+}
+
+fn lookup_with_html_fallback(
+    store: &Store,
+    name: &str,
+    rel: &str,
+) -> Result<store::Node, StoreError> {
+    match store.lookup(name, rel) {
+        Ok(node) => return Ok(node),
+        Err(StoreError::NotFound)
+            if !rel.is_empty()
+                && !rel.ends_with('/')
+                && !std::path::Path::new(rel)
+                    .extension()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .is_some_and(|extension| {
+                        extension.eq_ignore_ascii_case("html")
+                            || extension.eq_ignore_ascii_case("htm")
+                    }) => {}
+        Err(err) => return Err(err),
+    }
+    for suffix in [".html", ".htm"] {
+        match store.lookup(name, &format!("{rel}{suffix}")) {
+            Ok(node @ store::Node::File { .. }) => return Ok(node),
+            Ok(store::Node::Dir) | Err(StoreError::NotFound) => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Err(StoreError::NotFound)
 }
 
 fn find_index(
@@ -2653,6 +2684,45 @@ mod tests {
         assert_contract_status("site management", management.status());
     }
 
+    #[tokio::test]
+    async fn every_typed_contract_endpoint_observes_a_declared_status() {
+        for endpoint in contract::ENDPOINTS {
+            let root = tempfile::tempdir().unwrap();
+            let store = Store::new(root.path().to_path_buf()).unwrap();
+            let app = router(test_app(store));
+            let path = match endpoint.name {
+                "docs" | "unnamed put" => "/",
+                "docs hash" => "/HASH",
+                "stats" => "/STATS",
+                "installer" => "/install.sh",
+                "installer hash" => "/install.sh/HASH",
+                "client" => "/symbol.sh",
+                "client hash" => "/symbol.sh/HASH",
+                "site listing" => "/FILES",
+                "site redirect" | "site put" | "site pop" | "site copy" | "site move"
+                | "site undo" | "site expire" | "site management" => "/missing",
+                "site index" => "/missing/",
+                "site file" | "file put" | "file delete" | "file expire" => "/missing/file.txt",
+                "archive get" | "archive pop" => "/missing.tar.gz",
+                "files inventory" => "/missing/FILES",
+                "files subtree" => "/missing/FILES/path",
+                "file hash" => "/missing/file.txt/HASH",
+                "undo stack" => "/missing/UNDO",
+                "expiry inventory" => "/missing/EXPIRES",
+                "expiry target" => "/missing/file.txt/EXPIRES",
+                "immutable blob" => "/.blob/missing/deadbeef",
+                _ => endpoint.path,
+            };
+            let request = Request::builder()
+                .method(endpoint.method)
+                .uri(path)
+                .body(Body::empty())
+                .unwrap();
+            let response = app.oneshot(request).await.unwrap();
+            assert_contract_status(endpoint.name, response.status());
+        }
+    }
+
     #[test]
     fn emitted_application_logs_never_contain_request_or_response_secrets() {
         let captured = Arc::new(Mutex::new(Vec::new()));
@@ -2926,6 +2996,52 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn extensionless_get_falls_back_to_html_then_htm_without_shadowing_exact_files() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::new(root.path().to_path_buf()).unwrap();
+        store
+            .put_file("hello", "about.html", b"html fallback")
+            .unwrap();
+        store
+            .put_file("hello", "legacy.htm", b"htm fallback")
+            .unwrap();
+        store
+            .put_file("hello", "contact.html", b"html fallback")
+            .unwrap();
+        store.put_file("hello", "about", b"exact file").unwrap();
+        let app = router(test_app(store));
+
+        for (path, expected) in [
+            ("/hello/about", "exact file"),
+            ("/hello/contact", "html fallback"),
+            ("/hello/legacy", "htm fallback"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert_eq!(
+                to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+                expected,
+                "{path}"
+            );
+        }
+
+        let missing = app
+            .oneshot(
+                Request::builder()
+                    .uri("/hello/missing")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -3546,6 +3662,67 @@ mod tests {
             store.lookup("hello", "index.html"),
             Ok(store::Node::File { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn handler_file_delete_followed_by_guarded_undo_restores_the_file() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::new(root.path().to_path_buf()).unwrap();
+        store
+            .put_file("hello", "remove.txt", b"restore me")
+            .unwrap();
+        let app = router(test_app(store));
+        let deleted = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/hello/remove.txt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_contract_status("file delete", deleted.status());
+        let token = deleted.headers()["undo-token"].clone();
+        let missing = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/hello/remove.txt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        let restored = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::from_bytes(b"UNDO").unwrap())
+                    .uri("/hello")
+                    .header("undo-token", token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_contract_status("site undo", restored.status());
+        let content = app
+            .oneshot(
+                Request::builder()
+                    .uri("/hello/remove.txt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(content.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(content.into_body(), usize::MAX).await.unwrap(),
+            "restore me"
+        );
     }
 
     #[tokio::test]

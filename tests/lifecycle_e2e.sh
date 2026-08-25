@@ -200,24 +200,9 @@ ok "named puts merge and generate manifest"
 
 printf '<h1>api example</h1>\n' >"${ROOT}/work/api.html"
 "${CLIENT}" put hello "${ROOT}/work/api.html" >/dev/null
-api_curl=$(python3 -c '
-import pathlib,re,sys
-text=pathlib.Path(sys.argv[1]).read_text()
-blocks=re.findall(r"```sh\s*\n(.*?)\n```", text, re.S)
-commands=[]
-for block in blocks:
-    logical=block.replace(chr(92) + "\n", " ")
-    commands.extend(line.strip() for line in logical.splitlines() if line.strip().startswith("curl "))
-print(commands[0])
-' "${PWD}/API.md")
-mkdir "${ROOT}/work/api-curl"
-(cd "${ROOT}/work/api-curl" && SYMBOL_BASE="${BASE}" sh -c "${api_curl}")
-tar -tzf "${ROOT}/work/api-curl/hello.tar.gz" |
-  awk '$0 == "symbol.toml" { found=1 } END { exit !found }' ||
-  fail "documented API curl example returns archive"
-code=$(curl -sS -o /dev/null -w '%{http_code}' "${BASE}/hello/")
-[ "${code}" = 404 ] || fail "documented API curl example performs deletion"
-ok "documented API curl example executes unchanged"
+python3 tests/api_examples.py "${BASE}" ||
+  fail "documented raw HTTP and curl examples execute"
+ok "documented raw HTTP and curl examples execute"
 
 "${CLIENT}" get e2e-main "${ROOT}/work/main.zip" >/dev/null
 unzip -t "${ROOT}/work/main.zip" >/dev/null
@@ -340,16 +325,60 @@ ok "undo stack, mutation restore, and file-delete restore work"
 
 "${CLIENT}" expire e2e-main >/dev/null
 expiry=$("${CLIENT}" expire e2e-main --show)
-contains "${expiry}" 'expiry policies for e2e-main' &&
-  contains "${expiry}" 'e2e-main/' &&
-  contains "${expiry}" 'decay' ||
-  fail "site-wide expiry inventory renders all policies"
+normalized=$(printf '%s\n' "$expiry" |
+  sed -e 's/20[0-9][0-9]-[0-9T:.-]*Z/<TIME>/g' \
+    -e 's/(in [^)]*)/(in <DURATION>)/g')
+expected=$(cat <<'EOF'
+expiry policies for e2e-main
+TARGET                       MODE      EXPIRES                LIMITED BY
+e2e-main/                    decay     <TIME> (in <DURATION>) -
+EOF
+)
+[ "$normalized" = "$expected" ] ||
+  fail "site-wide expiry inventory differs from golden output"
 "${CLIENT}" expire e2e-main index.html >/dev/null
 expiry=$("${CLIENT}" expire e2e-main index.html --show)
-contains "${expiry}" 'effective lifetime: e2e-main/index.html' &&
-  contains "${expiry}" 'retention by size' ||
-  fail "target expiry report renders curve and timeline"
-"${CLIENT}" expire e2e-main --never >/dev/null
+normalized=$(printf '%s\n' "$expiry" |
+  sed -e 's/20[0-9][0-9]-[0-9T:.-]*Z/<TIME>/g' \
+    -e 's/(in [^)]*)/(in <DURATION>)/g' \
+    -e 's/^policy retention:.*/policy retention:  <DURATION>/' \
+    -e 's/^          .* elapsed; .* remaining$/          <DURATION> elapsed; <DURATION> remaining/')
+expected=$(cat <<'EOF'
+effective lifetime: e2e-main/index.html
+size:              14 B
+policy:            decay (30d..365d @ 512 MiB ^3.0)
+policy retention:  <DURATION>
+refreshed:         <TIME>
+own expiry:        <TIME>
+effective expiry:  <TIME> (in <DURATION>)
+inherited cap:      site (site) at <TIME>
+limited by:         site (site)
+
+retention by size
+    365d |\
+         | *....................................  you are here: 14 B
+     30d |.....................................
+      +-------------------------------------
+       0                           512 MiB
+
+effective lifetime
+refreshed |*------------------------------------| expires
+          <DURATION> elapsed; <DURATION> remaining
+EOF
+)
+[ "$normalized" = "$expected" ] ||
+  fail "target expiry report differs from golden output"
+never=$("${CLIENT}" expire e2e-main --never)
+normalized=$(printf '%s\n' "$never" |
+  sed -e 's/^undo within 4h: symbol undo e2e-main .*/undo within 4h: symbol undo e2e-main <TOKEN>/' \
+    -e 's|^expiration disabled for .*/e2e-main$|expiration disabled for <BASE>/e2e-main|')
+expected=$(cat <<'EOF'
+undo within 4h: symbol undo e2e-main <TOKEN>
+expiration disabled for <BASE>/e2e-main
+EOF
+)
+[ "$normalized" = "$expected" ] ||
+  fail "--never differs from golden output"
 ok "site and target expiry reports work"
 
 printf '<h1>claim later</h1>\n' >"${ROOT}/work/claim.html"
@@ -402,6 +431,7 @@ printf '<h1>secure</h1>\n' >"${ROOT}/work/managed/index.html"
 [ -s "${ROOT}/work/managed/.symbol-token" ] ||
   fail "managed creation saves token sidecar"
 token=$(awk '{print; exit}' "${ROOT}/work/managed/.symbol-token")
+claim=$(awk '{print; exit}' "${ROOT}/work/managed/.symbol-claim")
 
 unauthorized=$(printf nope |
   SYMBOL_TOKEN='' "${CLIENT}" put e2e-secure blocked.txt 2>&1 || true)
@@ -415,6 +445,14 @@ contains "${stored}" 'sym_mgmt_' &&
   ! contains "${stored}" "${token#sym_mgmt_}" ||
   fail "managed upload sanitizes token payload"
 ok "management authorization and sanitization work"
+
+if grep -F "$token" "${ROOT}/server.log" >/dev/null ||
+  grep -F "$claim" "${ROOT}/server.log" >/dev/null ||
+  grep -F 'sym_mgmt_' "${ROOT}/server.log" >/dev/null ||
+  grep -F 'sym_claim_' "${ROOT}/server.log" >/dev/null; then
+  fail "application tracing leaked request or one-time response secrets"
+fi
+ok "real request and response tracing excludes all management secrets"
 
 "${CLIENT}" expire e2e-secure --show >/dev/null
 (cd "${ROOT}/work/managed" && "${CLIENT}" manage e2e-secure --rotate >/dev/null)

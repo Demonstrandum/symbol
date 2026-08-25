@@ -66,9 +66,11 @@ Cache-Control: no-store
 A caller may instead send `Creator-Claim: sym_claim_...`. To create a managed
 site in the same request, send `Management-Action: claim`; a new management
 token is returned in `Management-Token`. Creator identity may come from one
-configured trusted-proxy account header, mTLS certificate-fingerprint header,
-Tailscale user header, or direct `tailscale whois --json` resolver configured
-with `SYMBOL_TAILSCALE_WHOIS_COMMAND`. Identity headers are accepted only from
+configured trusted-proxy account header, a certificate fingerprint supplied by
+a trusted TLS terminator after it validates mTLS, a Tailscale user header, or
+the direct `tailscale whois --json` resolver configured with
+`SYMBOL_TAILSCALE_WHOIS_COMMAND`. Symbol does not terminate TLS or inspect
+client certificates itself. Identity headers are accepted only from
 peer IPs in `SYMBOL_TRUSTED_PROXY`; caller-supplied internal principal headers
 are always stripped. Management audit rows retain that socket peer IP as
 non-authoritative context. Peers listed separately in
@@ -357,7 +359,12 @@ its own policy.
 <!-- contract:expiry target -->
 ### `GET /{name}/{path...}`
 
-Serves a file or directory as above, except these control suffixes:
+Serves a file or directory as above. If the exact path is missing, a
+non-directory request transparently tries `{path}.html` and then `{path}.htm`;
+an exact extensionless file or directory always wins. Explicit missing
+`.html`/`.htm` paths remain `404`.
+
+These control suffixes are reserved:
 
 - `/{name}/{path...}/HASH` returns the raw stored file hash with `200`, or `404`
   for a directory/missing path.

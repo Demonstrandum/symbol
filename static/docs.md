@@ -61,6 +61,13 @@ baseline. sync sends that tree hash as `If-Match`; upstream drift returns
 copy and move return `409` when their destination exists; use the printed
 `symbol undo` command to reverse a retained mutation.
 
+creator identity may come from a trusted proxy account, an mTLS fingerprint
+supplied by a trusted TLS terminator, a Tailscale user, or a mode-0600 creator
+claim; Symbol does not terminate TLS itself. PUT adds or updates paths;
+`rm NAME PATH` removes a path, `pop` removes a whole site after downloading it,
+copy creates a new site, and move changes its name. each mutation prints its
+inverse `symbol undo` command while retained.
+
 ## curl
 
 no name provided gets you a 4-character id, e.g. [{host}/k7qm/]({host}/k7qm/)
@@ -75,6 +82,8 @@ add a file to that site: PUT
 ```
 curl -T style.css {host}/hello/style.css
 curl -T style.css {host}/hello/  # same; curl appends the local filename
+curl -T style.css {host}/hello/style.css \
+  -H 'If-Match: "blake3:CURRENT_TREE_HASH"' # 412 if upstream changed
 ```
 
 large stored files are uploaded and served as streams. byte ranges, seeking,

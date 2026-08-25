@@ -57,6 +57,7 @@ pub const METHOD_MANAGE: &str = "MANAGE";
 const READ_ERRORS: &[u16] = &[304, 400, 404, 416];
 const MUTATION_ERRORS: &[u16] = &[400, 401, 403, 404, 409, 412, 413, 500];
 const MUTATION_HEADERS: &[&str] = &[
+    "Content-Type",
     "Location",
     "ETag",
     "Content-Revision",
@@ -221,6 +222,7 @@ pub static ENDPOINTS: &[EndpointContract] = &[
         &["Authorization"],
         &[
             "Content-Type",
+            "Content-Length",
             "Content-Disposition",
             "Undo-Token",
             "Undo-Expires"

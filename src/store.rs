@@ -45,6 +45,7 @@ const LATEST_SCHEMA_VERSION: i64 = 6;
 const UNDO_RETENTION_MILLIS: i64 = 4 * 60 * 60 * 1000;
 const UNDO_LIMIT_PER_SITE: i64 = 10;
 const IDEMPOTENCY_RETENTION_MILLIS: i64 = 4 * 60 * 60 * 1000;
+const SQLITE_DELETE_BATCH_SIZE: usize = 500;
 const MANIFEST_PATH: &str = "symbol.toml";
 const RESERVED_TERMINALS: [&str; 7] = [
     "FILES",
@@ -2489,11 +2490,12 @@ impl Store {
                 .filter(undo_names::token.eq(&latest))
                 .select(undo_names::name)
                 .load::<String>(&mut *tx)?;
-            diesel::delete(
-                management_tombstones::table
-                    .filter(management_tombstones::name.eq_any(tombstone_names)),
-            )
-            .execute(&mut *tx)?;
+            for names in tombstone_names.chunks(SQLITE_DELETE_BATCH_SIZE) {
+                diesel::delete(
+                    management_tombstones::table.filter(management_tombstones::name.eq_any(names)),
+                )
+                .execute(&mut *tx)?;
+            }
         }
         diesel::update(undo_operations::table.find(&latest))
             .set(undo_operations::consumed.eq(1_i64))
@@ -3996,8 +3998,10 @@ fn prune_undo_locked(tx: &mut SqliteConnection, now: i64) -> Result<(), diesel::
     }
     stale.sort_unstable();
     stale.dedup();
-    diesel::delete(undo_operations::table.filter(undo_operations::token.eq_any(stale)))
-        .execute(tx)?;
+    for tokens in stale.chunks(SQLITE_DELETE_BATCH_SIZE) {
+        diesel::delete(undo_operations::table.filter(undo_operations::token.eq_any(tokens)))
+            .execute(tx)?;
+    }
     Ok(())
 }
 
@@ -4476,7 +4480,9 @@ fn gc_blobs(tx: &mut SqliteConnection, now: i64) -> Result<Vec<String>, diesel::
         .into_iter()
         .filter(|hash| !live.contains(hash))
         .collect::<Vec<_>>();
-    diesel::delete(blobs::table.filter(blobs::hash.eq_any(&hashes))).execute(tx)?;
+    for chunk in hashes.chunks(SQLITE_DELETE_BATCH_SIZE) {
+        diesel::delete(blobs::table.filter(blobs::hash.eq_any(chunk))).execute(tx)?;
+    }
     Ok(hashes)
 }
 
@@ -4762,6 +4768,80 @@ mod tests {
         clock.advance(u64::try_from(UNDO_RETENTION_MILLIS).unwrap() + 1);
         store.prune_undo_and_gc().unwrap();
         assert!(store.undo_stack("hello").unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn garbage_collection_handles_more_dead_blobs_than_sqlite_variable_limit() {
+        const DEAD_BLOBS: usize = 40_000;
+
+        let dir = tempfile::tempdir().unwrap();
+        let _store = Store::new(dir.path().to_path_buf()).unwrap();
+        let mut db = test_connection(&dir.path().join("symbol.db"));
+        let mut tx = DbTransaction::begin(&mut db).unwrap();
+        for index in 0..DEAD_BLOBS {
+            let hash = format!("{index:064x}");
+            diesel::insert_into(blobs::table)
+                .values((
+                    blobs::hash.eq(hash),
+                    blobs::bytes.eq(Vec::<u8>::new()),
+                    blobs::size.eq(1_i64),
+                ))
+                .execute(&mut *tx)
+                .unwrap();
+        }
+
+        let removed = gc_blobs(&mut tx, 0).unwrap();
+        assert_eq!(removed.len(), DEAD_BLOBS);
+        assert_eq!(blobs::table.count().get_result::<i64>(&mut *tx).unwrap(), 0);
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn pagefind_scale_chunked_sync_remains_writable_after_undo_rotation() {
+        const FILES: usize = 42_802;
+        const CHUNK_FILES: usize = 4_000;
+        const FINAL_DELTA: usize = 1_900;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+        for start in (0..FILES).step_by(CHUNK_FILES) {
+            let end = (start + CHUNK_FILES).min(FILES);
+            let staged = (start..end)
+                .map(|index| {
+                    stage_bytes(
+                        &format!("pagefind/fragment/{index:05}.pf_fragment"),
+                        format!("fragment {index}").as_bytes(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            store
+                .merge_staged("large-sync", &staged, UndoKind::Put)
+                .unwrap();
+        }
+        assert_eq!(
+            store.site_inventory("large-sync").unwrap().files.len(),
+            FILES
+        );
+
+        let final_delta = (FILES - FINAL_DELTA..FILES)
+            .map(|index| {
+                stage_bytes(
+                    &format!("pagefind/fragment/{index:05}.pf_fragment"),
+                    format!("updated fragment {index}").as_bytes(),
+                )
+            })
+            .collect::<Vec<_>>();
+        store
+            .merge_staged("large-sync", &final_delta, UndoKind::Put)
+            .unwrap();
+        store
+            .put_file("large-sync", "pagefind/index.js", b"search index")
+            .unwrap();
+        assert_eq!(store.undo_stack("large-sync").unwrap().entries.len(), 10);
+        assert!(matches!(
+            store.lookup("large-sync", "pagefind/index.js"),
+            Ok(Node::File { .. })
+        ));
     }
 
     #[test]

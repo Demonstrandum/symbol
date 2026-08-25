@@ -372,8 +372,9 @@ contains "${out}" \
 
 : > "${LOG}"
 out=$("${CLIENT}" undo --stack hello)
-contains "${out}" 'TOKEN      WOULD UNDO' &&
-  contains "${out}" '2027-01-01 00:00Z (in 1m 40s)' &&
+expected=$(printf 'TOKEN      WOULD UNDO                         EXPIRES\n%-10s %-34s %s (in %s)' \
+  tok1 'restore file' '2027-01-01 00:00Z' '1m 40s')
+[ "${out}" = "${expected}" ] &&
   ok 'undo stack uses canonical compact UTC and duration output' ||
   not_ok 'undo stack uses canonical compact UTC and duration output'
 
