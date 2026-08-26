@@ -77,18 +77,34 @@ set -e
   }
 
 DEPLOY_MARKER="${TMP}/deploy-reached"
+BACKUP_MARKER="${TMP}/backup-reached"
+RESTORE_MARKER="${TMP}/restore-reached"
 JOURNAL_ALL="${TMP}/journal-all"
 JOURNAL_RECENT="${TMP}/journal-recent"
 SLEEP_MARKER="${TMP}/sleep-reached"
 PAUSE_MARKER="${TMP}/pause-reached"
 RESUME_MARKER="${TMP}/resume-reached"
+RUNNING_EXE="${TMP}/running-symbol"
+DEPLOY_BINARY="${TMP}/deployed-symbol"
+DATA_ROOT="${TMP}/data"
+BACKUP_ROOT="${TMP}/backups"
 export \
+  BACKUP_MARKER \
+  BACKUP_ROOT \
+  DATA_ROOT \
+  DEPLOY_BINARY \
   DEPLOY_MARKER \
   JOURNAL_ALL \
   JOURNAL_RECENT \
   SLEEP_MARKER \
   PAUSE_MARKER \
+  RESTORE_MARKER \
   RESUME_MARKER
+mkdir -p "${DATA_ROOT}/blobs"
+printf 'old binary\n' >"${RUNNING_EXE}"
+printf 'new binary\n' >"${DEPLOY_BINARY}"
+printf 'database\n' >"${DATA_ROOT}/symbol.db"
+printf 'blob\n' >"${DATA_ROOT}/blobs/aa"
 
 cat >"${TMP}/cargo" <<'EOF'
 #!/bin/sh
@@ -102,7 +118,10 @@ cat >"${TMP}/systemctl" <<'EOF'
 #!/bin/sh
 case "$1" in
   show)
-    printf '0123456789abcdef0123456789abcdef\n'
+    case "$*" in
+      *MainPID*) printf '12345\n' ;;
+      *) printf '0123456789abcdef0123456789abcdef\n' ;;
+    esac
     ;;
   daemon-reload)
     ;;
@@ -128,6 +147,9 @@ case "$1" in
     ;;
   restart)
     : >"${DEPLOY_MARKER}"
+    [ "${RESTART_FAILURE:-0}" != 1 ] || exit 1
+    ;;
+  stop | start)
     ;;
   is-active)
     exit 0
@@ -140,7 +162,19 @@ esac
 EOF
 cat >"${TMP}/install" <<'EOF'
 #!/bin/sh
+[ -e "${BACKUP_MARKER}" ] || {
+  printf 'deployment reached before backup\n' >&2
+  exit 92
+}
 : >"${DEPLOY_MARKER}"
+EOF
+cat >"${TMP}/cp" <<'EOF'
+#!/bin/sh
+/bin/cp "$@"
+case "$*" in
+  *"${DEPLOY_BINARY}") : >"${RESTORE_MARKER}" ;;
+  *) : >"${BACKUP_MARKER}" ;;
+esac
 EOF
 cat >"${TMP}/journalctl" <<'EOF'
 #!/bin/sh
@@ -175,24 +209,32 @@ chmod +x \
   "${TMP}/sudo" \
   "${TMP}/systemctl" \
   "${TMP}/install" \
+  "${TMP}/cp" \
   "${TMP}/journalctl" \
   "${TMP}/sleep"
 
 run_restart_guard() {
   rm -f \
+    "${BACKUP_MARKER}" \
     "${DEPLOY_MARKER}" \
     "${SLEEP_MARKER}" \
     "${SLEEP_MARKER}.finished" \
     "${PAUSE_MARKER}" \
+    "${RESTORE_MARKER}" \
     "${RESUME_MARKER}"
   set +e
   GUARD_OUTPUT=$(
     PATH="${TMP}:${PATH}" \
+      SYMBOL_BACKUP_ROOT="${BACKUP_ROOT}" \
+      SYMBOL_DATA_ROOT="${DATA_ROOT}" \
+      SYMBOL_DEPLOY_BINARY="${DEPLOY_BINARY}" \
       SYMBOL_PRODUCTION_PHASE=10 \
       SYMBOL_RESTART_QUIET_SECONDS=30 \
       SYMBOL_RESTART_WAIT_SECONDS="${1}" \
+      SYMBOL_RUNNING_EXE="${RUNNING_EXE}" \
       JOURNAL_FAILURE="${JOURNAL_FAILURE:-0}" \
       PAUSE_ACTION="${PAUSE_ACTION:-}" \
+      RESTART_FAILURE="${RESTART_FAILURE:-0}" \
       SLEEP_ACTION="${SLEEP_ACTION:-}" \
       sh "${ROOT}/ops/restart.sh" 2>&1
   )
@@ -225,9 +267,26 @@ write_journal_all \
 run_restart_guard 0
 [ "${GUARD_STATUS}" -eq 0 ] &&
   [ -e "${PAUSE_MARKER}" ] &&
+  [ -e "${BACKUP_MARKER}" ] &&
   [ -e "${DEPLOY_MARKER}" ] ||
   {
     printf 'quiet journal did not permit restart:\n%s\n' "${GUARD_OUTPUT}" >&2
+    exit 1
+  }
+
+write_journal_all \
+  'symbol_mutation_start mutation_id=8 method=PUT' \
+  'symbol_mutation_finish mutation_id=8 method=PUT status=200'
+: >"${JOURNAL_RECENT}"
+RESTART_FAILURE=1
+export RESTART_FAILURE
+run_restart_guard 0
+unset RESTART_FAILURE
+[ "${GUARD_STATUS}" -eq 1 ] &&
+  [ -e "${BACKUP_MARKER}" ] &&
+  [ -e "${RESTORE_MARKER}" ] ||
+  {
+    printf 'failed restart did not restore its backup:\n%s\n' "${GUARD_OUTPUT}" >&2
     exit 1
   }
 

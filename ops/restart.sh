@@ -15,18 +15,28 @@ waited=0
 invocation_id=$(
   sudo systemctl show --property=InvocationID --value symbol
 )
+main_pid=$(
+  sudo systemctl show --property=MainPID --value symbol
+)
 case "${invocation_id}" in
   '' | *[!0123456789abcdefABCDEF]*)
     printf 'cannot inspect Symbol mutations: invalid service invocation ID\n' >&2
     exit 1
     ;;
 esac
+case "${main_pid}" in
+  '' | 0 | *[!0123456789]*)
+    printf 'cannot back up Symbol: invalid service main PID\n' >&2
+    exit 1
+    ;;
+esac
 
 journal_all=$(mktemp)
 journal_recent=$(mktemp)
+backup_inventory=$(mktemp)
 paused=0
 cleanup() {
-  rm -f "${journal_all}" "${journal_recent}"
+  rm -f "${journal_all}" "${journal_recent}" "${backup_inventory}"
   if [ "${paused}" -eq 1 ]; then
     sudo systemctl kill --kill-who=main --signal=SIGCONT symbol \
       >/dev/null 2>&1 || :
@@ -172,9 +182,54 @@ do
   waited=$((waited + 5))
 done
 
+data_root=${SYMBOL_DATA_ROOT:-/var/lib/symbol}
+backup_root=${SYMBOL_BACKUP_ROOT:-${data_root}/backups}
+running_exe=${SYMBOL_RUNNING_EXE:-/proc/${main_pid}/exe}
+deploy_binary=${SYMBOL_DEPLOY_BINARY:-target/release/symbol}
+backup_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+backup_dir=${backup_root}/${backup_id}
+sudo mkdir -m 0700 -p "${backup_dir}"
+sudo cp --reflink=auto --preserve=mode,timestamps \
+  "${running_exe}" "${backup_dir}/symbol"
+for database_file in \
+  "${data_root}/symbol.db" \
+  "${data_root}/symbol.db-wal" \
+  "${data_root}/symbol.db-shm"
+do
+  [ ! -e "${database_file}" ] ||
+    sudo cp --reflink=auto --preserve=mode,timestamps \
+      "${database_file}" "${backup_dir}/"
+done
+if [ -d "${data_root}/blobs" ]; then
+  find "${data_root}/blobs" -type f -printf '%P\t%s\n' |
+    LC_ALL=C sort >"${backup_inventory}"
+fi
+sudo cp "${backup_inventory}" "${backup_dir}/blob-files.tsv"
+printf 'symbol backup: %s\n' "${backup_dir}"
+
 sudo install -m 0644 ops/symbol.service /etc/systemd/system/symbol.service
 sudo systemctl daemon-reload
-sudo systemctl restart symbol
-paused=0
-sudo systemctl is-active --quiet symbol
+if sudo systemctl restart symbol &&
+  sudo systemctl is-active --quiet symbol; then
+  paused=0
+else
+  printf 'new Symbol failed to start; restoring backup\n' >&2
+  sudo systemctl stop symbol >/dev/null 2>&1 || :
+  sudo cp "${backup_dir}/symbol" "${deploy_binary}"
+  sudo rm -f \
+    "${data_root}/symbol.db" \
+    "${data_root}/symbol.db-wal" \
+    "${data_root}/symbol.db-shm"
+  for database_file in \
+    "${backup_dir}/symbol.db" \
+    "${backup_dir}/symbol.db-wal" \
+    "${backup_dir}/symbol.db-shm"
+  do
+    [ ! -e "${database_file}" ] ||
+      sudo cp "${database_file}" "${data_root}/"
+  done
+  sudo systemctl start symbol
+  paused=0
+  exit 1
+fi
 echo "symbol rebuilt and restarted"
