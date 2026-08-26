@@ -4,9 +4,11 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time, UtcOffset};
 
-pub const DEFAULT_MIN_AGE_SECONDS: u64 = 30 * 24 * 60 * 60;
-pub const DEFAULT_MAX_AGE_SECONDS: u64 = 365 * 24 * 60 * 60;
-pub const DEFAULT_MAX_SIZE_BYTES: u64 = 512 * 1024 * 1024;
+use crate::units::{MIB, SECONDS_PER_MONTH, SECONDS_PER_YEAR};
+
+pub const DEFAULT_MIN_AGE_SECONDS: u64 = SECONDS_PER_MONTH;
+pub const DEFAULT_MAX_AGE_SECONDS: u64 = 3 * SECONDS_PER_YEAR / 2;
+pub const DEFAULT_MAX_SIZE_BYTES: u64 = 512 * MIB;
 pub const DEFAULT_POWER: f64 = 3.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

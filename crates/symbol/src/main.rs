@@ -20,6 +20,7 @@ mod schema;
 mod secrets;
 mod splice;
 mod store;
+mod units;
 mod upload;
 
 use std::collections::HashMap;
