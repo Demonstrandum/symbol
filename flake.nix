@@ -6,9 +6,31 @@
     url = "github:oxalica/rust-overlay";
     inputs.nixpkgs.follows = "nixpkgs";
   };
+  inputs.pyproject-nix = {
+    url = "github:pyproject-nix/pyproject.nix";
+    inputs.nixpkgs.follows = "nixpkgs";
+  };
+  inputs.pyproject-build-systems = {
+    url = "github:pyproject-nix/build-system-pkgs";
+    inputs.nixpkgs.follows = "nixpkgs";
+    inputs.pyproject-nix.follows = "pyproject-nix";
+    inputs.uv2nix.follows = "uv2nix";
+  };
+  inputs.uv2nix = {
+    url = "github:pyproject-nix/uv2nix";
+    inputs.nixpkgs.follows = "nixpkgs";
+    inputs.pyproject-nix.follows = "pyproject-nix";
+  };
 
   outputs =
-    { self, nixpkgs, rust-overlay }:
+    {
+      self,
+      nixpkgs,
+      rust-overlay,
+      pyproject-nix,
+      pyproject-build-systems,
+      uv2nix,
+    }:
     let
       inherit (nixpkgs) lib;
       systems = [
@@ -66,6 +88,7 @@
           ./ops
           ./static
           ./tests
+          ./tooling
         ];
       };
     in
@@ -120,6 +143,22 @@
             cargo = rust;
             rustc = rust;
           };
+          pythonWorkspace = uv2nix.lib.workspace.loadWorkspace {
+            workspaceRoot = src + "/tooling";
+          };
+          pythonOverlay = pythonWorkspace.mkPyprojectOverlay {
+            sourcePreference = "wheel";
+          };
+          pythonBase = pkgs.callPackage pyproject-nix.build.packages {
+            python = pkgs.python314;
+          };
+          pythonSet = pythonBase.overrideScope (
+            lib.composeManyExtensions [
+              pyproject-build-systems.overlays.wheel
+              pythonOverlay
+            ]
+          );
+          pythonSdk = pythonSet.mkVirtualEnv "symbol-api-checks-env" pythonWorkspace.deps.all;
           generatedSources = rustPlatform.buildRustPackage {
             pname = "symbol-generated-sources";
             version = "0.1.0";
@@ -214,9 +253,11 @@
             node tests/sdk/js/real.mjs
           '';
           sdkTs = sdkCheck "symbol-sdk-ts" [
+            pkgs.biome
             pkgs.nodejs
             pkgs.typescript
           ] ''
+            biome check --config-path=tooling/biome.json static/api.ts tests/sdk/ts/*.ts
             export TSC="${pkgs.typescript}/bin/tsc"
             export SYMBOL_BIN="${package}/bin/symbol"
             node tests/sdk/ts/run.mjs
@@ -230,6 +271,15 @@
             ''}
             node tests/sdk/js/browser-smoke.mjs
           '';
+          sdkPy = sdkCheck "symbol-sdk-py" [ pythonSdk ] ''
+            export SYMBOL_BIN="${package}/bin/symbol"
+            basedpyright --project tooling/pyproject.toml "${generatedSources}/api.py"
+            ruff check --no-cache --config tooling/pyproject.toml static/api.py tests/sdk/py
+            ruff format --check --no-cache --config tooling/pyproject.toml static/api.py tests/sdk/py
+            python3 tests/sdk/py/runtime.py
+            python3 tests/sdk/py/optional.py
+            python3 tests/sdk/py/real.py
+          '';
           named = posix // {
             inherit package;
             generated-sources = generatedSources;
@@ -240,6 +290,7 @@
             sdk-js-real = sdkJsReal;
             sdk-ts = sdkTs;
             sdk-browser = sdkBrowser;
+            sdk-py = sdkPy;
           };
         in
         named
@@ -264,8 +315,11 @@
                 "rustfmt"
               ];
             })
+            pkgs.biome
             pkgs.nodejs
+            pkgs.python314
             pkgs.typescript
+            pkgs.uv
           ] ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.chromium ];
         };
       });

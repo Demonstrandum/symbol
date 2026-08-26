@@ -71,14 +71,14 @@ fn generated_metadata_and_artifact_headers_are_identical() {
         assert_eq!(header_identity(source), expected_identity, "{artifact}");
     }
 
-    assert!(artifacts.api_ts.contains("artifact: \"api.ts\""));
-    assert!(artifacts.api_js.contains("artifact: \"api.js\""));
+    assert!(artifacts.api_ts.contains("\\\"artifact\\\":\\\"api.ts\\\""));
+    assert!(artifacts.api_js.contains("\\\"artifact\\\":\\\"api.js\\\""));
     assert!(
         artifacts
             .api_global_js
-            .contains("artifact: \"api.global.js\"")
+            .contains("\\\"artifact\\\":\\\"api.global.js\\\"")
     );
-    assert!(artifacts.api_py.contains("artifact=\"api.py\""));
+    assert!(artifacts.api_py.contains("\"artifact\":\"api.py\""));
 }
 
 #[test]
@@ -380,8 +380,8 @@ fn unsafe_commits_cannot_reach_javascript_or_python_artifacts() {
         provenance: BuildProvenance::from_injected("unknown".to_string(), false).unwrap(),
     };
     let artifacts = generate_artifacts(&root, &metadata).unwrap();
-    assert!(artifacts.api_js.contains("commit: \"unknown\""));
-    assert!(artifacts.api_py.contains("commit=\"unknown\""));
+    assert!(artifacts.api_js.contains("\\\"commit\\\":\\\"unknown\\\""));
+    assert!(artifacts.api_py.contains("\"commit\":\"unknown\""));
 }
 
 #[test]

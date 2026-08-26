@@ -3,6 +3,8 @@
 /result
 /result-*
 /.direnv
+/.venv
+/tooling/.venv
 /.api-version.lock
 
 *.swp

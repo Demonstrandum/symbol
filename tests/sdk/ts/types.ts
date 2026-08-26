@@ -1,31 +1,30 @@
 import {
-    AliasReceipt,
-    AllocationReceipt,
-    ArchiveDownload,
-    BodyNotReplayableError,
-    CachedFileInventory,
-    ContentFormats,
-    ExpiryReport,
-    FileInventory,
-    FileReplaceReceipt,
-    ManagementClaimReceipt,
-    MediaType,
-    Operation,
-    RetryPolicies,
-    SiteCreationReceipt,
-    SpliceReceipt,
-    SymbolClient,
-    SymbolStats,
+  type AliasReceipt,
+  type AllocationReceipt,
+  type ArchiveDownload,
+  BodyNotReplayableError,
+  type CachedFileInventory,
+  ContentFormats,
+  type ExpiryReport,
+  type FileInventory,
+  type FileReplaceReceipt,
+  type ManagementClaimReceipt,
+  MediaType,
+  Operation,
+  RetryPolicies,
+  type SiteCreationReceipt,
+  type SpliceReceipt,
+  SymbolClient,
+  type SymbolStats,
 } from "./api.js";
 
 type Equal<Left, Right> =
-    (<Value>() => Value extends Left ? 1 : 2) extends
-    (<Value>() => Value extends Right ? 1 : 2)
-        ? true
-        : false;
+  (<Value>() => Value extends Left ? 1 : 2) extends <Value>() => Value extends Right ? 1 : 2
+    ? true
+    : false;
 type Expect<Value extends true> = Value;
 type OptionalKeys<Value extends object> = {
-    [Key in keyof Value]-?: object extends Pick<Value, Key> ? Key : never;
+  [Key in keyof Value]-?: object extends Pick<Value, Key> ? Key : never;
 }[keyof Value];
 type NoOptional<Value extends object> = Equal<OptionalKeys<Value>, never>;
 
@@ -37,14 +36,15 @@ const stats: Operation<SymbolStats> = client.stats();
 const creation: Operation<SiteCreationReceipt> = client.create("hello");
 const allocation: Operation<AllocationReceipt> = site.folder("generated").json({ value: 1 });
 const alias: Operation<AliasReceipt> = site.alias("latest", "data.bin");
-const replacement: Operation<FileReplaceReceipt> = site.file("data.bin").replace(
-    new Uint8Array([1]),
-    { baseHash: "a".repeat(64) },
-);
-const splice: Operation<SpliceReceipt> = site.file("data.bin").splice(
+const replacement: Operation<FileReplaceReceipt> = site
+  .file("data.bin")
+  .replace(new Uint8Array([1]), { baseHash: "a".repeat(64) });
+const splice: Operation<SpliceReceipt> = site
+  .file("data.bin")
+  .splice(
     { offset: 0, deleteBytes: 0, insert: new Uint8Array([1]) },
     { baseHash: "a".repeat(64), format: "headers" },
-);
+  );
 
 type _InventoryExact = Expect<NoOptional<FileInventory>>;
 type _StatsExact = Expect<NoOptional<SymbolStats>>;
@@ -54,51 +54,51 @@ type _SpliceExact = Expect<NoOptional<SpliceReceipt>>;
 type _ExpiryExact = Expect<NoOptional<ExpiryReport>>;
 
 async function narrowing(): Promise<void> {
-    const cached = await inventory;
-    if (cached.status === 200) {
-        cached.files.map((file) => file.path);
-    } else {
-        cached.etag.toUpperCase();
-        // @ts-expect-error 304 responses do not lie about having inventory fields.
-        cached.files;
-    }
-    const allocated = await allocation;
-    if (allocated.changed) {
-        allocated.undo.expiresAt.toISOString();
-    } else {
-        const absent: null = allocated.undo;
-        void absent;
-    }
-    if (allocated.naming.mode === "generated") {
-        allocated.naming.extension.toUpperCase();
-    } else {
-        const custom: "custom" = allocated.naming.mode;
-        void custom;
-    }
+  const cached = await inventory;
+  if (cached.status === 200) {
+    cached.files.map((file) => file.path);
+  } else {
+    cached.etag.toUpperCase();
+    // @ts-expect-error 304 responses do not lie about having inventory fields.
+    cached.files;
+  }
+  const allocated = await allocation;
+  if (allocated.changed) {
+    allocated.undo.expiresAt.toISOString();
+  } else {
+    const absent: null = allocated.undo;
+    void absent;
+  }
+  if (allocated.naming.mode === "generated") {
+    allocated.naming.extension.toUpperCase();
+  } else {
+    const custom: "custom" = allocated.naming.mode;
+    void custom;
+  }
 
-    const claimed: ManagementClaimReceipt = await site.management().claim();
-    if (claimed.replayed) {
-        const unavailable: null = claimed.managementToken;
-        void unavailable;
-    } else {
-        claimed.managementToken.toUpperCase();
-    }
+  const claimed: ManagementClaimReceipt = await site.management().claim();
+  if (claimed.replayed) {
+    const unavailable: null = claimed.managementToken;
+    void unavailable;
+  } else {
+    claimed.managementToken.toUpperCase();
+  }
 
-    const replaced = await replacement;
-    if (replaced.outcome === "relocated") {
-        const relocated: true = replaced.relocated;
-        void relocated;
-    }
+  const replaced = await replacement;
+  if (replaced.outcome === "relocated") {
+    const relocated: true = replaced.relocated;
+    void relocated;
+  }
 
-    await using operation = site.archive();
-    await using archive: ArchiveDownload = await operation;
-    await archive.blob();
+  await using operation = site.archive();
+  await using archive: ArchiveDownload = await operation;
+  await archive.blob();
 
-    await using response = await site.file("data.bin").get();
-    await response.arrayBuffer();
+  await using response = await site.file("data.bin").get();
+  await response.arrayBuffer();
 
-    const hosted = await site.file("config.json").json<{ enabled: boolean }>();
-    hosted.enabled.valueOf();
+  const hosted = await site.file("config.json").json<{ enabled: boolean }>();
+  hosted.enabled.valueOf();
 }
 
 const media = MediaType.application("problem+json", [["profile", "example"]]);
@@ -116,9 +116,9 @@ site.folder().bytes("text");
 // @ts-expect-error allocation callback must return a basename string.
 site.folder().create("body", { name: () => 42 });
 site.file("data.bin").splice(
-    // @ts-expect-error splice insertions are binary, not strings.
-    { offset: 0, deleteBytes: 0, insert: "x" },
-    { baseHash: "a".repeat(64) },
+  // @ts-expect-error splice insertions are binary, not strings.
+  { offset: 0, deleteBytes: 0, insert: "x" },
+  { baseHash: "a".repeat(64) },
 );
 // @ts-expect-error response DTO fields are readonly.
 (stats as unknown as SymbolStats).sites = 2;

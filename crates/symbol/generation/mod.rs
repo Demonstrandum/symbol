@@ -865,49 +865,23 @@ fn render_typescript_template(
     metadata: &GenerationMetadata,
     template_path: &Path,
 ) -> Result<String, GenerationError> {
-    let mut rendered = template
-        .lines()
-        .filter(|line| !line.starts_with("declare const __SYMBOL_"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    if template.ends_with('\n') {
-        rendered.push('\n');
-    }
-    replace(&mut rendered, "__SYMBOL_ARTIFACT__", &json!(artifact));
+    let mut rendered = template.to_string();
+    let metadata_json = json!({
+        "artifact": artifact,
+        "apiVersion": metadata.ledger.version.to_string(),
+        "absoluteRevision": metadata.ledger.absolute_revision,
+        "sourceHash": metadata.ledger.source_hash.as_str(),
+        "generatorVersion": GENERATOR_VERSION,
+        "commit": metadata.provenance.commit.as_str(),
+        "dirty": metadata.provenance.dirty,
+    })
+    .to_string();
+    replace(&mut rendered, "\"{METADATA_JSON}\"", &json!(metadata_json));
+    let contract_fixture_json = json!(versioned_contract_fixture(metadata)).to_string();
     replace(
         &mut rendered,
-        "__SYMBOL_API_VERSION__",
-        &json!(metadata.ledger.version.to_string()),
-    );
-    replace(
-        &mut rendered,
-        "__SYMBOL_API_REVISION__",
-        &json!(metadata.ledger.absolute_revision),
-    );
-    replace(
-        &mut rendered,
-        "__SYMBOL_SOURCE_HASH__",
-        &json!(metadata.ledger.source_hash.as_str()),
-    );
-    replace(
-        &mut rendered,
-        "__SYMBOL_GENERATOR_VERSION__",
-        &json!(GENERATOR_VERSION),
-    );
-    replace(
-        &mut rendered,
-        "__SYMBOL_BUILD_COMMIT__",
-        &json!(metadata.provenance.commit.as_str()),
-    );
-    replace(
-        &mut rendered,
-        "__SYMBOL_BUILD_DIRTY__",
-        &json!(metadata.provenance.dirty),
-    );
-    replace(
-        &mut rendered,
-        "__SYMBOL_CONTRACT_FIXTURE__",
-        &json!(versioned_contract_fixture(metadata)),
+        "\"{CONTRACT_FIXTURE_JSON}\"",
+        &json!(contract_fixture_json),
     );
     ensure_no_placeholders(&rendered, template_path)?;
     Ok(rendered)
@@ -920,40 +894,17 @@ fn render_python_template(
     template_path: &Path,
 ) -> Result<String, GenerationError> {
     let mut rendered = template.to_string();
-    replace(&mut rendered, "__SYMBOL_ARTIFACT__", &json!(artifact));
-    replace(
-        &mut rendered,
-        "__SYMBOL_API_VERSION__",
-        &json!(metadata.ledger.version.to_string()),
-    );
-    replace(
-        &mut rendered,
-        "__SYMBOL_API_REVISION__",
-        &json!(metadata.ledger.absolute_revision),
-    );
-    replace(
-        &mut rendered,
-        "__SYMBOL_SOURCE_HASH__",
-        &json!(metadata.ledger.source_hash.as_str()),
-    );
-    replace(
-        &mut rendered,
-        "__SYMBOL_GENERATOR_VERSION__",
-        &json!(GENERATOR_VERSION),
-    );
-    replace(
-        &mut rendered,
-        "__SYMBOL_BUILD_COMMIT__",
-        &json!(metadata.provenance.commit.as_str()),
-    );
-    rendered = rendered.replace(
-        "__SYMBOL_BUILD_DIRTY__",
-        if metadata.provenance.dirty {
-            "True"
-        } else {
-            "False"
-        },
-    );
+    let metadata_json = json!({
+        "artifact": artifact,
+        "api_version": metadata.ledger.version.to_string(),
+        "absolute_revision": metadata.ledger.absolute_revision,
+        "source_hash": metadata.ledger.source_hash.as_str(),
+        "generator_version": GENERATOR_VERSION,
+        "commit": metadata.provenance.commit.as_str(),
+        "dirty": metadata.provenance.dirty,
+    })
+    .to_string();
+    rendered = rendered.replace("{METADATA}", &metadata_json);
     ensure_no_placeholders(&rendered, template_path)?;
     Ok(rendered)
 }
@@ -963,7 +914,11 @@ fn replace(rendered: &mut String, placeholder: &str, value: &serde_json::Value) 
 }
 
 fn ensure_no_placeholders(rendered: &str, path: &Path) -> Result<(), GenerationError> {
-    if rendered.contains("__SYMBOL_") {
+    if rendered.contains("__SYMBOL_")
+        || rendered.contains("{METADATA}")
+        || rendered.contains("{METADATA_JSON}")
+        || rendered.contains("{CONTRACT_FIXTURE_JSON}")
+    {
         return Err(GenerationError::UnresolvedTemplatePlaceholder(
             path.to_path_buf(),
         ));

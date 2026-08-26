@@ -13,6 +13,8 @@ require_tool() {
 
 require_tool node
 require_tool tsc
+require_tool biome
+require_tool uv
 if [ -z "${CHROMIUM_BIN:-}" ]; then
   require_tool chromium
   CHROMIUM_BIN=$(command -v chromium)
@@ -26,8 +28,14 @@ cargo build --workspace --locked
 node tests/sdk/mock-server.mjs
 node tests/sdk/js/runtime.mjs
 node tests/sdk/js/real.mjs
+biome check --config-path=tooling/biome.json static/api.ts tests/sdk/ts/*.ts
 node tests/sdk/ts/run.mjs
 node tests/sdk/js/browser-smoke.mjs
+uv --project tooling run --frozen ruff check --config tooling/pyproject.toml static/api.py tests/sdk/py
+uv --project tooling run --frozen ruff format --check --config tooling/pyproject.toml static/api.py tests/sdk/py
+uv --project tooling run --frozen python tests/sdk/py/runtime.py
+uv --project tooling run --frozen python tests/sdk/py/optional.py
+uv --project tooling run --frozen python tests/sdk/py/real.py
 sh -n static/symbol.sh
 sh -n tests/symbol_client.sh
 sh -n tests/alias_transfer_e2e.sh

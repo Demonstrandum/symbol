@@ -1,0 +1,42 @@
+[project]
+name = "symbol-api-checks"
+version = "0.0.0"
+requires-python = ">=3.14"
+dependencies = [
+    "aiohttp",
+    "httpx",
+    "requests",
+    "urllib3",
+]
+
+[dependency-groups]
+dev = [
+    "basedpyright",
+    "ruff>=0.16.4",
+]
+
+[tool.uv]
+package = false
+
+[tool.basedpyright]
+typeCheckingMode = "strict"
+pythonVersion = "3.14"
+reportMissingTypeStubs = false
+reportPrivateUsage = false
+
+[tool.ruff]
+target-version = "py314"
+
+[tool.ruff.lint]
+select = [
+    "E4",
+    "E7",
+    "E9",
+    "F",
+    "I",
+    "TRY004",
+    "UP",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"static/api.py" = ["F821"]
