@@ -3,6 +3,7 @@
 /result
 /result-*
 /.direnv
+/.api-version.lock
 
 *.swp
 *.swo

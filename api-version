@@ -1,0 +1,74 @@
+#!/bin/sh
+set -eu
+
+ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+COMMAND=${1-}
+unset SYMBOL_API_BUMP SYMBOL_API_BUMP_EXPECTED SYMBOL_API_BUMP_TARGET
+BUMP_KIND=
+
+case "$COMMAND" in
+  update)
+    SYMBOL_GENERATION_MODE=update
+    export SYMBOL_GENERATION_MODE
+    ;;
+  check)
+    SYMBOL_GENERATION_MODE=readonly
+    export SYMBOL_GENERATION_MODE
+    ;;
+  bump-minor)
+    SYMBOL_GENERATION_MODE=update
+    BUMP_KIND=minor
+    ;;
+  bump-major)
+    SYMBOL_GENERATION_MODE=update
+    BUMP_KIND=major
+    ;;
+  *)
+    echo "usage: $0 <update|check|bump-minor|bump-major>" >&2
+    exit 2
+    ;;
+esac
+export SYMBOL_GENERATION_MODE
+
+if [ -n "$BUMP_KIND" ]; then
+  LEDGER="$ROOT/api-version.toml"
+  VERSION=$(awk -F'"' '$1 == "version = " { print $2 }' "$LEDGER")
+  REVISION=$(awk '$1 == "absolute_revision" && $2 == "=" { print $3 }' "$LEDGER")
+  SOURCE_HASH=$(awk -F'"' '$1 == "source_hash = " { print $2 }' "$LEDGER")
+  if [ -z "$VERSION" ] || [ -z "$REVISION" ] || [ -z "$SOURCE_HASH" ]; then
+    echo "$0: invalid api-version.toml" >&2
+    exit 1
+  fi
+
+  MAJOR=${VERSION%%.*}
+  REMAINDER=${VERSION#*.}
+  MINOR=${REMAINDER%%.*}
+  PATCH=${REMAINDER#*.}
+  case "$MAJOR:$MINOR:$PATCH:$REVISION:$SOURCE_HASH" in
+    *[!0-9a-f:.]* | *::*)
+      echo "$0: invalid api-version.toml" >&2
+      exit 1
+      ;;
+  esac
+
+  case "$BUMP_KIND" in
+    minor)
+      TARGET="$MAJOR.$((MINOR + 1)).0"
+      ;;
+    major)
+      TARGET="$((MAJOR + 1)).0.0"
+      ;;
+  esac
+
+  SYMBOL_API_BUMP=$BUMP_KIND
+  SYMBOL_API_BUMP_EXPECTED="$VERSION:$REVISION:$SOURCE_HASH"
+  SYMBOL_API_BUMP_TARGET=$TARGET
+  export SYMBOL_API_BUMP SYMBOL_API_BUMP_EXPECTED SYMBOL_API_BUMP_TARGET
+fi
+
+exec cargo run \
+  --manifest-path "$ROOT/Cargo.toml" \
+  --locked \
+  -p symbol \
+  --example symbol-generate \
+  -- report "$ROOT"

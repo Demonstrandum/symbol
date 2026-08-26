@@ -1,0 +1,44 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Final
+
+
+@dataclass(frozen=True, slots=True)
+class ApiMetadata:
+    artifact: str
+    api_version: str
+    absolute_revision: int
+    source_hash: str
+    generator_version: str
+    commit: str
+    dirty: bool
+
+
+METADATA: Final[ApiMetadata] = ApiMetadata(
+    artifact=__SYMBOL_ARTIFACT__,
+    api_version=__SYMBOL_API_VERSION__,
+    absolute_revision=__SYMBOL_API_REVISION__,
+    source_hash=__SYMBOL_SOURCE_HASH__,
+    generator_version=__SYMBOL_GENERATOR_VERSION__,
+    commit=__SYMBOL_BUILD_COMMIT__,
+    dirty=__SYMBOL_BUILD_DIRTY__,
+)
+
+API_VERSION: Final[str] = METADATA.api_version
+API_REVISION: Final[int] = METADATA.absolute_revision
+SOURCE_HASH: Final[str] = METADATA.source_hash
+GENERATOR_VERSION: Final[str] = METADATA.generator_version
+BUILD_COMMIT: Final[str] = METADATA.commit
+BUILD_DIRTY: Final[bool] = METADATA.dirty
+
+__all__ = (
+    "ApiMetadata",
+    "METADATA",
+    "API_VERSION",
+    "API_REVISION",
+    "SOURCE_HASH",
+    "GENERATOR_VERSION",
+    "BUILD_COMMIT",
+    "BUILD_DIRTY",
+)

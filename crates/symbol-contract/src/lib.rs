@@ -1129,11 +1129,156 @@ pub struct SpliceReceipt {
     pub mutation: MutationReceipt,
 }
 
+pub const CONTRACT_FIXTURE_VERSION: u32 = 1;
+pub const INITIAL_API_VERSION: ContractVersion = ContractVersion::new(0, 1, 0);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContractVersion {
+    pub major: u64,
+    pub minor: u64,
+    pub patch: u64,
+}
+
+impl ContractVersion {
+    #[must_use]
+    pub const fn new(major: u64, minor: u64, patch: u64) -> Self {
+        Self {
+            major,
+            minor,
+            patch,
+        }
+    }
+}
+
+impl std::fmt::Display for ContractVersion {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+impl serde::Serialize for ContractVersion {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.collect_str(self)
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct ContractFixture {
+    pub fixture_version: u32,
+    pub operations: Vec<OperationFixture>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct OperationFixture {
+    pub name: &'static str,
+    pub method: &'static str,
+    pub head: bool,
+    pub path: &'static str,
+    pub introduced: ContractVersion,
+    pub request_headers: &'static [&'static str],
+    pub response_headers: &'static [&'static str],
+    pub outcomes_exact: bool,
+    pub success_outcomes: Vec<FixtureOutcome>,
+    pub error_outcomes: Vec<FixtureOutcome>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct FixtureOutcome {
+    pub status: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<WireBody>,
+    pub required_headers: &'static [&'static str],
+}
+
+#[must_use]
+pub fn contract_fixture() -> ContractFixture {
+    ContractFixture {
+        fixture_version: CONTRACT_FIXTURE_VERSION,
+        operations: ENDPOINTS.iter().map(operation_fixture).collect(),
+    }
+}
+
+#[must_use]
+/// Serializes the deterministic contract fixture.
+///
+/// # Panics
+///
+/// Panics only if serialization of the statically typed fixture fails.
+pub fn contract_fixture_json() -> String {
+    let mut json = serde_json::to_string_pretty(&contract_fixture())
+        .expect("contract fixture is serializable");
+    json.push('\n');
+    json
+}
+
+fn operation_fixture(endpoint: &'static EndpointContract) -> OperationFixture {
+    let exact = EXACT_OUTCOMES
+        .iter()
+        .find(|outcomes| outcomes.name == endpoint.name);
+    let (success_outcomes, error_outcomes, outcomes_exact) = exact.map_or_else(
+        || {
+            (
+                endpoint
+                    .success_statuses
+                    .iter()
+                    .copied()
+                    .map(inferred_fixture_outcome)
+                    .collect(),
+                endpoint
+                    .error_statuses
+                    .iter()
+                    .copied()
+                    .map(inferred_fixture_outcome)
+                    .collect(),
+                false,
+            )
+        },
+        |outcomes| {
+            (
+                outcomes.success.iter().map(exact_fixture_outcome).collect(),
+                outcomes.errors.iter().map(exact_fixture_outcome).collect(),
+                true,
+            )
+        },
+    );
+    OperationFixture {
+        name: endpoint.name,
+        method: endpoint.method,
+        head: endpoint.head,
+        path: endpoint.path,
+        introduced: INITIAL_API_VERSION,
+        request_headers: endpoint.request_headers,
+        response_headers: endpoint.response_headers,
+        outcomes_exact,
+        success_outcomes,
+        error_outcomes,
+    }
+}
+
+const fn exact_fixture_outcome(outcome: &OutcomeContract) -> FixtureOutcome {
+    FixtureOutcome {
+        status: outcome.status,
+        body: Some(outcome.body),
+        required_headers: outcome.required_headers,
+    }
+}
+
+const fn inferred_fixture_outcome(status: u16) -> FixtureOutcome {
+    FixtureOutcome {
+        status,
+        body: None,
+        required_headers: &[],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeSet, HashSet};
 
-    use super::{ENDPOINTS, EXACT_OUTCOMES};
+    use super::{ENDPOINTS, EXACT_OUTCOMES, INITIAL_API_VERSION, contract_fixture};
 
     #[test]
     fn endpoint_names_are_unique_and_shapes_are_well_formed() {
@@ -1204,5 +1349,38 @@ mod tests {
                 endpoint.name
             );
         }
+    }
+
+    #[test]
+    fn fixture_is_deterministic_and_covers_every_operation() {
+        let fixture = contract_fixture();
+        assert_eq!(fixture.fixture_version, 1);
+        assert_eq!(fixture.operations.len(), ENDPOINTS.len());
+        for (operation, endpoint) in fixture.operations.iter().zip(ENDPOINTS) {
+            assert_eq!(operation.name, endpoint.name);
+            assert_eq!(operation.introduced, INITIAL_API_VERSION);
+            assert_eq!(
+                operation
+                    .success_outcomes
+                    .iter()
+                    .map(|outcome| outcome.status)
+                    .collect::<Vec<_>>(),
+                endpoint.success_statuses
+            );
+            assert_eq!(
+                operation
+                    .error_outcomes
+                    .iter()
+                    .map(|outcome| outcome.status)
+                    .collect::<Vec<_>>(),
+                endpoint.error_statuses
+            );
+        }
+
+        let first = super::contract_fixture_json();
+        let second = super::contract_fixture_json();
+        assert_eq!(first, second);
+        assert!(first.ends_with('\n'));
+        serde_json::from_str::<serde_json::Value>(&first).expect("fixture is valid JSON");
     }
 }
