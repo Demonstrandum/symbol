@@ -10,7 +10,10 @@ WorkingDirectory=/home/samuel/symbol
 ExecStart=/home/samuel/symbol/target/release/symbol --bind 127.0.0.1:4340 --root /var/lib/symbol
 Restart=on-failure
 StateDirectory=symbol
-Environment=RUST_LOG=info
+Environment=RUST_LOG=info,symbol::mutation=info
+StandardOutput=journal
+StandardError=journal
+LogRateLimitIntervalSec=0
 Environment=SYMBOL_BIND=127.0.0.1:4340
 Environment=SYMBOL_ROOT=/var/lib/symbol
 Environment=SYMBOL_PUBLIC_URL=http://symbol

@@ -93,7 +93,7 @@ fn local_git_watch_paths_cover_head_index_and_resolved_ref() {
 }
 
 #[test]
-fn repository_tracked_dirty_scope_ignores_untracked_and_tracks_all_tracked_changes() {
+fn repository_dirty_scope_marks_untracked_canonical_sources_only() {
     let repository = tempfile::tempdir().unwrap();
     let root = repository.path();
     run_git(root, &["init"]);
@@ -116,8 +116,16 @@ fn repository_tracked_dirty_scope_ignores_untracked_and_tracks_all_tracked_chang
 
     let untracked = root.join("crates/symbol/generation/untracked.rs");
     fs::write(&untracked, "pub const NEW: u8 = 2;\n").unwrap();
-    assert!(!discover_git(root).unwrap().dirty);
+    let canonical_dirty = discover_git(root).unwrap();
+    assert!(canonical_dirty.dirty);
+    assert_eq!(canonical_dirty.commit, initial.commit);
     fs::remove_file(untracked).unwrap();
+    assert!(!discover_git(root).unwrap().dirty);
+
+    fs::create_dir_all(root.join("static")).unwrap();
+    fs::write(root.join("static/api.ts"), "export {};\n").unwrap();
+    assert!(discover_git(root).unwrap().dirty);
+    fs::remove_file(root.join("static/api.ts")).unwrap();
     assert!(!discover_git(root).unwrap().dirty);
 
     fs::write(root.join("unrelated-tracked.txt"), "changed\n").unwrap();

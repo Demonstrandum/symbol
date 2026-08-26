@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 pub use ledger::{ApiVersion, SourceHash, VersionLedger, preview_ledger, read_ledger};
 pub use provenance::{BuildProvenance, COMMIT_ENV, DIRTY_ENV, git_watch_paths, tracked_git_files};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use thiserror::Error;
 
@@ -28,8 +28,8 @@ const HASH_DOMAIN: &[u8] = b"symbol-api-canonical-inputs-v3\0";
 const CANONICAL_FIXED_INPUTS: &[&str] = &[
     "API.md",
     "api-version",
-    "static/api.ts.in",
-    "static/api.py.in",
+    "static/api.ts",
+    "static/api.py",
     "crates/symbol/build.rs",
     "crates/symbol/Cargo.toml",
     "Cargo.lock",
@@ -173,6 +173,35 @@ pub struct GeneratedArtifacts {
     pub api_d_ts: String,
     pub api_py: String,
     pub contract_fixture_json: String,
+}
+
+#[derive(Debug, Serialize)]
+struct VersionedContractFixture {
+    fixture_version: u32,
+    extension_normalization: &'static [symbol_contract::ExtensionNormalizationVector],
+    api_version: String,
+    absolute_revision: u64,
+    source_hash: String,
+    generator_version: &'static str,
+    build: BuildProvenanceFixture,
+    response_identity_headers: [&'static str; 3],
+    splice: SpliceContractFixture,
+    operations: Vec<symbol_contract::OperationFixture>,
+}
+
+#[derive(Debug, Serialize)]
+struct BuildProvenanceFixture {
+    commit: String,
+    dirty: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct SpliceContractFixture {
+    media_type: &'static str,
+    header_max_bytes: usize,
+    header_max_descriptors: usize,
+    frame_max_descriptors: usize,
+    frame_max_metadata_bytes: usize,
 }
 
 impl GeneratedArtifacts {
@@ -449,8 +478,8 @@ pub fn generate_artifacts(
     metadata: &GenerationMetadata,
 ) -> Result<GeneratedArtifacts, GenerationError> {
     metadata.provenance.validate()?;
-    let ts_path = root.join("static/api.ts.in");
-    let py_path = root.join("static/api.py.in");
+    let ts_path = root.join("static/api.ts");
+    let py_path = root.join("static/api.py");
     let ts_template = fs::read_to_string(&ts_path).map_err(|source| GenerationError::FileIo {
         path: ts_path.clone(),
         source,
@@ -460,7 +489,7 @@ pub fn generate_artifacts(
         source,
     })?;
 
-    emit_typescript(&ts_template, "api.ts.in")?;
+    emit_typescript(&ts_template, "api.ts")?;
 
     let typescript_source = render_typescript_template(&ts_template, "api.ts", metadata, &ts_path)?;
     let module_source = render_typescript_template(&ts_template, "api.js", metadata, &ts_path)?;
@@ -497,8 +526,44 @@ pub fn generate_artifacts(
         api_global_js: global_artifact,
         api_d_ts: declarations_artifact,
         api_py: python_artifact,
-        contract_fixture_json: symbol_contract::contract_fixture_json(),
+        contract_fixture_json: versioned_contract_fixture_json(metadata),
     })
+}
+
+fn versioned_contract_fixture(metadata: &GenerationMetadata) -> VersionedContractFixture {
+    let contract = symbol_contract::contract_fixture();
+    VersionedContractFixture {
+        fixture_version: contract.fixture_version,
+        extension_normalization: contract.extension_normalization,
+        api_version: metadata.ledger.version.to_string(),
+        absolute_revision: metadata.ledger.absolute_revision,
+        source_hash: metadata.ledger.source_hash.as_str().to_string(),
+        generator_version: GENERATOR_VERSION,
+        build: BuildProvenanceFixture {
+            commit: metadata.provenance.commit.clone(),
+            dirty: metadata.provenance.dirty,
+        },
+        response_identity_headers: [
+            "Symbol-API-Version",
+            "Symbol-API-Revision",
+            "Symbol-API-Source-Hash",
+        ],
+        splice: SpliceContractFixture {
+            media_type: symbol_contract::SPLICE_MEDIA_TYPE,
+            header_max_bytes: symbol_contract::SPLICE_HEADER_MAX_BYTES,
+            header_max_descriptors: symbol_contract::SPLICE_HEADER_MAX_DESCRIPTORS,
+            frame_max_descriptors: symbol_contract::SPLICE_FRAME_MAX_DESCRIPTORS,
+            frame_max_metadata_bytes: symbol_contract::SPLICE_FRAME_MAX_METADATA_BYTES,
+        },
+        operations: contract.operations,
+    }
+}
+
+fn versioned_contract_fixture_json(metadata: &GenerationMetadata) -> String {
+    let mut fixture = serde_json::to_string_pretty(&versioned_contract_fixture(metadata))
+        .expect("versioned contract fixture is serializable");
+    fixture.push('\n');
+    fixture
 }
 
 #[derive(Debug, Deserialize)]
@@ -800,7 +865,14 @@ fn render_typescript_template(
     metadata: &GenerationMetadata,
     template_path: &Path,
 ) -> Result<String, GenerationError> {
-    let mut rendered = template.to_string();
+    let mut rendered = template
+        .lines()
+        .filter(|line| !line.starts_with("declare const __SYMBOL_"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if template.ends_with('\n') {
+        rendered.push('\n');
+    }
     replace(&mut rendered, "__SYMBOL_ARTIFACT__", &json!(artifact));
     replace(
         &mut rendered,
@@ -831,6 +903,11 @@ fn render_typescript_template(
         &mut rendered,
         "__SYMBOL_BUILD_DIRTY__",
         &json!(metadata.provenance.dirty),
+    );
+    replace(
+        &mut rendered,
+        "__SYMBOL_CONTRACT_FIXTURE__",
+        &json!(versioned_contract_fixture(metadata)),
     );
     ensure_no_placeholders(&rendered, template_path)?;
     Ok(rendered)

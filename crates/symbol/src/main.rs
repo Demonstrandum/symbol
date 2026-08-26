@@ -27,7 +27,8 @@ use std::collections::HashMap;
 use std::io::{self, SeekFrom};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path as FsPath, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Extension, Path, State};
@@ -58,6 +59,22 @@ const DEFAULT_MAX_FILE_SIZE: u64 = 4 * 1024 * 1024 * 1024;
 const STREAM_THRESHOLD: u64 = 1024 * 1024;
 const INSTALL_SH: &str = static_asset!("install.sh");
 const SYMBOL_SH: &str = static_asset!("symbol.sh");
+const API_VERSION: &str = env!("SYMBOL_API_VERSION");
+const API_REVISION: &str = env!("SYMBOL_API_REVISION");
+const API_SOURCE_HASH: &str = env!("SYMBOL_API_SOURCE_HASH");
+static NEXT_MUTATION_SIGNAL_ID: AtomicU64 = AtomicU64::new(1);
+static CUSTOM_MUTATION_METHODS: LazyLock<[Method; 7]> = LazyLock::new(|| {
+    [
+        contract::METHOD_ALIAS,
+        contract::METHOD_COPY,
+        contract::METHOD_REPLACE,
+        contract::METHOD_MOVE,
+        contract::METHOD_UNDO,
+        contract::METHOD_EXPIRE,
+        contract::METHOD_MANAGE,
+    ]
+    .map(|method| Method::from_bytes(method.as_bytes()).expect("contract method is valid"))
+});
 
 #[derive(Parser)]
 #[command(name = "symbol", about = "Tiny static-site hosting for the tailnet")]
@@ -336,6 +353,7 @@ fn configured_identity_provider(args: &mut Args) -> IdentityProvider {
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
+        .with_ansi(false)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
@@ -351,7 +369,7 @@ async fn main() {
         return;
     }
     let is_admin = args.command.is_some();
-    let public_url = args.public_url.take().unwrap_or_else(|| {
+    let mut public_url = args.public_url.take().unwrap_or_else(|| {
         assert!(
             args.allow_dev_origin || is_admin,
             "SYMBOL_PUBLIC_URL is required (or set SYMBOL_ALLOW_DEV_ORIGIN=true for development)"
@@ -359,6 +377,18 @@ async fn main() {
         "http://symbol".to_string()
     });
     validate_public_url(&public_url).expect("valid SYMBOL_PUBLIC_URL");
+    let listener = if is_admin {
+        None
+    } else {
+        let listener = TcpListener::bind(&args.bind)
+            .await
+            .unwrap_or_else(|err| panic!("bind {}: {err}", args.bind));
+        let bound = listener.local_addr().expect("bound listener address");
+        if let Some(prefix) = public_url.strip_suffix(":0") {
+            public_url = format!("{prefix}:{}", bound.port());
+        }
+        Some(listener)
+    };
     let expiry_defaults = DecayPolicy {
         min_age_seconds: expiry::parse_duration_seconds(&args.expiry_min_age)
             .expect("valid SYMBOL_EXPIRY_MIN_AGE"),
@@ -409,10 +439,10 @@ async fn main() {
     state.audit_trusted_proxy = std::mem::take(&mut args.audit_trusted_proxy).into();
     tokio::spawn(expiry_worker(state.clone()));
     let app = router(state);
-    let listener = TcpListener::bind(&args.bind)
-        .await
-        .unwrap_or_else(|err| panic!("bind {}: {err}", args.bind));
-    tracing::info!("listening on {}", args.bind);
+    let listener = listener.expect("server mode binds a listener");
+    let bound = listener.local_addr().expect("bound listener address");
+    log_mutation_signals_ready();
+    tracing::info!("listening on {bound}");
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -504,6 +534,8 @@ fn router(app: App) -> Router {
             identity_config,
             resolve_creator,
         ))
+        .layer(middleware::from_fn(log_mutation_activity))
+        .layer(middleware::from_fn(attach_api_identity))
         .with_state(app)
 }
 
@@ -521,6 +553,61 @@ fn make_http_span(request: &Request<Body>) -> tracing::Span {
         method = %request.method(),
         uri = %request.uri()
     )
+}
+
+async fn log_mutation_activity(request: Request<Body>, next: Next) -> Response {
+    if !is_mutation_method(request.method()) {
+        return next.run(request).await;
+    }
+    let mutation_id = NEXT_MUTATION_SIGNAL_ID.fetch_add(1, Ordering::Relaxed);
+    let method = request.method().clone();
+    tracing::info!(
+        target: "symbol::mutation",
+        mutation_id,
+        method = %method,
+        "symbol_mutation_start"
+    );
+    let response = next.run(request).await;
+    tracing::info!(
+        target: "symbol::mutation",
+        mutation_id,
+        method = %method,
+        status = response.status().as_u16(),
+        "symbol_mutation_finish"
+    );
+    response
+}
+
+fn log_mutation_signals_ready() {
+    tracing::info!(
+        target: "symbol::mutation",
+        "symbol_mutation_signals_ready"
+    );
+}
+
+fn is_mutation_method(method: &Method) -> bool {
+    method == Method::PUT
+        || method == Method::DELETE
+        || method == Method::POST
+        || method == Method::PATCH
+        || CUSTOM_MUTATION_METHODS
+            .iter()
+            .any(|candidate| method == candidate)
+}
+
+async fn attach_api_identity(request: Request<Body>, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert("symbol-api-version", HeaderValue::from_static(API_VERSION));
+    headers.insert(
+        "symbol-api-revision",
+        HeaderValue::from_static(API_REVISION),
+    );
+    headers.insert(
+        "symbol-api-source-hash",
+        HeaderValue::from_static(API_SOURCE_HASH),
+    );
+    response
 }
 
 async fn resolve_creator(
@@ -2736,6 +2823,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn mutation_signals_cover_all_supported_write_methods() {
+        for method in [Method::PUT, Method::DELETE, Method::POST, Method::PATCH] {
+            assert!(is_mutation_method(&method), "{method}");
+        }
+        for method in CUSTOM_MUTATION_METHODS.iter() {
+            assert!(is_mutation_method(method), "{method}");
+        }
+        for method in [Method::GET, Method::HEAD, Method::OPTIONS] {
+            assert!(!is_mutation_method(&method), "{method}");
+        }
+    }
+
     #[tokio::test]
     async fn typed_contract_matches_observed_lifecycle_dispatch() {
         let root = tempfile::tempdir().unwrap();
@@ -2878,6 +2978,12 @@ mod tests {
                 .unwrap();
             let response = app.oneshot(request).await.unwrap();
             assert_contract_status(endpoint.name, response.status());
+            assert_eq!(response.headers()["symbol-api-version"], API_VERSION);
+            assert_eq!(response.headers()["symbol-api-revision"], API_REVISION);
+            assert_eq!(
+                response.headers()["symbol-api-source-hash"],
+                API_SOURCE_HASH
+            );
         }
     }
 
@@ -2913,6 +3019,97 @@ mod tests {
         }
         assert!(logs.contains("started processing request"), "{logs}");
         assert!(logs.contains("finished processing request"), "{logs}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn configured_info_logging_exposes_active_and_finished_mutations() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(CapturedLogs(Arc::clone(&captured)))
+            .with_ansi(false)
+            .without_time()
+            .with_env_filter("info,symbol::mutation=info")
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let _default = tracing::dispatcher::set_default(&dispatch);
+        log_mutation_signals_ready();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let handler_release = Arc::clone(&release);
+        let app = Router::new()
+            .route(
+                "/",
+                axum::routing::put(move || {
+                    let release = Arc::clone(&handler_release);
+                    async move {
+                        release.notified().await;
+                        StatusCode::NO_CONTENT
+                    }
+                }),
+            )
+            .layer(middleware::from_fn(log_mutation_activity));
+        let request = tokio::spawn(
+            app.oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        );
+
+        for _ in 0..100 {
+            if String::from_utf8_lossy(&captured.lock().unwrap()).contains("symbol_mutation_start")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let active_logs = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(active_logs.contains("symbol::mutation"), "{active_logs}");
+        assert!(
+            active_logs.contains("symbol_mutation_signals_ready"),
+            "{active_logs}"
+        );
+        assert!(
+            active_logs.contains("symbol_mutation_start"),
+            "{active_logs}"
+        );
+        assert!(active_logs.contains("method=PUT"), "{active_logs}");
+        assert!(active_logs.contains("mutation_id="), "{active_logs}");
+        assert!(
+            !active_logs.contains("symbol_mutation_finish"),
+            "{active_logs}"
+        );
+        let start_id = active_logs
+            .lines()
+            .find(|line| line.contains("symbol_mutation_start"))
+            .and_then(|line| {
+                line.split_whitespace()
+                    .find_map(|field| field.strip_prefix("mutation_id="))
+            })
+            .unwrap()
+            .to_string();
+
+        release.notify_one();
+        assert_eq!(
+            request.await.unwrap().unwrap().status(),
+            StatusCode::NO_CONTENT
+        );
+        let finished_logs = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(
+            finished_logs.contains("symbol_mutation_finish"),
+            "{finished_logs}"
+        );
+        assert!(finished_logs.contains("status=204"), "{finished_logs}");
+        let finish_id = finished_logs
+            .lines()
+            .find(|line| line.contains("symbol_mutation_finish"))
+            .and_then(|line| {
+                line.split_whitespace()
+                    .find_map(|field| field.strip_prefix("mutation_id="))
+            })
+            .unwrap();
+        assert_eq!(finish_id, start_id.as_str());
     }
 
     #[tokio::test]

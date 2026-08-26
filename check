@@ -4,10 +4,30 @@ set -eu
 SYMBOL_GENERATION_MODE='readonly'
 export SYMBOL_GENERATION_MODE
 
+require_tool() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    printf 'optional host SDK tool %s is missing; run sh nix/check.sh for the canonical release gate\n' "$1" >&2
+    exit 127
+  fi
+}
+
+require_tool node
+require_tool tsc
+if [ -z "${CHROMIUM_BIN:-}" ]; then
+  require_tool chromium
+  CHROMIUM_BIN=$(command -v chromium)
+  export CHROMIUM_BIN
+fi
+
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-targets --all-features --locked
 cargo build --workspace --locked
+node tests/sdk/mock-server.mjs
+node tests/sdk/js/runtime.mjs
+node tests/sdk/js/real.mjs
+node tests/sdk/ts/run.mjs
+node tests/sdk/js/browser-smoke.mjs
 sh -n static/symbol.sh
 sh -n tests/symbol_client.sh
 sh -n tests/alias_transfer_e2e.sh

@@ -87,10 +87,13 @@ def gzip_site() -> bytes:
 
 
 def execute_raw_http(example: HttpExample, managed_token: str, etag: str) -> None:
+    method, path, protocol = example.request_line.split()
+    if protocol != "HTTP/1.1":
+        raise AssertionError(f"unsupported documented HTTP version: {protocol}")
     if example.request_line == "PUT / HTTP/1.1":
         observed = request(
-            "PUT",
-            "/",
+            method,
+            path,
             b"<h1>Hello</h1>",
             (
                 ("Content-Type", "text/html"),
@@ -99,15 +102,15 @@ def execute_raw_http(example: HttpExample, managed_token: str, etag: str) -> Non
         )
     elif example.request_line == "GET /hello/FILES HTTP/1.1":
         observed = request(
-            "GET",
-            "/hello/FILES",
+            method,
+            path,
             headers=(("Accept", "application/json"),),
         )
     elif example.request_line == "PUT /hello HTTP/1.1":
         payload = gzip_site()
         observed = request(
-            "PUT",
-            "/api-raw",
+            method,
+            path,
             payload,
             (
                 ("Content-Type", "application/gzip"),
@@ -117,15 +120,21 @@ def execute_raw_http(example: HttpExample, managed_token: str, etag: str) -> Non
                 ("Authorization", f"Bearer {managed_token}"),
             ),
         )
+        require_status(example.request_line, observed, example.expected_status)
+        unpacked = request("GET", "/hello/index.html")
+        require_status("documented PUT /hello state", unpacked, 200)
+        if unpacked.body != b"<h1>raw merge</h1>\n":
+            raise AssertionError("documented PUT /hello did not update exact /hello state")
+        return
     elif example.request_line == "ALIAS /hello/current HTTP/1.1":
         current_etag = request(
             "GET",
-            "/api-raw/FILES",
+            "/hello/FILES",
             headers=(("Accept", "application/json"),),
         ).header("ETag")
         observed = request(
-            "ALIAS",
-            "/api-raw/current",
+            method,
+            path,
             headers=(
                 ("Alias-Target", "index.html"),
                 ("If-Match", current_etag),
@@ -136,20 +145,33 @@ def execute_raw_http(example: HttpExample, managed_token: str, etag: str) -> Non
     elif example.request_line == "REPLACE /hello/data.bin HTTP/1.1":
         fixture = request(
             "PUT",
-            "/api-raw/data.bin",
+            path,
             b"before",
             (("Authorization", f"Bearer {managed_token}"),),
         )
         require_status("raw REPLACE fixture", fixture, 200)
-        content_hash = request("GET", "/api-raw/data.bin/HASH").body.decode().strip()
+        content_hash = request("GET", f"{path}/HASH").body.decode().strip()
         observed = request(
-            "REPLACE",
-            "/api-raw/data.bin",
+            method,
+            path,
             b"replacement bytes",
             (
                 ("If-Content-Match", content_hash),
                 ("Authorization", f"Bearer {managed_token}"),
                 ("Idempotency-Key", "replace-data-v2"),
+            ),
+        )
+    elif example.request_line == "PATCH /hello/data.bin HTTP/1.1":
+        content_hash = request("GET", f"{path}/HASH").body.decode().strip()
+        observed = request(
+            method,
+            path,
+            b"X",
+            (
+                ("If-Content-Match", content_hash),
+                ("Splice", "offset=0; delete=0; insert=1"),
+                ("Idempotency-Key", "splice-data-v1"),
+                ("Authorization", f"Bearer {managed_token}"),
             ),
         )
     else:
@@ -164,6 +186,7 @@ def raw_http_examples() -> tuple[HttpExample, ...]:
         "PUT /hello HTTP/1.1": 200,
         "ALIAS /hello/current HTTP/1.1": 201,
         "REPLACE /hello/data.bin HTTP/1.1": 200,
+        "PATCH /hello/data.bin HTTP/1.1": 200,
     }
     found: list[HttpExample] = []
     for block in re.findall(r"```http\s*\n(.*?)\n```", API, re.DOTALL):
@@ -389,9 +412,15 @@ def execute_phase_five_contract_examples() -> None:
 
 
 claim = "sym_claim_" + "01" * 32
+previous_hello = request("DELETE", "/hello")
+if previous_hello.status not in (200, 404):
+    raise AssertionError(
+        "raw merge fixture reset: expected HTTP 200 or 404, "
+        f"observed {previous_hello.status}"
+    )
 created = request(
     "PUT",
-    "/api-raw/index.html",
+    "/hello/index.html",
     b"<h1>before raw merge</h1>\n",
     (("Management-Action", "claim"), ("Creator-Claim", claim)),
 )
@@ -399,7 +428,7 @@ require_status("raw merge fixture", created, 201)
 token = created.header("Management-Token")
 inventory = request(
     "GET",
-    "/api-raw/FILES",
+    "/hello/FILES",
     headers=(("Accept", "application/json"),),
 )
 require_status("raw merge fixture inventory", inventory, 200)
@@ -408,6 +437,16 @@ baseline = inventory.header("ETag")
 examples = raw_http_examples()
 for raw_example in examples:
     execute_raw_http(raw_example, token, baseline)
+
+released_raw_state = request(
+    "MANAGE",
+    "/hello",
+    headers=(
+        ("Management-Action", "release"),
+        ("Authorization", f"Bearer {token}"),
+    ),
+)
+require_status("raw HTTP example release", released_raw_state, 200)
 
 commands = curl_examples()
 with tempfile.TemporaryDirectory() as work:

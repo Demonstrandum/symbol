@@ -1,7 +1,10 @@
+use std::collections::BTreeSet;
+
 use swc_core::common::{FileName, GLOBALS, Globals, Mark, SourceMap, sync::Lrc};
 use swc_core::ecma::ast::{
     Accessibility, Class, ClassMember, Decl, DefaultDecl, EsVersion, Key, MemberExpr, MemberProp,
-    Module, ModuleDecl, ModuleItem, Program, Stmt, TsModuleDecl, TsNamespaceBody,
+    MethodKind, Module, ModuleDecl, ModuleItem, ParamOrTsParamProp, Pat, Program, PropName, Stmt,
+    TsModuleDecl, TsNamespaceBody, TsParamPropParam,
 };
 use swc_core::ecma::codegen::{Config, Emitter, text_writer::JsWriter};
 #[cfg(test)]
@@ -84,8 +87,8 @@ fn retain_declaration_items(items: &mut Vec<ModuleItem>, ambient: bool, declarat
         }
         ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultDecl(export)) => {
             match &mut export.decl {
-                DefaultDecl::Class(class) => strip_class(&mut class.class),
-                DefaultDecl::Fn(function) => function.function.body = None,
+                DefaultDecl::Class(class) => strip_class(&mut class.class, None),
+                DefaultDecl::Fn(function) => strip_function(&mut function.function),
                 DefaultDecl::TsInterfaceDecl(_) => {}
             }
             *declarations += 1;
@@ -119,12 +122,12 @@ fn declaration_only(declaration: &mut Decl, ambient: bool, declarations: &mut us
         }
         Decl::Fn(function) => {
             function.declare = !ambient;
-            function.function.body = None;
+            strip_function(&mut function.function);
             true
         }
         Decl::Class(class) => {
             class.declare = !ambient;
-            strip_class(&mut class.class);
+            strip_class(&mut class.class, Some(class.ident.sym.as_ref()));
             true
         }
         Decl::TsEnum(enumeration) => {
@@ -135,7 +138,8 @@ fn declaration_only(declaration: &mut Decl, ambient: bool, declarations: &mut us
             strip_namespace(module, ambient, declarations);
             true
         }
-        Decl::TsInterface(_) | Decl::TsTypeAlias(_) => true,
+        Decl::TsInterface(interface) => !interface.id.sym.starts_with("Internal"),
+        Decl::TsTypeAlias(alias) => !alias.id.sym.starts_with("Internal"),
         Decl::Using(_) => false,
     }
 }
@@ -146,7 +150,8 @@ fn retain_private_type_dependency(
     declarations: &mut usize,
 ) -> bool {
     match declaration {
-        Decl::TsInterface(_) | Decl::TsTypeAlias(_) => true,
+        Decl::TsInterface(interface) => !interface.id.sym.starts_with("Internal"),
+        Decl::TsTypeAlias(alias) => !alias.id.sym.starts_with("Internal"),
         Decl::TsModule(module) => {
             strip_namespace(module, ambient, declarations);
             true
@@ -174,21 +179,47 @@ fn strip_namespace_body(body: &mut TsNamespaceBody, declarations: &mut usize) {
     }
 }
 
-fn strip_class(class: &mut Class) {
+fn strip_class(class: &mut Class, class_name: Option<&str>) {
+    let overloads = class
+        .body
+        .iter()
+        .filter_map(|member| {
+            let ClassMember::Method(method) = member else {
+                return None;
+            };
+            if method.function.body.is_none() && method.kind == MethodKind::Method {
+                method_identity(method)
+            } else {
+                None
+            }
+        })
+        .collect::<BTreeSet<_>>();
     class.body.retain_mut(|member| match member {
         ClassMember::Constructor(constructor) => {
-            if is_private(constructor.accessibility) {
+            if class_name == Some("Operation") {
+                constructor.accessibility = Some(Accessibility::Private);
+                constructor.params.clear();
+                constructor.body = None;
+                true
+            } else if is_private(constructor.accessibility) {
                 false
             } else {
+                for parameter in &mut constructor.params {
+                    strip_constructor_parameter_default(parameter);
+                }
                 constructor.body = None;
                 true
             }
         }
         ClassMember::Method(method) => {
-            if is_private(method.accessibility) {
+            if is_private(method.accessibility)
+                || (method.function.body.is_some()
+                    && method_identity(method)
+                        .is_some_and(|identity| overloads.contains(&identity)))
+            {
                 false
             } else {
-                method.function.body = None;
+                strip_function(&mut method.function);
                 true
             }
         }
@@ -214,6 +245,62 @@ fn strip_class(class: &mut Class) {
         | ClassMember::Empty(_)
         | ClassMember::StaticBlock(_) => false,
     });
+}
+
+fn method_identity(method: &swc_core::ecma::ast::ClassMethod) -> Option<(String, bool)> {
+    let name = match &method.key {
+        PropName::Ident(identifier) => identifier.sym.to_string(),
+        PropName::Str(string) => string.value.as_str()?.to_string(),
+        PropName::Num(number) => number.value.to_string(),
+        PropName::BigInt(number) => number.value.to_string(),
+        PropName::Computed(_) => return None,
+    };
+    Some((name, method.is_static))
+}
+
+fn strip_function(function: &mut swc_core::ecma::ast::Function) {
+    function.body = None;
+    function.is_async = false;
+    function.is_generator = false;
+    for parameter in &mut function.params {
+        strip_parameter_default(&mut parameter.pat);
+    }
+}
+
+fn strip_constructor_parameter_default(parameter: &mut ParamOrTsParamProp) {
+    match parameter {
+        ParamOrTsParamProp::Param(parameter) => strip_parameter_default(&mut parameter.pat),
+        ParamOrTsParamProp::TsParamProp(property) => {
+            let TsParamPropParam::Assign(assignment) = &mut property.param else {
+                return;
+            };
+            if let Pat::Ident(mut identifier) = std::mem::take(&mut *assignment.left) {
+                identifier.id.optional = true;
+                property.param = TsParamPropParam::Ident(identifier);
+            }
+        }
+    }
+}
+
+fn strip_parameter_default(pattern: &mut Pat) {
+    let Pat::Assign(_) = pattern else {
+        return;
+    };
+    let Pat::Assign(assignment) = std::mem::take(pattern) else {
+        unreachable!("assignment pattern was checked");
+    };
+    *pattern = *assignment.left;
+    mark_parameter_optional(pattern);
+}
+
+fn mark_parameter_optional(pattern: &mut Pat) {
+    match pattern {
+        Pat::Ident(identifier) => identifier.id.optional = true,
+        Pat::Array(array) => array.optional = true,
+        Pat::Object(object) => object.optional = true,
+        Pat::Rest(rest) => mark_parameter_optional(&mut rest.arg),
+        Pat::Assign(_) | Pat::Invalid(_) | Pat::Expr(_) => {}
+    }
 }
 
 const fn is_private(accessibility: Option<Accessibility>) -> bool {

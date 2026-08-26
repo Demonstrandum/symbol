@@ -28,6 +28,26 @@
             }
           )
         );
+      injectedCommit = builtins.getEnv "SYMBOL_NIX_BUILD_COMMIT";
+      injectedDirty = builtins.getEnv "SYMBOL_NIX_BUILD_DIRTY";
+      provenanceCommit =
+        if self ? rev then
+          self.rev
+        else if self ? dirtyRev then
+          lib.removeSuffix "-dirty" self.dirtyRev
+        else if injectedCommit != "" then
+          injectedCommit
+        else
+          "unknown";
+      provenanceDirty =
+        if self ? rev then
+          "false"
+        else if self ? dirtyRev then
+          "true"
+        else if injectedDirty != "" then
+          injectedDirty
+        else
+          "true";
       src = lib.fileset.toSource {
         root = ./.;
         fileset = lib.fileset.unions [
@@ -41,6 +61,7 @@
           ./flake.nix
           ./nix
           ./public-api-freeze.json
+          ./release-check
           ./schema.sql
           ./ops
           ./static
@@ -68,15 +89,8 @@
               "--all-features"
             ];
             SYMBOL_GENERATION_MODE = "readonly";
-            # Flake rev/dirtyRev follows tracked Git state and ignores untracked files.
-            SYMBOL_BUILD_COMMIT =
-              if self ? rev then
-                self.rev
-              else if self ? dirtyRev then
-                lib.removeSuffix "-dirty" self.dirtyRev
-              else
-                "unknown";
-            SYMBOL_BUILD_DIRTY = if self ? rev then "false" else "true";
+            SYMBOL_BUILD_COMMIT = provenanceCommit;
+            SYMBOL_BUILD_DIRTY = provenanceDirty;
             nativeBuildInputs = [
               pkgs.git
               pkgs.pkg-config
@@ -124,15 +138,8 @@
               "symbol-generate"
             ];
             SYMBOL_GENERATION_MODE = "readonly";
-            # Keep generated-source provenance identical to the package derivation.
-            SYMBOL_BUILD_COMMIT =
-              if self ? rev then
-                self.rev
-              else if self ? dirtyRev then
-                lib.removeSuffix "-dirty" self.dirtyRev
-              else
-                "unknown";
-            SYMBOL_BUILD_DIRTY = if self ? rev then "false" else "true";
+            SYMBOL_BUILD_COMMIT = provenanceCommit;
+            SYMBOL_BUILD_DIRTY = provenanceDirty;
             nativeBuildInputs = [
               pkgs.git
               pkgs.pkg-config
@@ -172,10 +179,67 @@
             SYMBOL_BIN="${package}/bin/symbol" python3 tests/public_api_freeze.py
             touch "$out"
           '';
+          provenance = pkgs.runCommand "symbol-generated-provenance" {
+            nativeBuildInputs = [ pkgs.python3 ];
+          } ''
+            python3 - "${generatedSources}/symbol-contract.json" ${lib.escapeShellArg provenanceCommit} ${lib.escapeShellArg provenanceDirty} <<'PY'
+            import json
+            import sys
+
+            fixture = json.load(open(sys.argv[1], encoding="utf-8"))
+            assert fixture["build"]["commit"] == sys.argv[2]
+            assert fixture["build"]["dirty"] is (sys.argv[3] == "true")
+            PY
+            touch "$out"
+          '';
+          sdkCheck =
+            name: nativeBuildInputs: command:
+            pkgs.runCommand name {
+              inherit src;
+              SYMBOL_GENERATED_DIR = generatedSources;
+              inherit nativeBuildInputs;
+            } ''
+              cd "$src"
+              ${command}
+              touch "$out"
+            '';
+          sdkMock = sdkCheck "symbol-sdk-mock" [ pkgs.nodejs ] ''
+            node tests/sdk/mock-server.mjs
+          '';
+          sdkJs = sdkCheck "symbol-sdk-js" [ pkgs.nodejs ] ''
+            node tests/sdk/js/runtime.mjs
+          '';
+          sdkJsReal = sdkCheck "symbol-sdk-js-real" [ pkgs.nodejs ] ''
+            export SYMBOL_BIN="${package}/bin/symbol"
+            node tests/sdk/js/real.mjs
+          '';
+          sdkTs = sdkCheck "symbol-sdk-ts" [
+            pkgs.nodejs
+            pkgs.typescript
+          ] ''
+            export TSC="${pkgs.typescript}/bin/tsc"
+            export SYMBOL_BIN="${package}/bin/symbol"
+            node tests/sdk/ts/run.mjs
+          '';
+          sdkBrowser = sdkCheck "symbol-sdk-browser" (
+            [ pkgs.nodejs ]
+            ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.chromium ]
+          ) ''
+            ${lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+              export CHROMIUM_BIN="${pkgs.chromium}/bin/chromium"
+            ''}
+            node tests/sdk/js/browser-smoke.mjs
+          '';
           named = posix // {
             inherit package;
             generated-sources = generatedSources;
+            generated-provenance = provenance;
             public-api-freeze = publicApiFreeze;
+            sdk-mock = sdkMock;
+            sdk-js = sdkJs;
+            sdk-js-real = sdkJsReal;
+            sdk-ts = sdkTs;
+            sdk-browser = sdkBrowser;
           };
         in
         named
@@ -200,7 +264,9 @@
                 "rustfmt"
               ];
             })
-          ];
+            pkgs.nodejs
+            pkgs.typescript
+          ] ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.chromium ];
         };
       });
 

@@ -11,7 +11,7 @@ fi
 
 ./check
 cargo build --workspace --release --locked
-sudo -n nix build path:. --cores "${NIX_CORES:-8}" --max-jobs "${NIX_MAX_JOBS:-4}"
+sh nix/check.sh --cores "${NIX_CORES:-8}" --max-jobs "${NIX_MAX_JOBS:-4}"
 
 if [ -n "${SYMBOL_SOAK_SECONDS:-}" ]; then
   sh tests/concurrency_soak.sh

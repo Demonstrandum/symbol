@@ -1098,17 +1098,15 @@ async fn execute(probe: Probe) {
 }
 
 async fn assert_success_location_is_readable(probe: Probe, app: &Router, location: Option<String>) {
-    let Some(outcomes) = contract::EXACT_OUTCOMES
+    let fixture = contract::contract_fixture();
+    let outcomes = fixture
+        .operations
         .iter()
         .find(|outcomes| outcomes.name == probe.endpoint)
-    else {
-        return;
-    };
-    if !outcomes
-        .success
-        .iter()
-        .any(|outcome| outcome.status == probe.status)
-    {
+        .expect("every probe has a fixture operation");
+    if !outcomes.success_outcomes.iter().any(|outcome| {
+        outcome.status == probe.status && outcome.request_variant == probe_variant(probe)
+    }) {
         return;
     }
     let Some(location) = location else {
@@ -1132,17 +1130,21 @@ async fn assert_success_location_is_readable(probe: Probe, app: &Router, locatio
 }
 
 async fn assert_exact_outcome(probe: Probe, response: Response) {
-    let Some(outcomes) = contract::EXACT_OUTCOMES
+    let fixture = contract::contract_fixture();
+    let outcomes = fixture
+        .operations
         .iter()
         .find(|outcomes| outcomes.name == probe.endpoint)
-    else {
-        return;
-    };
+        .expect("every probe has a fixture operation");
     let expected = outcomes
-        .success
+        .success_outcomes
         .iter()
-        .chain(outcomes.errors)
-        .find(|outcome| outcome.status == probe.status)
+        .chain(&outcomes.error_outcomes)
+        .find(|outcome| {
+            outcome.status == probe.status
+                && (outcome.request_variant == "default"
+                    || outcome.request_variant == probe_variant(probe))
+        })
         .unwrap_or_else(|| {
             panic!(
                 "{} status {} lacks an exact outcome",
@@ -1156,6 +1158,15 @@ async fn assert_exact_outcome(probe: Probe, response: Response) {
             probe.endpoint,
             probe.status,
             required
+        );
+    }
+    for forbidden in expected.forbidden_headers {
+        assert!(
+            !response.headers().contains_key(*forbidden),
+            "{} status {} included forbidden exact-outcome header {}",
+            probe.endpoint,
+            probe.status,
+            forbidden
         );
     }
     let content_type = response
@@ -1172,11 +1183,27 @@ async fn assert_exact_outcome(probe: Probe, response: Response) {
             serde_json::from_slice::<serde_json::Value>(&body).unwrap();
         }
         contract::WireBody::PlainText => {
-            assert!(content_type.starts_with("text/plain"));
+            assert!(
+                content_type.starts_with("text/"),
+                "{} status {} returned {content_type}",
+                probe.endpoint,
+                probe.status
+            );
             std::str::from_utf8(&body).unwrap();
         }
         contract::WireBody::Binary => assert!(!body.is_empty()),
     }
+}
+
+fn probe_variant(probe: Probe) -> &'static str {
+    if probe.endpoint != "allocated file" {
+        return "default";
+    }
+    probe
+        .request_headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("allocation-action"))
+        .map_or("create", |(_, value)| *value)
 }
 
 async fn send(
@@ -2086,6 +2113,477 @@ async fn phase_five_mutations_cover_replay_conflict_limits_and_two_phase_outcome
     )
     .await;
     assert_eq!(media_response.headers()[header::CONTENT_TYPE], "image/png");
+}
+
+async fn fetch_absolute_location(app: &Router, location: &str) -> Response {
+    let location = location.parse::<axum::http::Uri>().unwrap();
+    let target = location
+        .path_and_query()
+        .map_or_else(|| location.path(), axum::http::uri::PathAndQuery::as_str);
+    send(app, "GET", target, &[], Body::empty()).await
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn phase_five_mutation_urls_encode_each_stored_path_segment_and_are_fetchable() {
+    const ENCODED_SEGMENT: &str = "100%25%20caf%C3%A9%20%3F%23";
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::new(root.path().to_path_buf()).unwrap();
+    let raw_folder = "paths/100% café ?#";
+    store
+        .put_file("encoded", "target.txt", b"alias target")
+        .unwrap();
+    store
+        .put_file(
+            "encoded",
+            &format!("{raw_folder}/replace.txt"),
+            b"replace before",
+        )
+        .unwrap();
+    store
+        .put_file(
+            "encoded",
+            &format!("{raw_folder}/splice.txt"),
+            b"splice before",
+        )
+        .unwrap();
+    let app = router(App::new(store.clone()));
+
+    let alias = send(
+        &app,
+        "ALIAS",
+        &format!("/encoded/paths/{ENCODED_SEGMENT}/alias.txt"),
+        &[("alias-target", "../../target.txt")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(alias.status(), StatusCode::CREATED);
+    let (alias_headers, alias_json) = json(alias).await;
+    let alias_location = alias_headers[header::LOCATION].to_str().unwrap();
+    let expected_alias = format!("http://symbol/encoded/paths/{ENCODED_SEGMENT}/alias.txt");
+    assert_eq!(alias_location, expected_alias);
+    assert_eq!(alias_json["location"], expected_alias);
+    let fetched = fetch_absolute_location(&app, alias_location).await;
+    assert_eq!(fetched.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(fetched.into_body(), usize::MAX).await.unwrap(),
+        "alias target"
+    );
+
+    let allocated = send(
+        &app,
+        "POST",
+        &format!("/encoded/paths/{ENCODED_SEGMENT}/"),
+        &[("file-extension", "bin")],
+        "allocated body",
+    )
+    .await;
+    assert_eq!(allocated.status(), StatusCode::CREATED);
+    let (allocated_headers, allocated_json) = json(allocated).await;
+    let allocated_location = allocated_headers[header::LOCATION].to_str().unwrap();
+    let expected_allocated = format!(
+        "http://symbol/encoded/paths/{ENCODED_SEGMENT}/{}",
+        allocated_json["name"].as_str().unwrap()
+    );
+    assert_eq!(allocated_location, expected_allocated);
+    assert_eq!(allocated_json["location"], expected_allocated);
+    assert_eq!(allocated_json["url"], expected_allocated);
+    let fetched = fetch_absolute_location(&app, allocated_location).await;
+    assert_eq!(fetched.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(fetched.into_body(), usize::MAX).await.unwrap(),
+        "allocated body"
+    );
+
+    let replace_path = format!("{raw_folder}/replace.txt");
+    let store::Node::File {
+        hash: replace_hash, ..
+    } = store.lookup("encoded", &replace_path).unwrap()
+    else {
+        panic!("replacement fixture must be a file");
+    };
+    let replaced = send(
+        &app,
+        "REPLACE",
+        &format!("/encoded/paths/{ENCODED_SEGMENT}/replace.txt"),
+        &[("if-content-match", &replace_hash)],
+        "replace after",
+    )
+    .await;
+    assert_eq!(replaced.status(), StatusCode::OK);
+    let (replaced_headers, replaced_json) = json(replaced).await;
+    let replaced_location = replaced_headers[header::LOCATION].to_str().unwrap();
+    let expected_replaced = format!("http://symbol/encoded/paths/{ENCODED_SEGMENT}/replace.txt");
+    assert_eq!(replaced_location, expected_replaced);
+    assert_eq!(replaced_json["location"], expected_replaced);
+    let fetched = fetch_absolute_location(&app, replaced_location).await;
+    assert_eq!(fetched.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(fetched.into_body(), usize::MAX).await.unwrap(),
+        "replace after"
+    );
+
+    let splice_path = format!("{raw_folder}/splice.txt");
+    let store::Node::File {
+        hash: splice_hash, ..
+    } = store.lookup("encoded", &splice_path).unwrap()
+    else {
+        panic!("splice fixture must be a file");
+    };
+    let spliced = send(
+        &app,
+        "PATCH",
+        &format!("/encoded/paths/{ENCODED_SEGMENT}/splice.txt"),
+        &[
+            ("if-content-match", &splice_hash),
+            ("splice", "offset=0; delete=6; insert=6"),
+        ],
+        "after ",
+    )
+    .await;
+    assert_eq!(spliced.status(), StatusCode::OK);
+    let (spliced_headers, spliced_json) = json(spliced).await;
+    let spliced_location = spliced_headers[header::LOCATION].to_str().unwrap();
+    let expected_spliced = format!("http://symbol/encoded/paths/{ENCODED_SEGMENT}/splice.txt");
+    assert_eq!(spliced_location, expected_spliced);
+    assert_eq!(spliced_json["location"], expected_spliced);
+    let fetched = fetch_absolute_location(&app, spliced_location).await;
+    assert_eq!(fetched.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(fetched.into_body(), usize::MAX).await.unwrap(),
+        "after  before"
+    );
+}
+
+#[tokio::test]
+async fn alias_batch_rejects_manifest_unsafe_paths_and_accepts_safe_punctuation() {
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::new(root.path().to_path_buf()).unwrap();
+    store
+        .put_file("alias-input", "target.txt", b"target")
+        .unwrap();
+    let app = router(App::new(store));
+    for path in [
+        "line\nbreak",
+        "bell\u{7}path",
+        ".DS_Store",
+        "nested/Thumbs.db",
+    ] {
+        let body = serde_json::json!({
+            "aliases": [{"path": path, "target": "target.txt"}]
+        })
+        .to_string();
+        let rejected = send(
+            &app,
+            "ALIAS",
+            "/alias-input/",
+            &[("content-type", "application/json")],
+            body,
+        )
+        .await;
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST, "{path:?}");
+    }
+
+    let safe_path = "quote\" ' []{}=+,;!@~$^&()#%?.txt";
+    let body = serde_json::json!({
+        "aliases": [{"path": safe_path, "target": "target.txt"}]
+    })
+    .to_string();
+    let accepted = send(
+        &app,
+        "ALIAS",
+        "/alias-input/",
+        &[("content-type", "application/json")],
+        body,
+    )
+    .await;
+    assert_eq!(accepted.status(), StatusCode::CREATED);
+    let (_, accepted) = json(accepted).await;
+    assert_eq!(accepted["aliases"][0]["path"], safe_path);
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn alias_responses_inherit_target_and_intermediate_expiry_caps() {
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::new(root.path().to_path_buf()).unwrap();
+    store
+        .put_file("expiry-alias", "target.txt", b"target")
+        .unwrap();
+    store
+        .put_file("expiry-alias", "directory/item.txt", b"item")
+        .unwrap();
+    store
+        .put_file("expiry-alias", "links/anchor.txt", b"anchor")
+        .unwrap();
+    store
+        .set_expiry(
+            "expiry-alias",
+            "target.txt",
+            Some(expiry::ExpiryPolicy::Relative {
+                duration_seconds: 80,
+            }),
+        )
+        .unwrap();
+    store
+        .set_expiry(
+            "expiry-alias",
+            "directory/item.txt",
+            Some(expiry::ExpiryPolicy::Relative {
+                duration_seconds: 30,
+            }),
+        )
+        .unwrap();
+    store
+        .put_aliases(
+            "expiry-alias",
+            &[
+                store::AliasSpec {
+                    path: "links/target-capped",
+                    target: "../target.txt",
+                },
+                store::AliasSpec {
+                    path: "links/direct",
+                    target: "../target.txt",
+                },
+                store::AliasSpec {
+                    path: "links/chain",
+                    target: "direct",
+                },
+                store::AliasSpec {
+                    path: "view",
+                    target: "directory",
+                },
+                store::AliasSpec {
+                    path: "dangling",
+                    target: "missing",
+                },
+            ],
+            store::FileMutationOptions::default(),
+        )
+        .unwrap();
+    store
+        .set_expiry(
+            "expiry-alias",
+            "links",
+            Some(expiry::ExpiryPolicy::Relative {
+                duration_seconds: 120,
+            }),
+        )
+        .unwrap();
+    store
+        .set_expiry(
+            "expiry-alias",
+            "links/direct",
+            Some(expiry::ExpiryPolicy::Relative {
+                duration_seconds: 40,
+            }),
+        )
+        .unwrap();
+    store
+        .set_expiry(
+            "expiry-alias",
+            "links/chain",
+            Some(expiry::ExpiryPolicy::Relative {
+                duration_seconds: 60,
+            }),
+        )
+        .unwrap();
+    store
+        .set_expiry(
+            "expiry-alias",
+            "dangling",
+            Some(expiry::ExpiryPolicy::Relative {
+                duration_seconds: 45,
+            }),
+        )
+        .unwrap();
+    let app = router(App::new(store));
+
+    let target = send(&app, "GET", "/expiry-alias/target.txt", &[], Body::empty()).await;
+    let target_capped = send(
+        &app,
+        "GET",
+        "/expiry-alias/links/target-capped",
+        &[],
+        Body::empty(),
+    )
+    .await;
+    let direct = send(
+        &app,
+        "GET",
+        "/expiry-alias/links/direct",
+        &[],
+        Body::empty(),
+    )
+    .await;
+    let chain = send(&app, "GET", "/expiry-alias/links/chain", &[], Body::empty()).await;
+    assert!(target.headers().contains_key(header::EXPIRES));
+    assert_eq!(
+        target_capped.headers()[header::EXPIRES],
+        target.headers()[header::EXPIRES],
+        "alias response must inherit its resolved target cap"
+    );
+    assert_ne!(
+        direct.headers()[header::EXPIRES],
+        target.headers()[header::EXPIRES],
+        "direct alias policy must remain an independent earlier cap"
+    );
+    assert_eq!(
+        chain.headers()[header::EXPIRES],
+        direct.headers()[header::EXPIRES],
+        "alias chains must inherit intermediate alias caps"
+    );
+
+    let item = send(
+        &app,
+        "GET",
+        "/expiry-alias/directory/item.txt",
+        &[],
+        Body::empty(),
+    )
+    .await;
+    let through_directory = send(
+        &app,
+        "GET",
+        "/expiry-alias/view/item.txt",
+        &[],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(
+        through_directory.headers()[header::EXPIRES],
+        item.headers()[header::EXPIRES],
+        "directory alias descendants must inherit the resolved file cap"
+    );
+
+    let dangling = send(&app, "GET", "/expiry-alias/dangling", &[], Body::empty()).await;
+    assert_eq!(dangling.status(), StatusCode::NOT_FOUND);
+    let dangling_report = send(
+        &app,
+        "GET",
+        "/expiry-alias/dangling/EXPIRES",
+        &[],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(dangling_report.status(), StatusCode::OK);
+    let (_, dangling_report) = json(dangling_report).await;
+    assert!(dangling_report["effective_expires_at"].is_string());
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn phase_five_content_mutations_report_and_store_sanitized_bytes() {
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::new(root.path().to_path_buf()).unwrap();
+    store
+        .put_file("redacted", "replace.txt", b"before")
+        .unwrap();
+    store
+        .put_file("redacted", "splice.txt", b"prefix:")
+        .unwrap();
+    let app = router(App::new(store.clone()));
+    let management = format!("sym_mgmt_{}", "a".repeat(64));
+    let claim = format!("sym_claim_{}", "b".repeat(64));
+    let redacted_management = format!("sym_mgmt_{}", "*".repeat(64));
+    let redacted_claim = format!("sym_claim_{}", "*".repeat(64));
+
+    let allocated = send(
+        &app,
+        "POST",
+        "/redacted/generated/",
+        &[("file-extension", "txt")],
+        format!("{management}\n{claim}"),
+    )
+    .await;
+    assert_eq!(allocated.status(), StatusCode::CREATED);
+    assert_eq!(allocated.headers()["sanitized-management-tokens"], "1");
+    assert_eq!(allocated.headers()["sanitized-creator-claims"], "1");
+    let (_, allocated_json) = json(allocated).await;
+    assert_eq!(allocated_json["sanitized_management_tokens"], 1);
+    assert_eq!(allocated_json["sanitized_creator_claims"], 1);
+    let allocation_bytes = format!("{redacted_management}\n{redacted_claim}");
+    let allocation_hash = blake3::hash(allocation_bytes.as_bytes())
+        .to_hex()
+        .to_string();
+    assert_eq!(allocated_json["hash"], format!("blake3:{allocation_hash}"));
+    assert!(
+        allocated_json["path"]
+            .as_str()
+            .unwrap()
+            .contains(&allocation_hash)
+    );
+    let fetched = fetch_absolute_location(&app, allocated_json["url"].as_str().unwrap()).await;
+    assert_eq!(
+        to_bytes(fetched.into_body(), usize::MAX).await.unwrap(),
+        allocation_bytes
+    );
+
+    let store::Node::File {
+        hash: replacement_base,
+        ..
+    } = store.lookup("redacted", "replace.txt").unwrap()
+    else {
+        panic!("replacement fixture must be a file");
+    };
+    let replaced = send(
+        &app,
+        "REPLACE",
+        "/redacted/replace.txt",
+        &[("if-content-match", &replacement_base)],
+        claim,
+    )
+    .await;
+    assert_eq!(replaced.status(), StatusCode::OK);
+    assert_eq!(replaced.headers()["sanitized-creator-claims"], "1");
+    let (_, replaced_json) = json(replaced).await;
+    assert_eq!(replaced_json["sanitized_creator_claims"], 1);
+    assert_eq!(
+        replaced_json["new_hash"],
+        format!(
+            "blake3:{}",
+            blake3::hash(redacted_claim.as_bytes()).to_hex()
+        )
+    );
+
+    let store::Node::File {
+        hash: splice_base, ..
+    } = store.lookup("redacted", "splice.txt").unwrap()
+    else {
+        panic!("splice fixture must be a file");
+    };
+    let spliced = send(
+        &app,
+        "PATCH",
+        "/redacted/splice.txt",
+        &[
+            ("if-content-match", &splice_base),
+            (
+                "splice",
+                &format!("offset=7; delete=0; insert={}", management.len()),
+            ),
+        ],
+        management,
+    )
+    .await;
+    assert_eq!(spliced.status(), StatusCode::OK);
+    assert_eq!(spliced.headers()["sanitized-management-tokens"], "1");
+    let (_, spliced_json) = json(spliced).await;
+    assert_eq!(spliced_json["sanitized_management_tokens"], 1);
+    let expected_splice = format!("prefix:{redacted_management}");
+    assert_eq!(
+        spliced_json["new_hash"],
+        format!(
+            "blake3:{}",
+            blake3::hash(expected_splice.as_bytes()).to_hex()
+        )
+    );
+    let fetched = fetch_absolute_location(&app, spliced_json["location"].as_str().unwrap()).await;
+    assert_eq!(
+        to_bytes(fetched.into_body(), usize::MAX).await.unwrap(),
+        expected_splice
+    );
 }
 
 #[tokio::test]

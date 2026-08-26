@@ -42,6 +42,17 @@ for required_reserved_rule in (
         failures.append(
             f"missing exact reserved mutation rule: {required_reserved_rule}"
         )
+splice_section = documented_section("file splice")
+documented_splice = "`Splice: offset=<n>; delete=<n>; insert=<n>`"
+if splice_section is None or documented_splice not in splice_section:
+    failures.append(
+        "file splice: descriptor fields must use semicolons and descriptors commas"
+    )
+if (
+    splice_section is not None
+    and "`Splice: offset=<n>,delete=<n>,insert=<n>`" in splice_section
+):
+    failures.append("file splice: comma-separated descriptor fields remain documented")
 for endpoint in contract:
     name = endpoint["name"]
     if name in names:

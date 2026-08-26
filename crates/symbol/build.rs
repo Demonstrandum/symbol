@@ -104,6 +104,15 @@ fn write_outputs(
     ledger: VersionLedger,
     schema: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    println!("cargo::rustc-env=SYMBOL_API_VERSION={}", ledger.version);
+    println!(
+        "cargo::rustc-env=SYMBOL_API_REVISION={}",
+        ledger.absolute_revision
+    );
+    println!(
+        "cargo::rustc-env=SYMBOL_API_SOURCE_HASH={}",
+        ledger.source_hash
+    );
     write_generated_file(&out_dir.join("schema.sql"), schema)?;
     let metadata = GenerationMetadata {
         ledger,

@@ -235,6 +235,7 @@ struct PendingMetadata {
     extension: Option<String>,
     expected_tree_hash: Option<String>,
     legacy_fingerprint: bool,
+    sanitized: TokenCounts,
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -249,6 +250,8 @@ struct PendingRequestMetadata {
     expected_tree_hash: Option<String>,
     #[serde(default)]
     legacy_fingerprint: bool,
+    #[serde(default)]
+    sanitized: TokenCounts,
 }
 
 #[derive(Clone, Copy)]
@@ -395,9 +398,18 @@ struct AliasDirectoryRowWork {
 }
 
 #[cfg(test)]
+#[derive(Clone, Copy, Default)]
+struct AliasRefreshRowWork {
+    real: u64,
+    aliases: u64,
+}
+
+#[cfg(test)]
 thread_local! {
     static ALIAS_DIRECTORY_ROW_WORK: Cell<AliasDirectoryRowWork> =
         Cell::new(AliasDirectoryRowWork::default());
+    static ALIAS_REFRESH_ROW_WORK: Cell<AliasRefreshRowWork> =
+        Cell::new(AliasRefreshRowWork::default());
 }
 
 #[cfg(test)]
@@ -409,6 +421,29 @@ fn reset_alias_directory_row_work() {
 fn alias_directory_row_work() -> AliasDirectoryRowWork {
     ALIAS_DIRECTORY_ROW_WORK.get()
 }
+
+#[cfg(test)]
+fn reset_alias_refresh_row_work() {
+    ALIAS_REFRESH_ROW_WORK.set(AliasRefreshRowWork::default());
+}
+
+#[cfg(test)]
+fn alias_refresh_row_work() -> AliasRefreshRowWork {
+    ALIAS_REFRESH_ROW_WORK.get()
+}
+
+#[cfg(test)]
+fn record_alias_refresh_rows(real: usize, aliases: usize) {
+    ALIAS_REFRESH_ROW_WORK.with(|cell| {
+        let mut work = cell.get();
+        work.real += u64::try_from(real).expect("row count fits in u64");
+        work.aliases += u64::try_from(aliases).expect("row count fits in u64");
+        cell.set(work);
+    });
+}
+
+#[cfg(not(test))]
+const fn record_alias_refresh_rows(_: usize, _: usize) {}
 
 #[cfg(test)]
 fn record_alias_resolution_rows(rows: usize) {
@@ -697,6 +732,7 @@ struct PreparedSplice {
     offset: u64,
     delete: u64,
     insert: PreparedSpliceSource,
+    sanitized: TokenCounts,
 }
 
 struct TemporaryDirectory {
@@ -954,8 +990,6 @@ pub enum StoreError {
     SpliceRange,
     #[error("error: splice result exceeds the configured limit")]
     SpliceResultTooLarge,
-    #[error("error: generated content contains recognizable management secrets")]
-    SecretContent,
     #[error("error: reserved path already exists: {0}")]
     #[allow(dead_code)]
     ReservedCollision(String),
@@ -1980,7 +2014,11 @@ impl Store {
                 sites::content_revision.eq(sites::content_revision + 1),
             ))
             .execute(&mut *tx)?;
-        refresh_aliases_locked(&mut tx, site_id)?;
+        let alias_changes = changed_paths
+            .iter()
+            .map(|path| AliasChange::Alias(path))
+            .collect::<Vec<_>>();
+        refresh_aliases_locked(&mut tx, site_id, &alias_changes)?;
         refresh_expiry_for_changes_locked(&mut tx, site_id, &changed_paths, now)?;
         let tree_hash = regenerate_site(&mut tx, &self.inner.blob_files, site_id, now)?;
         let (revision, _) = site_revision_locked(&mut tx, name)?;
@@ -2339,7 +2377,6 @@ impl Store {
         options: FileMutationOptions<'_>,
     ) -> Result<AllocatedFile, StoreError> {
         let staged = self.stage_allocation_source(source, "")?;
-        reject_staged_secrets(&staged)?;
         let destination = allocation_destination(&staged.hash, spec)?;
         self.run_before_content_commit();
         self.commit_allocated(
@@ -2363,7 +2400,6 @@ impl Store {
     ) -> Result<AllocatedFile, StoreError> {
         let current_path = normalize_rel(current_path)?;
         let staged = self.stage_allocation_source(source, "")?;
-        reject_staged_secrets(&staged)?;
         let request_fingerprint = content_mutation_request_fingerprint(
             name,
             &current_path,
@@ -2417,7 +2453,6 @@ impl Store {
     ) -> Result<PendingAllocation, StoreError> {
         let name = parse_site_name(name)?;
         let staged = self.stage_allocation_source(source, "")?;
-        reject_staged_secrets(&staged)?;
         let folder = normalize_folder(spec.folder)?;
         let media_type = normalize_media_type(spec.media_type)?;
         let extension = spec
@@ -2467,6 +2502,7 @@ impl Store {
             extension: extension.clone(),
             expected_tree_hash: options.expected_tree_hash.map(str::to_string),
             legacy_fingerprint: false,
+            sanitized: staged.sanitized,
         })
         .map_err(|error| StoreError::Io(io::Error::new(io::ErrorKind::InvalidData, error)))?;
         diesel::insert_into(pending_allocations::table)
@@ -2615,6 +2651,7 @@ impl Store {
                     extension: request.extension,
                     expected_tree_hash: request.expected_tree_hash,
                     legacy_fingerprint: request.legacy_fingerprint,
+                    sanitized: request.sanitized,
                 })
             })
             .transpose()?
@@ -2684,7 +2721,7 @@ impl Store {
             size: pending.size,
             hash: pending.hash.clone(),
             source: StagedSource::File(self.inner.blob_files.path(&pending.hash)),
-            sanitized: TokenCounts::default(),
+            sanitized: pending.sanitized,
         };
         let result = self.commit_allocated_locked(
             &mut tx,
@@ -2874,7 +2911,6 @@ impl Store {
         let path = normalize_rel(path)?;
         reject_reserved_path(&path)?;
         let staged = self.stage_allocation_source(source, &path)?;
-        reject_staged_secrets(&staged)?;
         let request_fingerprint = content_mutation_request_fingerprint(
             name,
             &path,
@@ -2987,21 +3023,18 @@ impl Store {
         let old_size = entry_size_locked(&mut db, site_id, &path, kind)?;
         drop(db);
         self.run_before_content_commit();
-        let (hash, size) = splice_blob_to_path(
+        splice_blob_to_path(
             &self.inner.blob_files.path(base_hash),
             old_size,
             &prepared,
             &output,
             maximum_result_size,
         )?;
-        let staged = StagedFile {
-            path: path.clone(),
-            size: i64::try_from(size).map_err(|_| StoreError::SpliceResultTooLarge)?,
-            hash,
-            source: StagedSource::File(output),
-            sanitized: TokenCounts::default(),
-        };
-        reject_staged_secrets(&staged)?;
+        let mut staged = stage_borrowed_file(&path, output)?;
+        for splice in &prepared {
+            staged.sanitized.management += splice.sanitized.management;
+            staged.sanitized.claim += splice.sanitized.claim;
+        }
         if kind == database::schema::ALLOCATED_ENTRY_KIND {
             let metadata = self.allocated_metadata(name, &path)?;
             let destination = relocated_destination(&staged.hash, &path, &metadata)?;
@@ -3497,7 +3530,7 @@ impl Store {
         diesel::update(sites::table.find(site_id))
             .set(sites::content_revision.eq(sites::content_revision + 1))
             .execute(&mut *tx)?;
-        refresh_aliases_locked(&mut tx, site_id)?;
+        refresh_aliases_locked(&mut tx, site_id, &[AliasChange::Subtree(&rel)])?;
         refresh_expiry_for_changes_locked(&mut tx, site_id, &[&rel], self.now_millis())?;
         regenerate_site(&mut tx, &self.inner.blob_files, site_id, self.now_millis())?;
         prune_undo_locked(&mut tx, self.now_millis())?;
@@ -3817,7 +3850,9 @@ impl Store {
                 sanitized: sanitized_counts(files),
             });
         }
-        if let Some(site_id) = existing_site_id {
+        if let Some(site_id) = existing_site_id
+            && !archive_aliases.is_empty()
+        {
             validate_alias_graph_with_staged(tx, site_id, files, archive_aliases)?;
         }
         for file in files {
@@ -3935,6 +3970,16 @@ impl Store {
         diesel::update(sites::table.find(site_id))
             .set((sites::updated.eq(now), sites::content_revision.eq(revision)))
             .execute(tx)?;
+        let alias_changes = files
+            .iter()
+            .map(|file| AliasChange::Entry(file.path.as_str()))
+            .chain(
+                archive_aliases
+                    .iter()
+                    .map(|alias| AliasChange::Alias(alias.path)),
+            )
+            .collect::<Vec<_>>();
+        refresh_aliases_locked(tx, site_id, &alias_changes)?;
         refresh_expiry_for_changes_locked(tx, site_id, &changed_paths, now)?;
         let tree_hash = regenerate_site(tx, &self.inner.blob_files, site_id, now)?;
         prune_undo_locked(tx, now)?;
@@ -4039,7 +4084,7 @@ impl Store {
                     revision,
                     tree_hash,
                     undo: None,
-                    sanitized: TokenCounts::default(),
+                    sanitized: staged.sanitized,
                 }),
             };
             store_entry_mutation_with_request(
@@ -4077,7 +4122,7 @@ impl Store {
             revision,
             tree_hash,
             undo: Some(undo),
-            sanitized: TokenCounts::default(),
+            sanitized: staged.sanitized,
         };
         let result = AllocatedFile {
             path: path.to_string(),
@@ -4244,7 +4289,7 @@ impl Store {
                         revision,
                         tree_hash,
                         undo: None,
-                        sanitized: TokenCounts::default(),
+                        sanitized: staged.sanitized,
                     }),
                 });
             }
@@ -4311,7 +4356,7 @@ impl Store {
                         revision,
                         tree_hash,
                         undo: Some(undo),
-                        sanitized: TokenCounts::default(),
+                        sanitized: staged.sanitized,
                     }),
                 });
             }
@@ -4330,7 +4375,7 @@ impl Store {
                     revision,
                     tree_hash,
                     undo: None,
-                    sanitized: TokenCounts::default(),
+                    sanitized: staged.sanitized,
                 }),
             });
         }
@@ -4413,7 +4458,7 @@ impl Store {
                 revision,
                 tree_hash,
                 undo: Some(undo),
-                sanitized: TokenCounts::default(),
+                sanitized: staged.sanitized,
             }),
         })
     }
@@ -4434,30 +4479,17 @@ impl Store {
         path: &str,
     ) -> Result<StagedFile, StoreError> {
         match source {
-            AllocationSource::Bytes(bytes) => Ok(StagedFile {
-                path: path.to_string(),
-                size: i64::try_from(bytes.len()).map_err(|_| StoreError::SpliceResultTooLarge)?,
-                hash: blake3::hash(bytes).to_hex().to_string(),
-                source: StagedSource::Bytes(bytes.to_vec()),
-                sanitized: TokenCounts::default(),
-            }),
+            AllocationSource::Bytes(bytes) => Ok(stage_bytes(path, bytes)),
             AllocationSource::File(source) => {
                 let temporary = TemporaryDirectory::create(self.tmp_dir("source"))?;
                 let copied = temporary.path().join("content");
                 let mut input = fs::File::open(source)?;
                 let mut output = fs::File::create(&copied)?;
-                let mut hasher = blake3::Hasher::new();
-                let size = copy_all_hashed(&mut input, &mut output, &mut hasher)?;
+                io::copy(&mut input, &mut output)?;
                 output.sync_all()?;
-                let size = i64::try_from(size).map_err(|_| StoreError::SpliceResultTooLarge)?;
+                let staged = stage_temporary_file(path, copied)?;
                 temporary.persist();
-                Ok(StagedFile {
-                    path: path.to_string(),
-                    size,
-                    hash: hasher.finalize().to_hex().to_string(),
-                    source: StagedSource::Temporary(copied),
-                    sanitized: TokenCounts::default(),
-                })
+                Ok(staged)
             }
         }
     }
@@ -4637,6 +4669,7 @@ impl Store {
                 diesel::delete(sites::table.find(site_id)).execute(&mut *tx)?;
             } else {
                 rebuild_aggregates_locked(&mut tx, site_id)?;
+                refresh_all_aliases_locked(&mut tx, site_id)?;
                 regenerate_site(&mut tx, &self.inner.blob_files, site_id, self.now_millis())?;
             }
         }
@@ -5071,53 +5104,8 @@ impl Store {
         let rel = normalize_rel(rel)?;
         let now = self.now_millis();
         let mut db = self.inner.readers.get();
-        let kind = expiry_target_kind_locked(&mut db, name, &rel)?;
         let site_id = site_id_locked(&mut db, name)?;
-        let size = expiry_target_size_locked(&mut db, site_id, &rel, kind)?;
-        let own = load_expiry_policy_locked(&mut db, site_id, &rel)?;
-        let mut inherited = Vec::new();
-        for ancestor in expiry_ancestor_paths(&rel) {
-            if let Some(stored) = load_expiry_policy_locked(&mut db, site_id, &ancestor)? {
-                inherited.push((ancestor, stored));
-            }
-        }
-        let own_policy = own.map(own_expiry_report);
-        let mut effective = own.map(|stored| stored.own_deadline_millis);
-        let mut limited_by = None;
-        let inherited_caps = inherited
-            .into_iter()
-            .map(|(path, stored)| {
-                if effective.is_none_or(|deadline| stored.own_deadline_millis < deadline) {
-                    effective = Some(stored.own_deadline_millis);
-                    limited_by = Some(ExpiryLimit {
-                        kind: stored.kind,
-                        path: (!path.is_empty()).then_some(path.clone()),
-                    });
-                }
-                InheritedExpiryCap {
-                    kind: stored.kind,
-                    path: (!path.is_empty()).then_some(path),
-                    expires_at: format_timestamp(stored.own_deadline_millis),
-                }
-            })
-            .collect();
-        Ok(ExpiryReport {
-            target: ExpiryTarget {
-                site: name.to_string(),
-                path: (!rel.is_empty()).then_some(rel),
-                kind,
-            },
-            size,
-            refreshed_at: own
-                .and_then(|stored| stored.refreshed_millis)
-                .map(format_timestamp),
-            own_policy,
-            inherited_caps,
-            effective_expires_at: effective.map(format_timestamp),
-            remaining_seconds: effective
-                .map(|deadline| remaining_seconds(deadline / 1000, now / 1000)),
-            limited_by,
-        })
+        expiry_report_locked(&mut db, name, site_id, &rel, now)
     }
 
     pub fn next_expiry_delay(&self) -> Result<std::time::Duration, StoreError> {
@@ -5309,6 +5297,7 @@ impl Store {
                 ))
                 .execute(&mut *tx)?;
             rebuild_aggregates_locked(&mut tx, site_id)?;
+            refresh_all_aliases_locked(&mut tx, site_id)?;
             regenerate_site(&mut tx, &self.inner.blob_files, site_id, now)?;
         }
         tx.commit()?;
@@ -5669,6 +5658,7 @@ fn parse_pending_request_metadata(value: &str) -> Result<PendingRequestMetadata,
             extension: None,
             expected_tree_hash: None,
             legacy_fingerprint: true,
+            sanitized: TokenCounts::default(),
         });
     }
     serde_json::from_str(value)
@@ -5913,20 +5903,6 @@ pub fn validate_mutation_target(path: &str) -> Result<(), StoreError> {
     reject_reserved_path(&path)
 }
 
-fn reject_staged_secrets(staged: &StagedFile) -> Result<(), StoreError> {
-    let counts = match &staged.source {
-        StagedSource::Bytes(bytes) => sanitize::redact_tokens(bytes).counts(),
-        StagedSource::File(path) | StagedSource::Temporary(path) => {
-            sanitize::count_reader(fs::File::open(path)?)?
-        }
-    };
-    if counts.total() == 0 {
-        Ok(())
-    } else {
-        Err(StoreError::SecretContent)
-    }
-}
-
 fn ensure_blob_locked(
     tx: &mut SqliteConnection,
     staged: &StagedFile,
@@ -6025,7 +6001,11 @@ fn finish_entry_mutation(
             sites::content_revision.eq(sites::content_revision + 1),
         ))
         .execute(tx)?;
-    refresh_aliases_locked(tx, site_id)?;
+    let alias_changes = paths
+        .iter()
+        .map(|path| AliasChange::Entry(path))
+        .collect::<Vec<_>>();
+    refresh_aliases_locked(tx, site_id, &alias_changes)?;
     refresh_expiry_for_changes_locked(tx, site_id, paths, now)?;
     regenerate_site(tx, blob_files, site_id, now)?;
     prune_undo_locked(tx, now)?;
@@ -6048,16 +6028,21 @@ fn prepare_splices(
     let mut prepared = Vec::with_capacity(splices.len());
     let mut staged_bytes = 0_u64;
     for (index, splice) in splices.iter().enumerate() {
-        let insert = match splice.insert {
-            SpliceSource::Empty => PreparedSpliceSource::Empty,
+        let (insert, sanitized) = match splice.insert {
+            SpliceSource::Empty => (PreparedSpliceSource::Empty, TokenCounts::default()),
             SpliceSource::Bytes(bytes) => {
+                let redacted = sanitize::redact_tokens(bytes);
+                let bytes = redacted.as_bytes();
                 staged_bytes = staged_bytes
                     .checked_add(u64::try_from(bytes.len()).expect("slice length fits in u64"))
                     .ok_or(StoreError::SpliceResultTooLarge)?;
                 if staged_bytes > maximum_staged_bytes {
                     return Err(StoreError::SpliceResultTooLarge);
                 }
-                PreparedSpliceSource::Bytes(bytes.to_vec())
+                (
+                    PreparedSpliceSource::Bytes(bytes.to_vec()),
+                    redacted.counts(),
+                )
             }
             SpliceSource::File(path) => {
                 let copied = temporary.join(format!("insert-{index}"));
@@ -6067,24 +6052,31 @@ fn prepare_splices(
                     .checked_sub(staged_bytes)
                     .ok_or(StoreError::SpliceResultTooLarge)?;
                 let mut limited = (&mut source).take(remaining.saturating_add(1));
-                let mut hasher = blake3::Hasher::new();
-                let size = copy_all_hashed(&mut limited, &mut target, &mut hasher)?;
+                let size = io::copy(&mut limited, &mut target)?;
                 if size > remaining {
                     return Err(StoreError::SpliceResultTooLarge);
                 }
                 staged_bytes += size;
                 target.sync_all()?;
-                PreparedSpliceSource::File {
-                    path: copied,
-                    size,
-                    hash: hasher.finalize().to_hex().to_string(),
-                }
+                drop(target);
+                let (sanitized_size, hash, sanitized) = sanitized_file_properties(&copied)?;
+                let sanitized_size = sanitized_size.cast_unsigned();
+                debug_assert_eq!(sanitized_size, size);
+                (
+                    PreparedSpliceSource::File {
+                        path: copied,
+                        size: sanitized_size,
+                        hash,
+                    },
+                    sanitized,
+                )
             }
         };
         prepared.push(PreparedSplice {
             offset: splice.offset,
             delete: splice.delete,
             insert,
+            sanitized,
         });
     }
     Ok(prepared)
@@ -7300,11 +7292,19 @@ fn restore_entry_deltas(
         .filter(undo_alias_deltas::token.eq(token))
         .select(UndoAliasRow::as_select())
         .load::<UndoAliasRow>(tx)?;
-    let changed_paths = file_deltas
+    let entry_change_paths = file_deltas
         .iter()
-        .map(|row| row.0.as_str())
-        .chain(allocated_deltas.iter().map(|row| row.path.as_str()))
-        .chain(alias_deltas.iter().map(|row| row.path.as_str()))
+        .map(|row| row.0.clone())
+        .chain(allocated_deltas.iter().map(|row| row.path.clone()))
+        .collect::<Vec<_>>();
+    let alias_change_paths = alias_deltas
+        .iter()
+        .map(|row| row.path.clone())
+        .collect::<Vec<_>>();
+    let changed_paths = entry_change_paths
+        .iter()
+        .chain(&alias_change_paths)
+        .map(String::as_str)
         .collect::<Vec<_>>();
     for paths in changed_paths.chunks(512) {
         diesel::delete(
@@ -7396,6 +7396,16 @@ fn restore_entry_deltas(
     diesel::update(sites::table.find(site_id))
         .set(sites::content_revision.eq(content_revision))
         .execute(tx)?;
+    let alias_changes = entry_change_paths
+        .iter()
+        .map(|path| AliasChange::Entry(path))
+        .chain(
+            alias_change_paths
+                .iter()
+                .map(|path| AliasChange::Alias(path)),
+        )
+        .collect::<Vec<_>>();
+    refresh_aliases_locked(tx, site_id, &alias_changes)?;
     regenerate_site(tx, blob_files, site_id, updated)?;
     Ok(updated)
 }
@@ -7891,6 +7901,131 @@ fn own_expiry_report(stored: StoredExpiryPolicy) -> OwnExpiryReport {
     }
 }
 
+struct ExpiryReportState {
+    report: ExpiryReport,
+    effective_millis: Option<i64>,
+}
+
+fn base_expiry_report_locked(
+    db: &mut SqliteConnection,
+    name: &str,
+    site_id: i64,
+    rel: &str,
+    now: i64,
+) -> Result<ExpiryReportState, StoreError> {
+    let kind = expiry_target_kind_locked(db, name, rel)?;
+    let size = expiry_target_size_locked(db, site_id, rel, kind)?;
+    let own = load_expiry_policy_locked(db, site_id, rel)?;
+    let mut inherited = Vec::new();
+    for ancestor in expiry_ancestor_paths(rel) {
+        if let Some(stored) = load_expiry_policy_locked(db, site_id, &ancestor)? {
+            inherited.push((ancestor, stored));
+        }
+    }
+    let own_policy = own.map(own_expiry_report);
+    let mut effective = own.map(|stored| stored.own_deadline_millis);
+    let mut limited_by = None;
+    let inherited_caps = inherited
+        .into_iter()
+        .map(|(path, stored)| {
+            if effective.is_none_or(|deadline| stored.own_deadline_millis < deadline) {
+                effective = Some(stored.own_deadline_millis);
+                limited_by = Some(ExpiryLimit {
+                    kind: stored.kind,
+                    path: (!path.is_empty()).then_some(path.clone()),
+                });
+            }
+            InheritedExpiryCap {
+                kind: stored.kind,
+                path: (!path.is_empty()).then_some(path),
+                expires_at: format_timestamp(stored.own_deadline_millis),
+            }
+        })
+        .collect();
+    Ok(ExpiryReportState {
+        report: ExpiryReport {
+            target: ExpiryTarget {
+                site: name.to_string(),
+                path: (!rel.is_empty()).then(|| rel.to_string()),
+                kind,
+            },
+            size,
+            refreshed_at: own
+                .and_then(|stored| stored.refreshed_millis)
+                .map(format_timestamp),
+            own_policy,
+            inherited_caps,
+            effective_expires_at: effective.map(format_timestamp),
+            remaining_seconds: effective
+                .map(|deadline| remaining_seconds(deadline / 1000, now / 1000)),
+            limited_by,
+        },
+        effective_millis: effective,
+    })
+}
+
+fn effective_expiry_source(report: &ExpiryReport) -> ExpiryLimit {
+    report.limited_by.clone().unwrap_or_else(|| ExpiryLimit {
+        kind: report.target.kind,
+        path: report.target.path.clone(),
+    })
+}
+
+fn apply_resolved_expiry_cap(state: &mut ExpiryReportState, cap: &ExpiryReportState, now: i64) {
+    let Some(deadline) = cap.effective_millis else {
+        return;
+    };
+    let source = effective_expiry_source(&cap.report);
+    let expires_at = format_timestamp(deadline);
+    if !state.report.inherited_caps.iter().any(|existing| {
+        existing.kind == source.kind
+            && existing.path == source.path
+            && existing.expires_at == expires_at
+    }) {
+        state.report.inherited_caps.push(InheritedExpiryCap {
+            kind: source.kind,
+            path: source.path.clone(),
+            expires_at,
+        });
+    }
+    if state
+        .effective_millis
+        .is_none_or(|current| deadline < current)
+    {
+        state.effective_millis = Some(deadline);
+        state.report.effective_expires_at = Some(format_timestamp(deadline));
+        state.report.remaining_seconds = Some(remaining_seconds(deadline / 1000, now / 1000));
+        state.report.limited_by = Some(source);
+    }
+}
+
+fn expiry_report_locked(
+    db: &mut SqliteConnection,
+    name: &str,
+    site_id: i64,
+    rel: &str,
+    now: i64,
+) -> Result<ExpiryReport, StoreError> {
+    let mut state = base_expiry_report_locked(db, name, site_id, rel, now)?;
+    let (resolution, physical, dependencies) = resolve_db_path_trace(db, site_id, rel)?;
+    let mut capped_paths = BTreeSet::new();
+    for dependency in dependencies {
+        if dependency == rel || !capped_paths.insert(dependency.clone()) {
+            continue;
+        }
+        let cap = base_expiry_report_locked(db, name, site_id, &dependency, now)?;
+        apply_resolved_expiry_cap(&mut state, &cap, now);
+    }
+    if !matches!(resolution, GraphResolution::Missing)
+        && physical != rel
+        && capped_paths.insert(physical.clone())
+    {
+        let cap = base_expiry_report_locked(db, name, site_id, &physical, now)?;
+        apply_resolved_expiry_cap(&mut state, &cap, now);
+    }
+    Ok(state.report)
+}
+
 fn expiry_ancestor_paths(rel: &str) -> Vec<String> {
     if rel.is_empty() {
         return Vec::new();
@@ -7954,35 +8089,31 @@ fn refresh_expiry_for_changes_locked(
     changed_paths: &[&str],
     now: i64,
 ) -> Result<(), StoreError> {
-    let alias_rows = aliases::table
-        .filter(aliases::site_id.eq(site_id))
-        .select((
-            aliases::path,
-            aliases::canonical_target,
-            aliases::resolved_kind,
-        ))
-        .load::<(String, String, Option<i64>)>(tx)?;
-    let alias_kinds = alias_rows
-        .iter()
-        .map(|(path, _, kind)| (path.as_str(), *kind))
-        .collect::<HashMap<_, _>>();
-    let alias_graph = alias_rows
-        .iter()
-        .map(|(path, target, _)| (path.clone(), target.clone()))
-        .collect::<BTreeMap<_, _>>();
-    let real_entries = load_real_entries(tx, site_id)?;
     let policies = expiry_policies::table
         .filter(expiry_policies::site_id.eq(site_id))
         .select((expiry_policies::path, expiry_policies::target_kind))
         .load::<(String, i64)>(tx)?;
+    if policies.is_empty() {
+        return Ok(());
+    }
+    let policy_paths = policies.iter().map(|(path, _)| path).collect::<Vec<_>>();
+    let mut alias_kinds = HashMap::new();
+    for chunk in policy_paths.chunks(30_000) {
+        alias_kinds.extend(
+            aliases::table
+                .filter(aliases::site_id.eq(site_id))
+                .filter(aliases::path.eq_any(chunk))
+                .select((aliases::path, aliases::resolved_kind))
+                .load::<(String, Option<i64>)>(tx)?,
+        );
+    }
     for (path, raw_kind) in policies {
         let stored_kind = ExpiryTargetKind::try_from(raw_kind)?;
         let directly_affected = changed_paths
             .iter()
             .any(|changed| policy_is_affected(&path, stored_kind, changed));
-        let alias_dependency_affected = if alias_graph.contains_key(&path) {
-            let (_, target, dependencies) =
-                resolve_graph_path_trace(&real_entries, &alias_graph, &path)?;
+        let alias_dependency_affected = if alias_kinds.contains_key(&path) {
+            let (_, target, dependencies) = resolve_db_path_trace(tx, site_id, &path)?;
             changed_paths.iter().any(|changed| {
                 dependencies.iter().any(|dependency| *changed == dependency)
                     || *changed == target
@@ -8002,7 +8133,7 @@ fn refresh_expiry_for_changes_locked(
         let Some(stored) = load_expiry_policy_locked(tx, site_id, &path)? else {
             continue;
         };
-        let kind = match alias_kinds.get(path.as_str()) {
+        let kind = match alias_kinds.get(&path) {
             Some(Some(kind)) if *kind == AliasResolvedKind::File as i64 => ExpiryTargetKind::File,
             Some(Some(kind)) if *kind == AliasResolvedKind::Directory as i64 => {
                 ExpiryTargetKind::Folder
@@ -8056,7 +8187,7 @@ fn finish_partial_expiry_locked(
     diesel::update(sites::table.find(site_id))
         .set(sites::content_revision.eq(sites::content_revision + 1))
         .execute(tx)?;
-    refresh_aliases_locked(tx, site_id)?;
+    refresh_aliases_locked(tx, site_id, &[AliasChange::Subtree(changed_path)])?;
     refresh_expiry_for_changes_locked(tx, site_id, &[changed_path], now)?;
     regenerate_site(tx, blobs, site_id, now)?;
     Ok(())
@@ -8069,7 +8200,6 @@ fn regenerate_site(
     site_id: i64,
     updated: i64,
 ) -> Result<String, StoreError> {
-    refresh_aliases_locked(tx, site_id)?;
     let (name, public_url, revision, management_status) = sites::table
         .find(site_id)
         .select((
@@ -8339,6 +8469,25 @@ enum GraphResolution {
     File(RealEntry),
 }
 
+#[derive(Clone, Copy)]
+enum AliasChange<'a> {
+    Entry(&'a str),
+    Alias(&'a str),
+    Subtree(&'a str),
+}
+
+impl<'a> AliasChange<'a> {
+    const fn path(self) -> &'a str {
+        match self {
+            Self::Entry(path) | Self::Alias(path) | Self::Subtree(path) => path,
+        }
+    }
+
+    const fn includes_target_descendants(self) -> bool {
+        matches!(self, Self::Alias(_) | Self::Subtree(_))
+    }
+}
+
 fn load_real_entries(
     db: &mut SqliteConnection,
     site_id: i64,
@@ -8434,13 +8583,183 @@ fn resolve_graph_path_trace(
     Err(StoreError::AliasHopLimit)
 }
 
-fn refresh_aliases_locked(tx: &mut SqliteConnection, site_id: i64) -> Result<(), StoreError> {
+fn load_alias_rows_at_paths(
+    tx: &mut SqliteConnection,
+    site_id: i64,
+    paths: &BTreeSet<String>,
+) -> Result<Vec<AliasRow>, StoreError> {
+    let mut rows = Vec::new();
+    for chunk in paths.iter().collect::<Vec<_>>().chunks(30_000) {
+        rows.extend(
+            aliases::table
+                .filter(aliases::site_id.eq(site_id))
+                .filter(aliases::path.eq_any(chunk))
+                .select(AliasRow::as_select())
+                .load::<AliasRow>(tx)?,
+        );
+    }
+    Ok(rows)
+}
+
+fn load_alias_rows_for_exact_targets(
+    tx: &mut SqliteConnection,
+    site_id: i64,
+    targets: &BTreeSet<String>,
+) -> Result<Vec<AliasRow>, StoreError> {
+    let mut rows = Vec::new();
+    for chunk in targets.iter().collect::<Vec<_>>().chunks(30_000) {
+        rows.extend(
+            aliases::table
+                .filter(aliases::site_id.eq(site_id))
+                .filter(aliases::canonical_target.eq_any(chunk))
+                .select(AliasRow::as_select())
+                .load::<AliasRow>(tx)?,
+        );
+    }
+    Ok(rows)
+}
+
+fn alias_dependency_targets(paths: impl IntoIterator<Item = String>) -> BTreeSet<String> {
+    let mut targets = BTreeSet::new();
+    for path in paths {
+        if path.is_empty() {
+            continue;
+        }
+        targets.insert(path.clone());
+        targets.extend(
+            aggregate_paths(&path)
+                .into_iter()
+                .filter(|ancestor| !ancestor.is_empty())
+                .map(str::to_string),
+        );
+    }
+    targets
+}
+
+fn add_affected_alias_rows(
+    affected: &mut BTreeMap<String, AliasRow>,
+    pending: &mut Vec<String>,
+    rows: Vec<AliasRow>,
+) {
+    record_alias_refresh_rows(0, rows.len());
+    for row in rows {
+        if affected.contains_key(&row.path) {
+            continue;
+        }
+        pending.push(row.path.clone());
+        affected.insert(row.path.clone(), row);
+    }
+}
+
+fn refresh_aliases_locked(
+    tx: &mut SqliteConnection,
+    site_id: i64,
+    changes: &[AliasChange<'_>],
+) -> Result<(), StoreError> {
+    const FULL_REFRESH_THRESHOLD: usize = 512;
+
+    if changes.is_empty() {
+        return Ok(());
+    }
+    let changed_paths = changes
+        .iter()
+        .map(|change| change.path().to_string())
+        .collect::<BTreeSet<_>>();
+    let mut affected = BTreeMap::new();
+    let mut pending = changes
+        .iter()
+        .filter(|change| change.includes_target_descendants())
+        .map(|change| change.path().to_string())
+        .collect::<Vec<_>>();
+    add_affected_alias_rows(
+        &mut affected,
+        &mut pending,
+        load_alias_rows_at_paths(tx, site_id, &changed_paths)?,
+    );
+    let dependency_targets = alias_dependency_targets(changed_paths.iter().cloned());
+    add_affected_alias_rows(
+        &mut affected,
+        &mut pending,
+        load_alias_rows_for_exact_targets(tx, site_id, &dependency_targets)?,
+    );
+    if affected.len() > FULL_REFRESH_THRESHOLD {
+        return refresh_all_aliases_locked(tx, site_id);
+    }
+
+    let mut expanded = BTreeSet::new();
+    let mut cursor = 0;
+    while cursor < pending.len() {
+        let path = pending[cursor].clone();
+        cursor += 1;
+        if path.is_empty() || !expanded.insert(path.clone()) {
+            continue;
+        }
+        let targets = alias_dependency_targets(std::iter::once(path.clone()));
+        add_affected_alias_rows(
+            &mut affected,
+            &mut pending,
+            load_alias_rows_for_exact_targets(tx, site_id, &targets)?,
+        );
+        let (start, end) = descendant_bounds(&path);
+        let descendants = aliases::table
+            .filter(aliases::site_id.eq(site_id))
+            .filter(aliases::canonical_target.ge(start))
+            .filter(aliases::canonical_target.lt(end))
+            .select(AliasRow::as_select())
+            .load::<AliasRow>(tx)?;
+        add_affected_alias_rows(&mut affected, &mut pending, descendants);
+        if affected.len() > FULL_REFRESH_THRESHOLD {
+            return refresh_all_aliases_locked(tx, site_id);
+        }
+    }
+
+    for row in affected.into_values() {
+        let (resolution, final_target, _) =
+            resolve_db_path_final(tx, site_id, &row.canonical_target)?;
+        if matches!(resolution, GraphResolution::Directory)
+            && row
+                .path
+                .strip_prefix(&final_target)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+        {
+            return Err(StoreError::AliasCycle);
+        }
+        let value = match resolution {
+            GraphResolution::Missing => (None, None, None),
+            GraphResolution::Directory => (Some(AliasResolvedKind::Directory as i64), None, None),
+            GraphResolution::File(file) => (
+                Some(AliasResolvedKind::File as i64),
+                Some(file.hash),
+                Some(file.size),
+            ),
+        };
+        resolve_db_path_final(tx, site_id, &row.path)?;
+        if (
+            row.resolved_kind,
+            row.resolved_hash.as_ref(),
+            row.resolved_size,
+        ) != (value.0, value.1.as_ref(), value.2)
+        {
+            diesel::update(aliases::table.find((site_id, row.path.as_str())))
+                .set((
+                    aliases::resolved_kind.eq(value.0),
+                    aliases::resolved_hash.eq(value.1),
+                    aliases::resolved_size.eq(value.2),
+                ))
+                .execute(tx)?;
+        }
+    }
+    Ok(())
+}
+
+fn refresh_all_aliases_locked(tx: &mut SqliteConnection, site_id: i64) -> Result<(), StoreError> {
     let real = load_real_entries(tx, site_id)?;
     let rows = aliases::table
         .filter(aliases::site_id.eq(site_id))
         .select(AliasRow::as_select())
         .order(aliases::path)
         .load::<AliasRow>(tx)?;
+    record_alias_refresh_rows(real.len(), rows.len());
     let graph = rows
         .iter()
         .map(|row| (row.path.clone(), row.canonical_target.clone()))
@@ -8606,26 +8925,71 @@ fn reject_alias_writes_locked<'a>(
     paths: impl IntoIterator<Item = &'a str>,
     allow_exact: bool,
 ) -> Result<(), StoreError> {
-    let alias_paths = aliases::table
-        .filter(aliases::site_id.eq(site_id))
-        .select(aliases::path)
-        .load::<String>(db)?
-        .into_iter()
+    let paths = paths.into_iter().collect::<Vec<_>>();
+    let mut exact_conflicts = paths
+        .iter()
+        .flat_map(|path| aggregate_paths(path))
+        .filter(|ancestor| !ancestor.is_empty())
+        .map(str::to_string)
         .collect::<BTreeSet<_>>();
-    for path in paths {
-        let ancestor_conflict = aggregate_paths(path)
-            .into_iter()
-            .filter(|ancestor| !ancestor.is_empty())
-            .any(|ancestor| alias_paths.contains(ancestor));
-        let (descendant_start, descendant_end) = descendant_bounds(path);
-        let descendant_conflict = alias_paths
-            .range(descendant_start..descendant_end)
-            .next()
+    if !allow_exact {
+        exact_conflicts.extend(paths.iter().map(|path| (*path).to_string()));
+    }
+    for chunk in exact_conflicts.iter().collect::<Vec<_>>().chunks(30_000) {
+        let found = aliases::table
+            .filter(aliases::site_id.eq(site_id))
+            .filter(aliases::path.eq_any(chunk))
+            .select(aliases::site_id)
+            .first::<i64>(db)
+            .optional()?
             .is_some();
-        if (!allow_exact && alias_paths.contains(path))
-            || ancestor_conflict
-            || (!allow_exact && descendant_conflict)
-        {
+        if found {
+            return Err(StoreError::AliasWrite);
+        }
+    }
+    if allow_exact {
+        return Ok(());
+    }
+    if paths.len() <= 512 {
+        for path in paths {
+            let (start, end) = descendant_bounds(path);
+            let found = aliases::table
+                .filter(aliases::site_id.eq(site_id))
+                .filter(aliases::path.ge(start))
+                .filter(aliases::path.lt(end))
+                .select(aliases::site_id)
+                .first::<i64>(db)
+                .optional()?
+                .is_some();
+            if found {
+                return Err(StoreError::AliasWrite);
+            }
+        }
+        return Ok(());
+    }
+
+    let changed = paths
+        .iter()
+        .map(|path| (*path).to_string())
+        .collect::<BTreeSet<_>>();
+    let top_levels = paths
+        .iter()
+        .filter_map(|path| path.split('/').next())
+        .collect::<BTreeSet<_>>();
+    for top_level in top_levels {
+        let (start, end) = descendant_bounds(top_level);
+        let candidates = aliases::table
+            .filter(aliases::site_id.eq(site_id))
+            .filter(aliases::path.ge(start))
+            .filter(aliases::path.lt(end))
+            .select(aliases::path)
+            .load::<String>(db)?;
+        if candidates.into_iter().any(|candidate| {
+            aggregate_paths(&candidate)
+                .into_iter()
+                .filter(|ancestor| !ancestor.is_empty())
+                .any(|ancestor| changed.contains(ancestor))
+        }) {
             return Err(StoreError::AliasWrite);
         }
     }
@@ -8797,9 +9161,18 @@ fn resolve_db_path_final(
     site_id: i64,
     initial: &str,
 ) -> Result<(GraphResolution, String, bool), StoreError> {
+    resolve_db_path_trace(db, site_id, initial)
+        .map(|(resolution, path, dependencies)| (resolution, path, !dependencies.is_empty()))
+}
+
+fn resolve_db_path_trace(
+    db: &mut SqliteConnection,
+    site_id: i64,
+    initial: &str,
+) -> Result<(GraphResolution, String, Vec<String>), StoreError> {
     let mut path = initial.to_string();
     let mut visited = HashSet::new();
-    let mut used_alias = false;
+    let mut dependencies = Vec::new();
     for _ in 0..MAX_ALIAS_HOPS {
         if !visited.insert(path.clone()) {
             return Err(StoreError::AliasCycle);
@@ -8814,7 +9187,7 @@ fn resolve_db_path_final(
             return Ok((
                 GraphResolution::File(RealEntry { hash, size }),
                 path,
-                used_alias,
+                dependencies,
             ));
         }
         let allocated = allocated_entries::table
@@ -8827,7 +9200,7 @@ fn resolve_db_path_final(
             return Ok((
                 GraphResolution::File(RealEntry { hash, size }),
                 path,
-                used_alias,
+                dependencies,
             ));
         }
         let mut candidates = aggregate_paths(&path)
@@ -8848,8 +9221,8 @@ fn resolve_db_path_final(
             .max_by_key(|(prefix, _)| prefix.len())
         {
             let suffix = &path[prefix.len()..];
+            dependencies.push(prefix.clone());
             path = format!("{target}{suffix}");
-            used_alias = true;
             continue;
         }
         let (start, end) = descendant_bounds(&path);
@@ -8891,9 +9264,9 @@ fn resolve_db_path_final(
             found
         };
         if file_descendant || allocated_descendant || alias_descendant {
-            return Ok((GraphResolution::Directory, path, used_alias));
+            return Ok((GraphResolution::Directory, path, dependencies));
         }
-        return Ok((GraphResolution::Missing, path, used_alias));
+        return Ok((GraphResolution::Missing, path, dependencies));
     }
     Err(StoreError::AliasHopLimit)
 }
@@ -9206,6 +9579,51 @@ fn collect_stage(base: &Path, dir: &Path, out: &mut Vec<StagedFile>) -> io::Resu
         }
     }
     Ok(())
+}
+
+fn sanitized_file_properties(source: &Path) -> Result<(i64, String, TokenCounts), StoreError> {
+    let sanitized = sanitize::sanitize_file(source)?;
+    let mut file = fs::File::open(source)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut size = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        size = size
+            .checked_add(u64::try_from(read).expect("read size fits in u64"))
+            .ok_or(StoreError::SpliceResultTooLarge)?;
+    }
+    Ok((
+        i64::try_from(size).map_err(|_| StoreError::SpliceResultTooLarge)?,
+        hasher.finalize().to_hex().to_string(),
+        sanitized,
+    ))
+}
+
+fn stage_temporary_file(path: &str, source: PathBuf) -> Result<StagedFile, StoreError> {
+    let (size, hash, sanitized) = sanitized_file_properties(&source)?;
+    Ok(StagedFile {
+        path: path.to_string(),
+        size,
+        hash,
+        source: StagedSource::Temporary(source),
+        sanitized,
+    })
+}
+
+fn stage_borrowed_file(path: &str, source: PathBuf) -> Result<StagedFile, StoreError> {
+    let (size, hash, sanitized) = sanitized_file_properties(&source)?;
+    Ok(StagedFile {
+        path: path.to_string(),
+        size,
+        hash,
+        source: StagedSource::File(source),
+        sanitized,
+    })
 }
 
 fn stage_bytes(path: &str, bytes: &[u8]) -> StagedFile {
@@ -10443,6 +10861,186 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn alias_expiry_caps_follow_targets_chains_directories_and_dangling_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(TestClock::new(1_700_000_000_000));
+        let store = Store::with_clock(
+            dir.path().to_path_buf(),
+            "http://symbol".to_string(),
+            Arc::<TestClock>::clone(&clock),
+        )
+        .unwrap();
+        store
+            .put_file("alias-caps", "target.txt", b"target")
+            .unwrap();
+        store
+            .put_file("alias-caps", "directory/item.txt", b"item")
+            .unwrap();
+        store
+            .put_file("alias-caps", "links/anchor.txt", b"anchor")
+            .unwrap();
+        let target = store
+            .set_expiry(
+                "alias-caps",
+                "target.txt",
+                Some(ExpiryPolicy::Relative {
+                    duration_seconds: 80,
+                }),
+            )
+            .unwrap()
+            .report;
+        let directory_item = store
+            .set_expiry(
+                "alias-caps",
+                "directory/item.txt",
+                Some(ExpiryPolicy::Relative {
+                    duration_seconds: 30,
+                }),
+            )
+            .unwrap()
+            .report;
+        store
+            .put_aliases(
+                "alias-caps",
+                &[
+                    AliasSpec {
+                        path: "links/target-capped",
+                        target: "../target.txt",
+                    },
+                    AliasSpec {
+                        path: "links/direct",
+                        target: "../target.txt",
+                    },
+                    AliasSpec {
+                        path: "links/chain",
+                        target: "direct",
+                    },
+                    AliasSpec {
+                        path: "view",
+                        target: "directory",
+                    },
+                    AliasSpec {
+                        path: "dangling",
+                        target: "missing",
+                    },
+                ],
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        store
+            .set_expiry(
+                "alias-caps",
+                "links",
+                Some(ExpiryPolicy::Relative {
+                    duration_seconds: 120,
+                }),
+            )
+            .unwrap();
+        let direct = store
+            .set_expiry(
+                "alias-caps",
+                "links/direct",
+                Some(ExpiryPolicy::Relative {
+                    duration_seconds: 40,
+                }),
+            )
+            .unwrap()
+            .report;
+        store
+            .set_expiry(
+                "alias-caps",
+                "links/chain",
+                Some(ExpiryPolicy::Relative {
+                    duration_seconds: 60,
+                }),
+            )
+            .unwrap();
+        let dangling = store
+            .set_expiry(
+                "alias-caps",
+                "dangling",
+                Some(ExpiryPolicy::Relative {
+                    duration_seconds: 45,
+                }),
+            )
+            .unwrap()
+            .report;
+
+        assert_eq!(
+            store
+                .expiry_report("alias-caps", "links/target-capped")
+                .unwrap()
+                .effective_expires_at,
+            target.effective_expires_at
+        );
+        assert_eq!(
+            store
+                .expiry_report("alias-caps", "links/chain")
+                .unwrap()
+                .effective_expires_at,
+            direct.effective_expires_at
+        );
+        assert_eq!(
+            store
+                .expiry_report("alias-caps", "view/item.txt")
+                .unwrap()
+                .effective_expires_at,
+            directory_item.effective_expires_at
+        );
+        assert_eq!(
+            store
+                .expiry_report("alias-caps", "dangling")
+                .unwrap()
+                .effective_expires_at,
+            dangling.effective_expires_at
+        );
+    }
+
+    #[test]
+    fn unrelated_write_refreshes_only_affected_alias_closure() {
+        const ALIAS_COUNT: usize = 4096;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+        store
+            .put_file("alias-refresh", "target.txt", b"target")
+            .unwrap();
+        let paths = (0..ALIAS_COUNT)
+            .map(|index| format!("links/{index:04}.txt"))
+            .collect::<Vec<_>>();
+        let specs = paths
+            .iter()
+            .map(|path| AliasSpec {
+                path,
+                target: "../target.txt",
+            })
+            .collect::<Vec<_>>();
+        store
+            .put_aliases("alias-refresh", &specs, FileMutationOptions::default())
+            .unwrap();
+
+        reset_alias_refresh_row_work();
+        store
+            .put_file("alias-refresh", "unrelated/new.txt", b"new")
+            .unwrap();
+        let work = alias_refresh_row_work();
+        assert!(
+            work.aliases <= 2,
+            "unrelated write loaded {} of {ALIAS_COUNT} aliases",
+            work.aliases
+        );
+        assert!(
+            work.real <= 2,
+            "unrelated write loaded {} unrelated real entries",
+            work.real
+        );
+        assert!(matches!(
+            store.lookup("alias-refresh", "links/4095.txt"),
+            Ok(Node::File { .. })
+        ));
+    }
+
+    #[test]
     fn directory_alias_listing_row_work_is_prefix_bounded() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::new(dir.path().to_path_buf()).unwrap();
@@ -10518,6 +11116,58 @@ mod tests {
         assert_eq!(work.aliases, 2);
         assert_eq!(work.aggregates, 1);
         assert!(work.resolution <= 12);
+    }
+
+    #[test]
+    fn alias_paths_reject_controls_and_noise_but_preserve_safe_punctuation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+        store
+            .put_file("alias-paths", "target.txt", b"target")
+            .unwrap();
+        for invalid in [
+            "line\nbreak",
+            "carriage\rreturn",
+            "tab\tpath",
+            "bell\u{7}path",
+            ".DS_Store",
+            "nested/Thumbs.db",
+            "nested/._resource",
+        ] {
+            assert!(matches!(
+                store.put_alias(
+                    "alias-paths",
+                    invalid,
+                    "target.txt",
+                    FileMutationOptions::default()
+                ),
+                Err(StoreError::InvalidAliasTarget)
+            ));
+        }
+
+        let safe = "safe/quote\" ' []{}=+,;!@~$^&()#%?.txt";
+        store
+            .put_alias(
+                "alias-paths",
+                safe,
+                "../target.txt",
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        assert!(matches!(
+            store.lookup("alias-paths", safe),
+            Ok(Node::File { .. })
+        ));
+        let Node::File { hash, .. } = store.lookup("alias-paths", MANIFEST_PATH).unwrap() else {
+            panic!("manifest must be a file");
+        };
+        let manifest = String::from_utf8(store.read_blob(&hash).unwrap().to_vec()).unwrap();
+        let parsed = toml::from_str::<toml::Value>(&manifest).unwrap();
+        assert_eq!(
+            parsed["aliases"][safe].as_str(),
+            Some("target.txt"),
+            "safe punctuation must round-trip through generated TOML"
+        );
     }
 
     #[test]
@@ -12189,6 +12839,142 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
+    fn allocation_replacement_and_splice_redact_before_hashing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+        store
+            .put_file("sanitize-mutations", "regular.txt", b"before")
+            .unwrap();
+        store
+            .put_file("sanitize-mutations", "splice.txt", b"prefix:")
+            .unwrap();
+        let management = format!("sym_mgmt_{}", "a".repeat(64));
+        let claim = format!("sym_claim_{}", "b".repeat(64));
+        let redacted_management = format!("sym_mgmt_{}", "*".repeat(64));
+        let redacted_claim = format!("sym_claim_{}", "*".repeat(64));
+        let allocation_input = format!("{management}\n{claim}");
+        let allocation_output = format!("{redacted_management}\n{redacted_claim}");
+
+        let allocated = store
+            .allocate_bytes(
+                "sanitize-mutations",
+                allocation_input.as_bytes(),
+                AllocationSpec::default(),
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            allocated.mutation.as_ref().unwrap().sanitized,
+            TokenCounts {
+                management: 1,
+                claim: 1
+            }
+        );
+        assert_eq!(
+            allocated.hash,
+            blake3::hash(allocation_output.as_bytes())
+                .to_hex()
+                .to_string()
+        );
+        assert!(allocated.path.contains(&allocated.hash));
+        assert_eq!(
+            store.read_blob(&allocated.hash).unwrap().as_ref(),
+            allocation_output.as_bytes()
+        );
+
+        let proposal = store
+            .propose_allocation(
+                "sanitize-mutations",
+                AllocationSource::Bytes(management.as_bytes()),
+                PendingAllocationSpec::default(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            proposal.hash,
+            blake3::hash(redacted_management.as_bytes())
+                .to_hex()
+                .to_string()
+        );
+        let finalized = store
+            .finalize_allocation_custom(
+                "sanitize-mutations",
+                &proposal.token,
+                "pending.txt",
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            finalized.mutation.as_ref().unwrap().sanitized,
+            TokenCounts {
+                management: 1,
+                claim: 0
+            }
+        );
+
+        let regular_hash = node_hash(&store, "sanitize-mutations", "regular.txt");
+        let replaced = store
+            .replace_file_content(
+                "sanitize-mutations",
+                "regular.txt",
+                &regular_hash,
+                AllocationSource::Bytes(claim.as_bytes()),
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            replaced.mutation.as_ref().unwrap().sanitized,
+            TokenCounts {
+                management: 0,
+                claim: 1
+            }
+        );
+        assert_eq!(
+            store.read_blob(&replaced.hash).unwrap().as_ref(),
+            redacted_claim.as_bytes()
+        );
+
+        let splice_hash = node_hash(&store, "sanitize-mutations", "splice.txt");
+        let spliced = store
+            .splice_file(
+                "sanitize-mutations",
+                "splice.txt",
+                &splice_hash,
+                &[Splice {
+                    offset: 7,
+                    delete: 0,
+                    insert: SpliceSource::Bytes(management.as_bytes()),
+                }],
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            spliced.mutation.as_ref().unwrap().sanitized,
+            TokenCounts {
+                management: 1,
+                claim: 0
+            }
+        );
+        assert_eq!(
+            store.read_blob(&spliced.hash).unwrap().as_ref(),
+            format!("prefix:{redacted_management}").as_bytes()
+        );
+    }
+
+    #[test]
+    fn allocated_extension_normalization_matches_shared_sdk_vectors() {
+        for vector in symbol_contract::EXTENSION_NORMALIZATION_VECTORS {
+            assert_eq!(
+                normalize_allocated_extension(vector.input).ok().as_deref(),
+                vector.output,
+                "{:?}",
+                vector.input
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
     fn pending_allocation_finalizes_once_and_pruning_releases_blob() {
         let dir = tempfile::tempdir().unwrap();
         let clock = Arc::new(TestClock::new(1_700_000_000_000));
@@ -12511,8 +13297,8 @@ mod tests {
             Err(StoreError::SpliceRange)
         ));
         let secret = format!("sym_mgmt_{}\n", "a".repeat(64));
-        assert!(matches!(
-            store.splice_file(
+        let sanitized = store
+            .splice_file(
                 "splice",
                 "data.txt",
                 &result.hash,
@@ -12521,11 +13307,14 @@ mod tests {
                     delete: 0,
                     insert: SpliceSource::Bytes(secret.as_bytes()),
                 }],
-                FileMutationOptions::default()
-            ),
-            Err(StoreError::SecretContent)
-        ));
-        assert_eq!(node_hash(&store, "splice", "data.txt"), result.hash);
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(sanitized.mutation.unwrap().sanitized.management, 1);
+        assert_eq!(
+            store.read_blob(&sanitized.hash).unwrap().as_ref(),
+            format!("sym_mgmt_{}\nA01BC56789Z", "*".repeat(64)).as_bytes()
+        );
     }
 
     #[test]

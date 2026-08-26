@@ -560,6 +560,10 @@ Large binary files are not scanned. A supported archive uploaded without
 rejected with `400` if a token is found. Sanitization is therefore a narrow
 token leak barrier, not general secret detection.
 
+Allocated uploads, replacement bodies, and completed splice results use the
+same redaction before content hashing and content-addressed naming. Their
+headers and JSON receipts report the sanitized token counts.
+
 <!-- contract:file delete -->
 ### `DELETE /{name}/{path...}`
 
@@ -877,12 +881,23 @@ Idempotency-Key: replace-data-v2
 
 Applies ordered byte splices with `If-Content-Match`, optional `If-Match`,
 `Authorization`, and `Idempotency-Key`. The header form uses one or more
-`Splice: offset=<n>,delete=<n>,insert=<n>` descriptors followed by the exact
-concatenated insertion bytes (at most 64 descriptors and 8192 aggregate header
-bytes). Binary frame v1 uses case-insensitive media type
+`Splice: offset=<n>; delete=<n>; insert=<n>` descriptors, separated from one
+another by commas, followed by the exact concatenated insertion bytes (at most
+64 descriptors and 8192 aggregate header bytes). Binary frame v1 uses
+case-insensitive media type
 `Content-Type: application/vnd.symbol.splice; version=1`, magic `SYMSPL1\0`,
 big-endian count/flags/descriptor table, at most 4096 descriptors and 96 KiB
 metadata, then exact insertion bytes with no trailing data.
+
+```http
+PATCH /hello/data.bin HTTP/1.1
+If-Content-Match: blake3:<file hash>
+Splice: offset=0; delete=0; insert=1
+Idempotency-Key: splice-data-v1
+Content-Length: 1
+
+X
+```
 
 Success is `200` JSON with `Location`, `ETag`, `Content-Revision`, optional
 `Undo-Token`/`Undo-Expires`, and `Idempotency-Replayed`. Malformed/range/size

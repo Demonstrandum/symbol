@@ -4,10 +4,10 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time, UtcOffset};
 
-use crate::units::{MIB, SECONDS_PER_MONTH, SECONDS_PER_YEAR};
+use crate::units::{MIB, SECONDS_PER_DAY};
 
-pub const DEFAULT_MIN_AGE_SECONDS: u64 = SECONDS_PER_MONTH;
-pub const DEFAULT_MAX_AGE_SECONDS: u64 = 3 * SECONDS_PER_YEAR / 2;
+pub const DEFAULT_MIN_AGE_SECONDS: u64 = 30 * SECONDS_PER_DAY;
+pub const DEFAULT_MAX_AGE_SECONDS: u64 = 365 * SECONDS_PER_DAY;
 pub const DEFAULT_MAX_SIZE_BYTES: u64 = 512 * MIB;
 pub const DEFAULT_POWER: f64 = 3.0;
 
@@ -601,6 +601,15 @@ impl fmt::Display for HumanDuration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_decay_policy_matches_frozen_service_defaults() {
+        let defaults = DecayPolicy::default();
+        assert_eq!(defaults.min_age_seconds, 30 * 86_400);
+        assert_eq!(defaults.max_age_seconds, 365 * 86_400);
+        assert_eq!(defaults.max_size_bytes, 512 * MIB);
+        assert_eq!(defaults.power.to_bits(), 3.0_f64.to_bits());
+    }
 
     fn policy(power: f64) -> DecayPolicy {
         DecayPolicy {

@@ -33,12 +33,12 @@ BUILD_COMMIT: Final[str] = METADATA.commit
 BUILD_DIRTY: Final[bool] = METADATA.dirty
 
 __all__ = (
-    "ApiMetadata",
-    "METADATA",
-    "API_VERSION",
     "API_REVISION",
-    "SOURCE_HASH",
-    "GENERATOR_VERSION",
+    "API_VERSION",
     "BUILD_COMMIT",
     "BUILD_DIRTY",
+    "GENERATOR_VERSION",
+    "METADATA",
+    "SOURCE_HASH",
+    "ApiMetadata",
 )

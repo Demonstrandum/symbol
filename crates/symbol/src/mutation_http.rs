@@ -14,7 +14,7 @@ use tokio::io::AsyncWriteExt as _;
 
 use super::{
     App, ExpiryRequest, TemporaryUpload, expiry_policy_from, has_expiry_parameters, if_match_from,
-    insert_undo_headers, management_bearer, plain,
+    insert_sanitized_headers, insert_undo_headers, management_bearer, plain,
 };
 use crate::secrets::ManagementToken;
 use crate::splice::{self, ProtocolError};
@@ -522,7 +522,7 @@ pub async fn alias_file(app: &App, name: &str, path: &str, headers: &HeaderMap) 
         .into_iter()
         .next()
         .expect("single alias mutation stores one receipt row");
-    let location = format!("{}/{name}/{}", app.public_url, alias.path);
+    let location = resource_location(app, name, &alias.path);
     let receipt = alias_receipt(
         alias,
         mutation_receipt(&mutation, &idempotency_key, location.clone()),
@@ -603,7 +603,7 @@ pub async fn alias_batch(app: &App, name: &str, headers: &HeaderMap, body: Body)
     };
     let mutation = result.mutation;
     let aliases = result.aliases;
-    let location = format!("{}/{name}/", app.public_url);
+    let location = site_location(app, name);
     let receipt = contract::AliasBatchReceipt {
         aliases: aliases.into_iter().map(inventory_alias).collect(),
         mutation: mutation_receipt(&mutation, &idempotency_key, location.clone()),
@@ -667,7 +667,7 @@ pub async fn replace_file(
         Ok(replaced) => replaced,
         Err(error) => return mutation_error(app, name, error).await,
     };
-    let location = format!("{}/{name}/{}", app.public_url, replaced.path);
+    let location = resource_location(app, name, &replaced.path);
     let relocated = replaced.path != path;
     let outcome = if !replaced.changed {
         contract::ReplacementOutcome::Unchanged
@@ -790,7 +790,7 @@ async fn splice_file_inner(
         Ok(result) => result,
         Err(error) => return mutation_error(&app, &name, error).await,
     };
-    let location = format!("{}/{name}/{}", app.public_url, spliced.path);
+    let location = resource_location(&app, &name, &spliced.path);
     let mutation =
         match allocated_mutation_receipt(&app, &name, &spliced, &idempotency_key, location.clone())
             .await
@@ -825,7 +825,7 @@ async fn allocated_response(
     idempotency_key: String,
     naming: contract::AllocationNaming,
 ) -> Response {
-    let url = format!("{}/{name}/{}", app.public_url, allocated.path);
+    let url = resource_location(app, name, &allocated.path);
     let blob_url = format!("{}/.blob/{name}/{}", app.public_url, allocated.hash);
     let created = allocated
         .mutation
@@ -1254,6 +1254,7 @@ fn insert_mutation_headers(headers: &mut HeaderMap, mutation: &MutationResult, l
     if let Some(undo) = &mutation.undo {
         insert_undo_headers(headers, undo);
     }
+    insert_sanitized_headers(headers, mutation.sanitized);
 }
 
 fn insert_snapshot_values(headers: &mut HeaderMap, location: &str, tree_hash: &str, revision: u64) {
@@ -1354,7 +1355,30 @@ fn splice_error(error: &ProtocolError) -> Response {
 }
 
 fn site_location(app: &App, name: &str) -> String {
-    format!("{}/{name}/", app.public_url)
+    resource_location(app, name, "")
+}
+
+fn resource_location(app: &App, name: &str, path: &str) -> String {
+    let mut location = format!("{}/{}", app.public_url, name);
+    if path.is_empty() {
+        location.push('/');
+        return location;
+    }
+    for segment in path.split('/') {
+        location.push('/');
+        encode_path_segment(&mut location, segment);
+    }
+    location
+}
+
+fn encode_path_segment(output: &mut String, segment: &str) {
+    for byte in segment.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            output.push(char::from(byte));
+        } else {
+            write!(output, "%{byte:02X}").expect("writing to String cannot fail");
+        }
+    }
 }
 
 #[allow(dead_code)]

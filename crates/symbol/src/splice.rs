@@ -9,10 +9,10 @@ use tokio::io::AsyncWriteExt as _;
 
 use crate::store::{Splice, SpliceSource};
 
-pub const MAX_HEADER_BYTES: usize = 8 * 1024;
-pub const MAX_HEADER_DESCRIPTORS: usize = 64;
-pub const MAX_FRAME_DESCRIPTORS: usize = 4096;
-pub const MAX_FRAME_METADATA_BYTES: usize = 96 * 1024;
+pub const MAX_HEADER_BYTES: usize = symbol_contract::SPLICE_HEADER_MAX_BYTES;
+pub const MAX_HEADER_DESCRIPTORS: usize = symbol_contract::SPLICE_HEADER_MAX_DESCRIPTORS;
+pub const MAX_FRAME_DESCRIPTORS: usize = symbol_contract::SPLICE_FRAME_MAX_DESCRIPTORS;
+pub const MAX_FRAME_METADATA_BYTES: usize = symbol_contract::SPLICE_FRAME_MAX_METADATA_BYTES;
 
 const FRAME_MAGIC: &[u8; 8] = b"SYMSPL1\0";
 const FRAME_PREFIX_BYTES: usize = 16;
@@ -154,14 +154,20 @@ fn parse_header_descriptors(
     let values = headers.get_all("splice");
     let mut aggregate = String::new();
     for value in values {
-        if !aggregate.is_empty() {
-            aggregate.push(',');
-        }
         let value = value
             .to_str()
             .map_err(|_| ProtocolError::MalformedDescriptor)?;
-        if aggregate.len().saturating_add(value.len()) > MAX_HEADER_BYTES {
+        let separator_bytes = usize::from(!aggregate.is_empty());
+        let combined_bytes = aggregate
+            .len()
+            .checked_add(separator_bytes)
+            .and_then(|length| length.checked_add(value.len()))
+            .ok_or(ProtocolError::HeaderLimit)?;
+        if combined_bytes > MAX_HEADER_BYTES {
             return Err(ProtocolError::HeaderLimit);
+        }
+        if separator_bytes != 0 {
+            aggregate.push(',');
         }
         aggregate.push_str(value);
     }
@@ -536,6 +542,33 @@ mod tests {
         headers.insert("splice", HeaderValue::from_str(&oversized).unwrap());
         assert!(matches!(
             parse_header_descriptors(&headers, 0),
+            Err(ProtocolError::HeaderLimit)
+        ));
+
+        let first = format!(
+            "{descriptor}{}",
+            " ".repeat(MAX_HEADER_BYTES - (2 * descriptor.len()) - 1)
+        );
+        let mut repeated = HeaderMap::new();
+        repeated.append("splice", HeaderValue::from_str(&first).unwrap());
+        repeated.append("splice", HeaderValue::from_str(descriptor).unwrap());
+        assert_eq!(
+            first.len() + 1 + descriptor.len(),
+            MAX_HEADER_BYTES,
+            "combined boundary includes the inserted comma"
+        );
+        assert_eq!(parse_header_descriptors(&repeated, 0).unwrap().len(), 2);
+
+        let oversized_first = format!("{first} ");
+        let mut repeated_oversized = HeaderMap::new();
+        repeated_oversized.append("splice", HeaderValue::from_str(&oversized_first).unwrap());
+        repeated_oversized.append("splice", HeaderValue::from_str(descriptor).unwrap());
+        assert_eq!(
+            oversized_first.len() + 1 + descriptor.len(),
+            MAX_HEADER_BYTES + 1
+        );
+        assert!(matches!(
+            parse_header_descriptors(&repeated_oversized, 0),
             Err(ProtocolError::HeaderLimit)
         ));
     }

@@ -57,6 +57,10 @@ pub const METHOD_EXPIRE: &str = "EXPIRE";
 pub const METHOD_MANAGE: &str = "MANAGE";
 pub const RESERVED_MUTATION_ERROR: &str = "error: path is reserved by symbol";
 pub const SPLICE_MEDIA_TYPE: &str = "application/vnd.symbol.splice; version=1";
+pub const SPLICE_HEADER_MAX_BYTES: usize = 8 * 1024;
+pub const SPLICE_HEADER_MAX_DESCRIPTORS: usize = 64;
+pub const SPLICE_FRAME_MAX_DESCRIPTORS: usize = 4096;
+pub const SPLICE_FRAME_MAX_METADATA_BYTES: usize = 96 * 1024;
 
 const READ_ERRORS: &[u16] = &[304, 400, 404, 416];
 const MUTATION_ERRORS: &[u16] = &[400, 401, 403, 404, 409, 412, 413, 500];
@@ -71,6 +75,19 @@ const MUTATION_HEADERS: &[&str] = &[
     "Management-Token",
     "Sanitized-Management-Tokens",
     "Sanitized-Creator-Claims",
+];
+const IDEMPOTENT_MUTATION_HEADERS: &[&str] = &[
+    "Content-Type",
+    "Location",
+    "ETag",
+    "Content-Revision",
+    "Undo-Token",
+    "Undo-Expires",
+    "Creator-Claim",
+    "Management-Token",
+    "Sanitized-Management-Tokens",
+    "Sanitized-Creator-Claims",
+    "Idempotency-Replayed",
 ];
 
 pub static ENDPOINTS: &[EndpointContract] = &[
@@ -99,7 +116,7 @@ pub static ENDPOINTS: &[EndpointContract] = &[
             "Creator-Claim",
             "Management-Action"
         ],
-        MUTATION_HEADERS
+        IDEMPOTENT_MUTATION_HEADERS
     ),
     endpoint!(
         "docs hash",
@@ -214,7 +231,7 @@ pub static ENDPOINTS: &[EndpointContract] = &[
             "Creator-Claim",
             "Management-Action"
         ],
-        MUTATION_HEADERS
+        IDEMPOTENT_MUTATION_HEADERS
     ),
     endpoint!(
         "site pop",
@@ -245,7 +262,7 @@ pub static ENDPOINTS: &[EndpointContract] = &[
             "Creator-Claim",
             "Management-Action"
         ],
-        MUTATION_HEADERS
+        IDEMPOTENT_MUTATION_HEADERS
     ),
     endpoint!(
         "site move",
@@ -628,123 +645,30 @@ pub enum WireBody {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-pub struct OutcomeContract {
-    pub status: u16,
-    pub body: WireBody,
-    pub required_headers: &'static [&'static str],
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-pub struct EndpointOutcomes {
-    pub name: &'static str,
-    pub success: &'static [OutcomeContract],
-    pub errors: &'static [OutcomeContract],
-}
-
-const JSON_MUTATION_HEADERS: &[&str] = &["Content-Type", "Location", "ETag", "Content-Revision"];
-const PLAIN_ERROR: WireBody = WireBody::PlainText;
-const MUTATION_ERROR_OUTCOMES: &[OutcomeContract] = &[
-    error_outcome(400),
-    error_outcome(401),
-    error_outcome(403),
-    error_outcome(404),
-    error_outcome(409),
-    error_outcome(412),
-    error_outcome(413),
-    error_outcome(500),
-];
-const SPLICE_ERROR_OUTCOMES: &[OutcomeContract] = &[
-    error_outcome(400),
-    error_outcome(401),
-    error_outcome(403),
-    error_outcome(404),
-    error_outcome(409),
-    error_outcome(412),
-    error_outcome(413),
-    error_outcome(416),
-    error_outcome(500),
-];
-
-pub static EXACT_OUTCOMES: &[EndpointOutcomes] = &[
-    EndpointOutcomes {
-        name: "alias batch",
-        success: &[
-            OutcomeContract {
-                status: 200,
-                body: WireBody::Json,
-                required_headers: JSON_MUTATION_HEADERS,
-            },
-            OutcomeContract {
-                status: 201,
-                body: WireBody::Json,
-                required_headers: JSON_MUTATION_HEADERS,
-            },
-        ],
-        errors: MUTATION_ERROR_OUTCOMES,
-    },
-    EndpointOutcomes {
-        name: "alias file",
-        success: &[
-            OutcomeContract {
-                status: 200,
-                body: WireBody::Json,
-                required_headers: JSON_MUTATION_HEADERS,
-            },
-            OutcomeContract {
-                status: 201,
-                body: WireBody::Json,
-                required_headers: JSON_MUTATION_HEADERS,
-            },
-        ],
-        errors: MUTATION_ERROR_OUTCOMES,
-    },
-    EndpointOutcomes {
-        name: "allocated file",
-        success: &[
-            OutcomeContract {
-                status: 200,
-                body: WireBody::Json,
-                required_headers: JSON_MUTATION_HEADERS,
-            },
-            OutcomeContract {
-                status: 201,
-                body: WireBody::Json,
-                required_headers: JSON_MUTATION_HEADERS,
-            },
-            OutcomeContract {
-                status: 202,
-                body: WireBody::Json,
-                required_headers: &["Content-Type", "Location", "ETag", "Content-Revision"],
-            },
-        ],
-        errors: MUTATION_ERROR_OUTCOMES,
-    },
-    EndpointOutcomes {
-        name: "file replace",
-        success: &[OutcomeContract {
-            status: 200,
-            body: WireBody::Json,
-            required_headers: JSON_MUTATION_HEADERS,
-        }],
-        errors: MUTATION_ERROR_OUTCOMES,
-    },
-    EndpointOutcomes {
-        name: "file splice",
-        success: &[OutcomeContract {
-            status: 200,
-            body: WireBody::Json,
-            required_headers: JSON_MUTATION_HEADERS,
-        }],
-        errors: SPLICE_ERROR_OUTCOMES,
-    },
-];
-
-const fn error_outcome(status: u16) -> OutcomeContract {
-    OutcomeContract {
-        status,
-        body: PLAIN_ERROR,
-        required_headers: &["Content-Type"],
-    }
+#[serde(rename_all = "snake_case")]
+pub enum WireSchema {
+    Empty,
+    Asset,
+    Hash,
+    Stats,
+    DirectoryListing,
+    HostedContent,
+    SiteMutationReceipt,
+    Archive,
+    UndoMutationReceipt,
+    ExpiryReport,
+    ManagementStatus,
+    FileInventory,
+    UndoStack,
+    ExpirySiteReport,
+    AliasReceipt,
+    AliasBatchReceipt,
+    AllocationReceipt,
+    AllocationProposalReceipt,
+    AllocationCancellationReceipt,
+    FileReplaceReceipt,
+    SpliceReceipt,
+    Error,
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize)]
@@ -1129,8 +1053,45 @@ pub struct SpliceReceipt {
     pub mutation: MutationReceipt,
 }
 
-pub const CONTRACT_FIXTURE_VERSION: u32 = 1;
+pub const CONTRACT_FIXTURE_VERSION: u32 = 2;
 pub const INITIAL_API_VERSION: ContractVersion = ContractVersion::new(0, 1, 0);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct ExtensionNormalizationVector {
+    pub input: &'static str,
+    pub output: Option<&'static str>,
+}
+
+pub const EXTENSION_NORMALIZATION_VECTORS: &[ExtensionNormalizationVector] = &[
+    ExtensionNormalizationVector {
+        input: ".Tar.GZ",
+        output: Some("tar-gz"),
+    },
+    ExtensionNormalizationVector {
+        input: "hello_world",
+        output: Some("hello-world"),
+    },
+    ExtensionNormalizationVector {
+        input: "a--b",
+        output: Some("a-b"),
+    },
+    ExtensionNormalizationVector {
+        input: "../png",
+        output: Some("png"),
+    },
+    ExtensionNormalizationVector {
+        input: "café",
+        output: Some("caf"),
+    },
+    ExtensionNormalizationVector {
+        input: "日本",
+        output: None,
+    },
+    ExtensionNormalizationVector {
+        input: "...",
+        output: None,
+    },
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContractVersion {
@@ -1168,6 +1129,7 @@ impl serde::Serialize for ContractVersion {
 #[derive(Debug, serde::Serialize)]
 pub struct ContractFixture {
     pub fixture_version: u32,
+    pub extension_normalization: &'static [ExtensionNormalizationVector],
     pub operations: Vec<OperationFixture>,
 }
 
@@ -1188,15 +1150,19 @@ pub struct OperationFixture {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct FixtureOutcome {
     pub status: u16,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub body: Option<WireBody>,
+    pub request_variant: &'static str,
+    pub body: WireBody,
+    pub schema: WireSchema,
     pub required_headers: &'static [&'static str],
+    pub optional_headers: &'static [&'static str],
+    pub forbidden_headers: &'static [&'static str],
 }
 
 #[must_use]
 pub fn contract_fixture() -> ContractFixture {
     ContractFixture {
         fixture_version: CONTRACT_FIXTURE_VERSION,
+        extension_normalization: EXTENSION_NORMALIZATION_VECTORS,
         operations: ENDPOINTS.iter().map(operation_fixture).collect(),
     }
 }
@@ -1215,35 +1181,6 @@ pub fn contract_fixture_json() -> String {
 }
 
 fn operation_fixture(endpoint: &'static EndpointContract) -> OperationFixture {
-    let exact = EXACT_OUTCOMES
-        .iter()
-        .find(|outcomes| outcomes.name == endpoint.name);
-    let (success_outcomes, error_outcomes, outcomes_exact) = exact.map_or_else(
-        || {
-            (
-                endpoint
-                    .success_statuses
-                    .iter()
-                    .copied()
-                    .map(inferred_fixture_outcome)
-                    .collect(),
-                endpoint
-                    .error_statuses
-                    .iter()
-                    .copied()
-                    .map(inferred_fixture_outcome)
-                    .collect(),
-                false,
-            )
-        },
-        |outcomes| {
-            (
-                outcomes.success.iter().map(exact_fixture_outcome).collect(),
-                outcomes.errors.iter().map(exact_fixture_outcome).collect(),
-                true,
-            )
-        },
-    );
     OperationFixture {
         name: endpoint.name,
         method: endpoint.method,
@@ -1252,25 +1189,308 @@ fn operation_fixture(endpoint: &'static EndpointContract) -> OperationFixture {
         introduced: INITIAL_API_VERSION,
         request_headers: endpoint.request_headers,
         response_headers: endpoint.response_headers,
-        outcomes_exact,
-        success_outcomes,
-        error_outcomes,
+        outcomes_exact: true,
+        success_outcomes: typed_success_outcomes(endpoint),
+        error_outcomes: endpoint
+            .error_statuses
+            .iter()
+            .copied()
+            .map(|status| typed_error_outcome(endpoint.name, status))
+            .collect(),
     }
 }
 
-const fn exact_fixture_outcome(outcome: &OutcomeContract) -> FixtureOutcome {
-    FixtureOutcome {
-        status: outcome.status,
-        body: Some(outcome.body),
-        required_headers: outcome.required_headers,
+fn typed_success_outcomes(endpoint: &'static EndpointContract) -> Vec<FixtureOutcome> {
+    if endpoint.name != "allocated file" {
+        return endpoint
+            .success_statuses
+            .iter()
+            .copied()
+            .map(|status| typed_success_outcome(endpoint.name, status))
+            .collect();
     }
+    let mut outcomes = Vec::new();
+    for status in [200, 201] {
+        for variant in ["create", "finalize"] {
+            let mut outcome = typed_success_outcome(endpoint.name, status);
+            outcome.request_variant = variant;
+            outcomes.push(outcome);
+        }
+    }
+    let mut proposal = typed_success_outcome(endpoint.name, 202);
+    proposal.request_variant = "propose";
+    outcomes.push(proposal);
+    outcomes.push(FixtureOutcome {
+        status: 200,
+        request_variant: "cancel",
+        body: WireBody::Json,
+        schema: WireSchema::AllocationCancellationReceipt,
+        required_headers: &["Content-Type", "Location", "ETag", "Content-Revision"],
+        optional_headers: &[],
+        forbidden_headers: &["Content-Range", "Content-Location"],
+    });
+    outcomes
 }
 
-const fn inferred_fixture_outcome(status: u16) -> FixtureOutcome {
+#[expect(
+    clippy::too_many_lines,
+    reason = "one exhaustive table keeps every installed endpoint/status outcome auditable"
+)]
+fn typed_success_outcome(name: &str, status: u16) -> FixtureOutcome {
+    let (body, schema, required_headers, forbidden_headers) = match (name, status) {
+        ("docs" | "installer" | "client", 200) => (
+            WireBody::PlainText,
+            WireSchema::Asset,
+            &["Content-Type", "ETag", "Cache-Control"][..],
+            &["Content-Range", "Location"][..],
+        ),
+        (
+            "docs" | "installer" | "client" | "site listing" | "site index" | "site file"
+            | "files inventory" | "files subtree" | "immutable blob",
+            304,
+        ) => (
+            WireBody::Empty,
+            WireSchema::Empty,
+            &["ETag", "Cache-Control"][..],
+            &[
+                "Content-Type",
+                "Content-Length",
+                "Content-Range",
+                "Location",
+            ][..],
+        ),
+        ("docs hash" | "installer hash" | "client hash" | "file hash", 200) => (
+            WireBody::PlainText,
+            WireSchema::Hash,
+            &["Content-Type"][..],
+            &["Content-Range", "Location"][..],
+        ),
+        ("stats", 200) => (
+            WireBody::Json,
+            WireSchema::Stats,
+            &["Content-Type"][..],
+            &["Content-Range", "Location"][..],
+        ),
+        ("site listing" | "files subtree", 200) => (
+            WireBody::Json,
+            WireSchema::DirectoryListing,
+            &["Content-Type", "ETag", "Cache-Control"][..],
+            &["Content-Range", "Location"][..],
+        ),
+        ("site redirect" | "site index" | "site file" | "files subtree", 307) => (
+            WireBody::Empty,
+            WireSchema::Empty,
+            &["Location", "Content-Length"][..],
+            &["Content-Type", "Content-Range", "ETag"][..],
+        ),
+        ("site index" | "site file" | "immutable blob", 200) => (
+            WireBody::Binary,
+            WireSchema::HostedContent,
+            &[
+                "Content-Type",
+                "Content-Length",
+                "ETag",
+                "Cache-Control",
+                "Accept-Ranges",
+            ][..],
+            &["Content-Range", "Location"][..],
+        ),
+        ("site index" | "site file" | "immutable blob", 206) => (
+            WireBody::Binary,
+            WireSchema::HostedContent,
+            &[
+                "Content-Type",
+                "Content-Length",
+                "Content-Range",
+                "Accept-Ranges",
+                "ETag",
+                "Cache-Control",
+            ][..],
+            &["Location"][..],
+        ),
+        ("unnamed put" | "site copy", _) => (
+            WireBody::PlainText,
+            WireSchema::SiteMutationReceipt,
+            &["Content-Type", "Location", "ETag", "Content-Revision"][..],
+            &["Content-Range"][..],
+        ),
+        ("site put" | "site move" | "file put", _) => (
+            WireBody::PlainText,
+            WireSchema::SiteMutationReceipt,
+            &["Content-Type", "Location", "ETag", "Content-Revision"][..],
+            &["Content-Range", "Idempotency-Replayed"][..],
+        ),
+        ("site pop" | "archive pop", 200) => (
+            WireBody::Binary,
+            WireSchema::Archive,
+            &[
+                "Content-Type",
+                "Content-Length",
+                "Content-Disposition",
+                "Undo-Token",
+                "Undo-Expires",
+            ][..],
+            &["Content-Range", "ETag", "Location"][..],
+        ),
+        ("archive get", 200) => (
+            WireBody::Binary,
+            WireSchema::Archive,
+            &[
+                "Content-Type",
+                "Content-Length",
+                "Content-Disposition",
+                "Cache-Control",
+            ][..],
+            &["Content-Range", "ETag", "Location"][..],
+        ),
+        ("site undo", 200) => (
+            WireBody::PlainText,
+            WireSchema::UndoMutationReceipt,
+            &["Content-Type"][..],
+            &["Content-Range", "Location"][..],
+        ),
+        ("file delete", 200) => (
+            WireBody::PlainText,
+            WireSchema::SiteMutationReceipt,
+            &["Content-Type", "Undo-Token", "Undo-Expires"][..],
+            &["Content-Range", "Location", "ETag"][..],
+        ),
+        ("site expire" | "file expire", 200) => (
+            WireBody::Json,
+            WireSchema::ExpiryReport,
+            &["Content-Type", "Undo-Token", "Undo-Expires"][..],
+            &["Content-Range", "Location", "ETag"][..],
+        ),
+        ("site management", 200) => (
+            WireBody::Json,
+            WireSchema::ManagementStatus,
+            &["Content-Type", "Cache-Control"][..],
+            &["Content-Range", "Location", "ETag"][..],
+        ),
+        ("undo stack", 200) => (
+            WireBody::Json,
+            WireSchema::UndoStack,
+            &["Content-Type", "Cache-Control"][..],
+            &["Content-Range", "Location", "ETag"][..],
+        ),
+        ("expiry inventory", 200) => (
+            WireBody::Json,
+            WireSchema::ExpirySiteReport,
+            &["Content-Type", "Cache-Control"][..],
+            &["Content-Range", "Location", "ETag"][..],
+        ),
+        ("expiry target", 200) => (
+            WireBody::Json,
+            WireSchema::ExpiryReport,
+            &["Content-Type", "Cache-Control"][..],
+            &["Content-Range", "Location", "ETag"][..],
+        ),
+        ("files inventory", 200) => (
+            WireBody::Json,
+            WireSchema::FileInventory,
+            &["Content-Type", "ETag", "Content-Revision", "Cache-Control"][..],
+            &["Content-Range", "Location"][..],
+        ),
+        ("alias file", 200 | 201) => (
+            WireBody::Json,
+            WireSchema::AliasReceipt,
+            &["Content-Type", "Location", "ETag", "Content-Revision"][..],
+            &["Content-Range"][..],
+        ),
+        ("alias batch", 200 | 201) => (
+            WireBody::Json,
+            WireSchema::AliasBatchReceipt,
+            &["Content-Type", "Location", "ETag", "Content-Revision"][..],
+            &["Content-Range"][..],
+        ),
+        ("allocated file", 200 | 201) => (
+            WireBody::Json,
+            WireSchema::AllocationReceipt,
+            &[
+                "Content-Type",
+                "Content-Location",
+                "Location",
+                "ETag",
+                "Content-Revision",
+            ][..],
+            &["Content-Range"][..],
+        ),
+        ("allocated file", 202) => (
+            WireBody::Json,
+            WireSchema::AllocationProposalReceipt,
+            &["Content-Type", "Location", "ETag", "Content-Revision"][..],
+            &["Content-Range", "Content-Location"][..],
+        ),
+        ("file replace", 200) => (
+            WireBody::Json,
+            WireSchema::FileReplaceReceipt,
+            &["Content-Type", "Location", "ETag", "Content-Revision"][..],
+            &["Content-Range"][..],
+        ),
+        ("file splice", 200) => (
+            WireBody::Json,
+            WireSchema::SpliceReceipt,
+            &["Content-Type", "Location", "ETag", "Content-Revision"][..],
+            &["Content-Range"][..],
+        ),
+        _ => panic!("missing typed success outcome for {name} status {status}"),
+    };
     FixtureOutcome {
         status,
-        body: None,
-        required_headers: &[],
+        request_variant: "default",
+        body,
+        schema,
+        required_headers,
+        optional_headers: &[],
+        forbidden_headers,
+    }
+}
+
+fn typed_error_outcome(name: &str, status: u16) -> FixtureOutcome {
+    let (body, required_headers, forbidden_headers) = match status {
+        304 => (
+            WireBody::Empty,
+            &["ETag", "Cache-Control"][..],
+            &[
+                "Content-Type",
+                "Content-Length",
+                "Content-Range",
+                "Location",
+            ][..],
+        ),
+        401 => (
+            WireBody::PlainText,
+            &["Content-Type", "WWW-Authenticate", "Cache-Control"][..],
+            &["Content-Range", "Location"][..],
+        ),
+        412 => (
+            WireBody::PlainText,
+            &["Content-Type", "ETag", "Content-Revision"][..],
+            &["Content-Range", "Location"][..],
+        ),
+        416 if name != "file splice" => (
+            WireBody::Empty,
+            &["Content-Range", "Accept-Ranges", "ETag", "Cache-Control"][..],
+            &["Content-Type", "Location"][..],
+        ),
+        _ => (
+            WireBody::PlainText,
+            &["Content-Type"][..],
+            &["Content-Range", "Location"][..],
+        ),
+    };
+    FixtureOutcome {
+        status,
+        request_variant: "default",
+        body,
+        schema: if body == WireBody::Empty {
+            WireSchema::Empty
+        } else {
+            WireSchema::Error
+        },
+        required_headers,
+        optional_headers: if status == 500 { &["Retry-After"] } else { &[] },
+        forbidden_headers,
     }
 }
 
@@ -1278,7 +1498,7 @@ const fn inferred_fixture_outcome(status: u16) -> FixtureOutcome {
 mod tests {
     use std::collections::{BTreeSet, HashSet};
 
-    use super::{ENDPOINTS, EXACT_OUTCOMES, INITIAL_API_VERSION, contract_fixture};
+    use super::{ENDPOINTS, INITIAL_API_VERSION, contract_fixture};
 
     #[test]
     fn endpoint_names_are_unique_and_shapes_are_well_formed() {
@@ -1306,33 +1526,16 @@ mod tests {
     }
 
     #[test]
-    fn every_installed_frozen_addition_has_exact_outcomes() {
-        let expected = [
-            "alias batch",
-            "alias file",
-            "allocated file",
-            "file replace",
-            "file splice",
-        ];
-        assert_eq!(
-            EXACT_OUTCOMES
-                .iter()
-                .map(|endpoint| endpoint.name)
-                .collect::<BTreeSet<_>>(),
-            expected.into_iter().collect()
-        );
-        for outcomes in EXACT_OUTCOMES {
-            let endpoint = ENDPOINTS
-                .iter()
-                .find(|endpoint| endpoint.name == outcomes.name)
-                .expect("exact outcomes name a frozen endpoint");
+    fn every_installed_endpoint_has_typed_exact_outcomes() {
+        let fixture = contract_fixture();
+        for (outcomes, endpoint) in fixture.operations.iter().zip(ENDPOINTS) {
             let success = outcomes
-                .success
+                .success_outcomes
                 .iter()
                 .map(|outcome| outcome.status)
                 .collect::<BTreeSet<_>>();
             let errors = outcomes
-                .errors
+                .error_outcomes
                 .iter()
                 .map(|outcome| outcome.status)
                 .collect::<BTreeSet<_>>();
@@ -1348,24 +1551,50 @@ mod tests {
                 "{} error outcomes",
                 endpoint.name
             );
+            for outcome in outcomes
+                .success_outcomes
+                .iter()
+                .chain(&outcomes.error_outcomes)
+            {
+                assert!(!outcome.request_variant.is_empty());
+                assert!(
+                    outcome
+                        .required_headers
+                        .iter()
+                        .all(|required| !outcome.forbidden_headers.contains(required)),
+                    "{} status {} contradictory headers",
+                    endpoint.name,
+                    outcome.status
+                );
+                assert!(
+                    outcome
+                        .optional_headers
+                        .iter()
+                        .all(|optional| !outcome.forbidden_headers.contains(optional)),
+                    "{} status {} contradictory optional headers",
+                    endpoint.name,
+                    outcome.status
+                );
+            }
         }
     }
 
     #[test]
     fn fixture_is_deterministic_and_covers_every_operation() {
         let fixture = contract_fixture();
-        assert_eq!(fixture.fixture_version, 1);
+        assert_eq!(fixture.fixture_version, 2);
         assert_eq!(fixture.operations.len(), ENDPOINTS.len());
         for (operation, endpoint) in fixture.operations.iter().zip(ENDPOINTS) {
             assert_eq!(operation.name, endpoint.name);
             assert_eq!(operation.introduced, INITIAL_API_VERSION);
+            assert!(operation.outcomes_exact, "{} outcomes", operation.name);
             assert_eq!(
                 operation
                     .success_outcomes
                     .iter()
                     .map(|outcome| outcome.status)
-                    .collect::<Vec<_>>(),
-                endpoint.success_statuses
+                    .collect::<BTreeSet<_>>(),
+                endpoint.success_statuses.iter().copied().collect()
             );
             assert_eq!(
                 operation

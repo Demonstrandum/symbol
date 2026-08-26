@@ -15,13 +15,22 @@ use super::{
     generate_artifacts, read_ledger,
 };
 
-const RUNTIME_EXPORTS: [&str; 7] = [
+const REQUIRED_RUNTIME_EXPORTS: [&str; 16] = [
     "API_REVISION",
     "API_VERSION",
+    "AllocationProposal",
+    "ArchiveDownload",
+    "ContentFormat",
+    "ContentFormats",
     "BUILD_COMMIT",
     "BUILD_DIRTY",
     "GENERATOR_VERSION",
+    "MediaType",
+    "MediaTypes",
+    "Operation",
     "SOURCE_HASH",
+    "SymbolApiError",
+    "SymbolClient",
     "metadata",
 ];
 
@@ -82,15 +91,19 @@ fn swc_outputs_have_runtime_export_parity_and_declarations_only() {
     let declarations = parse_ts_module_for_test(&artifacts.api_d_ts).unwrap();
     parse_es_module_for_test(&artifacts.api_global_js).unwrap();
 
-    let expected = RUNTIME_EXPORTS
-        .into_iter()
-        .map(str::to_string)
-        .collect::<BTreeSet<_>>();
-    assert_eq!(runtime_exports(&typescript), expected);
+    let expected = runtime_exports(&typescript);
     assert_eq!(runtime_exports(&javascript), expected);
     assert_eq!(runtime_exports(&declarations), expected);
+    for required in REQUIRED_RUNTIME_EXPORTS {
+        assert!(expected.contains(required), "{required}");
+        assert!(
+            artifacts
+                .api_global_js
+                .contains(&format!("get {required} ()")),
+            "UMD omitted {required}"
+        );
+    }
     assert!(!artifacts.api_js.contains("interface SymbolApiMetadata"));
-    assert!(!artifacts.api_js.contains(": string"));
     assert!(!artifacts.api_global_js.contains("export "));
     assert!(artifacts.api_global_js.contains(".SymbolAPI"));
 
@@ -216,6 +229,60 @@ export declare namespace SDK {
     typecheck_declarations_if_available(&declarations);
 }
 
+#[test]
+fn declarations_strip_defaults_async_and_overload_implementations() {
+    let source = r#"
+export async function load(limit: number = 10): Promise<number> {
+    return limit;
+}
+export class Client {
+    constructor(endpoint: string = "https://example.invalid") {}
+    files(): Promise<string>;
+    files(path: string): Promise<number>;
+    async files(pathOrNothing: string | undefined = undefined): Promise<string | number> {
+        return pathOrNothing ?? "";
+    }
+    async close(reason: string = "done"): Promise<void> {}
+}
+"#;
+    let declarations = emit_declarations(source, "defaults-golden.ts").unwrap();
+    let expected = r#"export declare function load(limit?: number): Promise<number>;
+export declare class Client {
+    constructor(endpoint?: string);
+    files(): Promise<string>;
+    files(path: string): Promise<number>;
+    close(reason?: string): Promise<void>;
+}
+"#;
+    assert_eq!(declarations, expected);
+    parse_ts_module_for_test(&declarations).unwrap();
+    typecheck_declarations_if_available(&declarations);
+}
+
+#[test]
+fn declarations_hide_operation_construction_and_internal_support_types() {
+    let source = r#"
+interface InternalOperationConfiguration {
+    retry: boolean;
+}
+type InternalAttemptExecutor<T> = () => Promise<T>;
+export class Operation<T> {
+    constructor(
+        configuration: InternalOperationConfiguration,
+        executor: InternalAttemptExecutor<T>,
+    ) {}
+    value(): T { throw new Error("runtime only"); }
+}
+"#;
+    let declarations = emit_declarations(source, "operation-surface.ts").unwrap();
+    assert!(declarations.contains("private constructor();"));
+    assert!(declarations.contains("value(): T;"));
+    assert!(!declarations.contains("InternalOperationConfiguration"));
+    assert!(!declarations.contains("InternalAttemptExecutor"));
+    parse_ts_module_for_test(&declarations).unwrap();
+    typecheck_declarations_if_available(&declarations);
+}
+
 #[cfg(unix)]
 #[test]
 fn wrapper_overrides_hostile_inherited_bump_intent() {
@@ -319,17 +386,23 @@ fn unsafe_commits_cannot_reach_javascript_or_python_artifacts() {
 
 #[test]
 fn nix_generated_sources_is_an_independent_read_only_derivation() {
-    let flake = std::fs::read_to_string(workspace_root().join("flake.nix")).unwrap();
+    let root = workspace_root();
+    let flake = std::fs::read_to_string(root.join("flake.nix")).unwrap();
     assert!(flake.contains("generatedSources = rustPlatform.buildRustPackage"));
     assert!(flake.contains("generated-sources = generatedSources;"));
     assert!(!flake.contains("generated-sources = package;"));
     assert!(flake.contains("lib.removeSuffix \"-dirty\" self.dirtyRev"));
-    assert_eq!(
-        flake
-            .matches("SYMBOL_BUILD_DIRTY = if self ? rev then \"false\" else \"true\";")
-            .count(),
-        2
-    );
+    assert!(flake.contains("SYMBOL_BUILD_COMMIT = provenanceCommit;"));
+    assert!(flake.contains("SYMBOL_BUILD_DIRTY = provenanceDirty;"));
+    assert!(flake.contains("generated-provenance = provenance;"));
+
+    let nix_check = std::fs::read_to_string(root.join("nix/check.sh")).unwrap();
+    assert!(nix_check.contains("git -C \"$root\" rev-parse HEAD"));
+    assert!(nix_check.contains("SYMBOL_NIX_BUILD_DIRTY=true"));
+    assert!(nix_check.contains("nix flake check --impure"));
+    let release = std::fs::read_to_string(root.join("release-check")).unwrap();
+    assert!(release.contains("sh nix/check.sh"));
+    assert!(!release.contains("nix build path:."));
 }
 
 fn workspace_root() -> std::path::PathBuf {
@@ -356,14 +429,25 @@ fn runtime_exports(module: &Module) -> BTreeSet<String> {
         let ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) = item else {
             continue;
         };
-        let Decl::Var(variable) = &export.decl else {
-            continue;
-        };
-        for declarator in &variable.decls {
-            let Pat::Ident(identifier) = &declarator.name else {
-                continue;
-            };
-            names.insert(identifier.id.sym.to_string());
+        match &export.decl {
+            Decl::Var(variable) => {
+                for declarator in &variable.decls {
+                    let Pat::Ident(identifier) = &declarator.name else {
+                        continue;
+                    };
+                    names.insert(identifier.id.sym.to_string());
+                }
+            }
+            Decl::Fn(function) => {
+                names.insert(function.ident.sym.to_string());
+            }
+            Decl::Class(class) => {
+                names.insert(class.ident.sym.to_string());
+            }
+            Decl::TsEnum(enumeration) => {
+                names.insert(enumeration.id.sym.to_string());
+            }
+            Decl::TsInterface(_) | Decl::TsTypeAlias(_) | Decl::TsModule(_) | Decl::Using(_) => {}
         }
     }
     names

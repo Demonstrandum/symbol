@@ -2,7 +2,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use super::GenerationError;
+use super::{CANONICAL_FIXED_INPUTS, CANONICAL_SOURCE_DIRECTORIES, GenerationError};
 
 pub const COMMIT_ENV: &str = "SYMBOL_BUILD_COMMIT";
 pub const DIRTY_ENV: &str = "SYMBOL_BUILD_DIRTY";
@@ -27,9 +27,8 @@ impl BuildProvenance {
 
     /// Resolves injected provenance or reads the local Git worktree without fetching.
     ///
-    /// Local dirty state matches Git/Nix tracked-state semantics: staged or
-    /// unstaged changes to any tracked file are dirty, while untracked files
-    /// are ignored.
+    /// Staged or unstaged changes to any tracked file are dirty. Untracked
+    /// files are ignored unless canonical source discovery would include them.
     ///
     /// # Errors
     ///
@@ -135,7 +134,36 @@ fn resolve_with_probe(
 }
 
 fn discover_git(root: &Path) -> Result<BuildProvenance, GenerationError> {
-    resolve_with_probe(|query| run_git_query(root, query))
+    let mut provenance = resolve_with_probe(|query| run_git_query(root, query))?;
+    provenance.dirty |= has_untracked_canonical_input(root)?;
+    Ok(provenance)
+}
+
+fn has_untracked_canonical_input(root: &Path) -> Result<bool, GenerationError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["status", "--porcelain=v1", "--untracked-files=all", "-z"])
+        .output()
+        .map_err(|source| GenerationError::GitIo { source })?;
+    if !output.status.success() {
+        return Err(GenerationError::GitCommand {
+            command: "git status --porcelain=v1 --untracked-files=all -z",
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    Ok(output.stdout.split(|byte| *byte == b'\0').any(|entry| {
+        let Some(path) = entry.strip_prefix(b"?? ") else {
+            return false;
+        };
+        let path = String::from_utf8_lossy(path);
+        CANONICAL_FIXED_INPUTS.contains(&path.as_ref())
+            || (path.ends_with(".rs")
+                && CANONICAL_SOURCE_DIRECTORIES.iter().any(|directory| {
+                    path.strip_prefix(directory)
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+                }))
+    }))
 }
 
 fn injected_provenance(commit: String, dirty: &str) -> Result<BuildProvenance, GenerationError> {

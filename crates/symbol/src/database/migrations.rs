@@ -6,6 +6,7 @@ use diesel::sql_types::BigInt;
 use diesel::sqlite::SqliteConnection;
 use serde::{Deserialize, Serialize};
 
+use super::catalog::{CatalogDifference, SchemaCatalog};
 use super::schema;
 use crate::schema::{files, metadata, site_entries};
 
@@ -19,9 +20,13 @@ pub enum MigrationError {
     #[error("unsupported database schema version {0}")]
     UnsupportedVersion(i64),
     #[error(transparent)]
+    Connection(#[from] diesel::ConnectionError),
+    #[error(transparent)]
     Database(#[from] diesel::result::Error),
     #[error("invalid migration metadata: {0}")]
     Metadata(String),
+    #[error("database schema v6 catalog drift: {0}")]
+    Catalog(#[from] CatalogDifference),
 }
 
 #[derive(QueryableByName)]
@@ -65,17 +70,17 @@ pub fn migrate(db: &mut SqliteConnection) -> Result<MigrationOutcome, MigrationE
             for statement in schema::upgrade_v2_to_v6() {
                 execute(connection, &statement)?;
             }
+            validate_v6_catalog(connection)?;
             migrate_v6_to_v9(connection)?;
             ensure_migration_record(connection, MigrationProgram::V2ToV9)
         }),
-        6 => {
-            validate_v6_record(db)?;
-            db.transaction::<_, MigrationError, _>(|connection| {
-                migrate_v6_to_v9(connection)?;
-                diesel::delete(metadata::table.find("schema.migration.v6")).execute(connection)?;
-                ensure_migration_record(connection, MigrationProgram::V6ToV9)
-            })
-        }
+        6 => db.transaction::<_, MigrationError, _>(|connection| {
+            validate_v6_record(connection)?;
+            validate_v6_catalog(connection)?;
+            migrate_v6_to_v9(connection)?;
+            diesel::delete(metadata::table.find("schema.migration.v6")).execute(connection)?;
+            ensure_migration_record(connection, MigrationProgram::V6ToV9)
+        }),
         7 => db.transaction::<_, MigrationError, _>(|connection| {
             for statement in schema::upgrade_v7_to_v8()
                 .into_iter()
@@ -288,6 +293,17 @@ fn validate_v6_record(db: &mut SqliteConnection) -> Result<(), MigrationError> {
     Ok(())
 }
 
+fn validate_v6_catalog(db: &mut SqliteConnection) -> Result<(), MigrationError> {
+    let mut expected_db = SqliteConnection::establish(":memory:")?;
+    execute(&mut expected_db, &schema::schema_v6_sql())?;
+    let expected = SchemaCatalog::load(&mut expected_db)?;
+    let actual = SchemaCatalog::load(db)?;
+    if let Some(difference) = expected.difference(&actual) {
+        return Err(difference.into());
+    }
+    Ok(())
+}
+
 fn migration_program_hash(program: MigrationProgram) -> String {
     let source = match program {
         MigrationProgram::FreshV6 => schema::schema_v6_sql(),
@@ -371,7 +387,13 @@ mod tests {
     use diesel::sql_types::{BigInt, Text};
 
     use super::*;
+    use crate::database::catalog::SchemaCatalog;
     use crate::schema::{blobs, sites};
+
+    // Restored byte-for-byte from the SQL assets removed by e657598.
+    const HISTORICAL_SCHEMA_V6: &str =
+        include_str!("../../tests/fixtures/historical_schema_v6.sql");
+    const HISTORICAL_V6_TO_V2: &str = include_str!("../../tests/fixtures/historical_v6_to_v2.sql");
 
     #[derive(QueryableByName)]
     struct SchemaObject {
@@ -411,6 +433,198 @@ mod tests {
         let database = root.path().join("symbol.db");
         let connection = SqliteConnection::establish(&database.to_string_lossy()).unwrap();
         (root, connection)
+    }
+
+    fn execute_v6_sql(db: &mut SqliteConnection, sql: &str) {
+        db.batch_execute(sql).unwrap();
+        assert_eq!(schema_version(db).unwrap(), 6);
+    }
+
+    #[test]
+    fn historical_schema_fixtures_remain_byte_exact() {
+        assert_eq!(
+            blake3::hash(HISTORICAL_SCHEMA_V6.as_bytes())
+                .to_hex()
+                .as_str(),
+            "8617a22b6926034a034f978da702cf7e96c5513f96f9999bc0d885c965cf80a4"
+        );
+        assert_eq!(
+            blake3::hash(HISTORICAL_V6_TO_V2.as_bytes())
+                .to_hex()
+                .as_str(),
+            "1e4a8a077621e0ca6ecccf2afbfdd3ebfb15eecad1374bf460d635a9cb8d72da"
+        );
+    }
+
+    fn replace_once(source: &str, from: &str, to: &str) -> String {
+        assert_eq!(source.matches(from).count(), 1, "{from}");
+        source.replacen(from, to, 1)
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum V6CatalogDrift {
+        Table,
+        Column,
+        Type,
+        Nullability,
+        Default,
+        PrimaryKey,
+        ForeignKey,
+        Index,
+        CheckConstraint,
+    }
+
+    impl V6CatalogDrift {
+        const ALL: [Self; 9] = [
+            Self::Table,
+            Self::Column,
+            Self::Type,
+            Self::Nullability,
+            Self::Default,
+            Self::PrimaryKey,
+            Self::ForeignKey,
+            Self::Index,
+            Self::CheckConstraint,
+        ];
+
+        fn initialize(self, db: &mut SqliteConnection) {
+            let base = schema::schema_v6_sql();
+            let sql = match self {
+                Self::Type => replace_once(
+                    &base,
+                    "\"name\" text NOT NULL UNIQUE, \"updated\" integer NOT NULL",
+                    "\"name\" text NOT NULL UNIQUE, \"updated\" text NOT NULL",
+                ),
+                Self::Nullability => replace_once(
+                    &base,
+                    "\"name\" text NOT NULL UNIQUE, \"updated\" integer NOT NULL",
+                    "\"name\" text NOT NULL UNIQUE, \"updated\" integer",
+                ),
+                Self::Default => replace_once(
+                    &base,
+                    "\"public_url\" text NOT NULL DEFAULT ''",
+                    "\"public_url\" text NOT NULL DEFAULT 'drift'",
+                ),
+                Self::PrimaryKey => replace_once(&base, "\"key\" text PRIMARY KEY", "\"key\" text"),
+                Self::ForeignKey => replace_once(
+                    &base,
+                    "FOREIGN KEY (\"site_id\") REFERENCES \"sites\" (\"id\") ON DELETE CASCADE, FOREIGN KEY (\"hash\") REFERENCES \"blobs\" (\"hash\")",
+                    "FOREIGN KEY (\"site_id\") REFERENCES \"sites\" (\"id\"), FOREIGN KEY (\"hash\") REFERENCES \"blobs\" (\"hash\")",
+                ),
+                Self::CheckConstraint => replace_once(
+                    &base,
+                    "\"size\" integer NOT NULL );",
+                    "\"size\" integer NOT NULL CHECK (\"size\" >= 0) );",
+                ),
+                Self::Table | Self::Column | Self::Index => base,
+            };
+            execute_v6_sql(db, &sql);
+            match self {
+                Self::Table => db.batch_execute("DROP TABLE path_aggregates").unwrap(),
+                Self::Column => db
+                    .batch_execute("ALTER TABLE sites DROP COLUMN creator_kind")
+                    .unwrap(),
+                Self::Index => db.batch_execute("DROP INDEX files_hash").unwrap(),
+                Self::Type
+                | Self::Nullability
+                | Self::Default
+                | Self::PrimaryKey
+                | Self::ForeignKey
+                | Self::CheckConstraint => {}
+            }
+        }
+    }
+
+    #[test]
+    fn rust_v6_catalogs_match_the_historical_sql_contract_in_every_dimension() {
+        let (_historical_root, mut historical) = connection();
+        execute_v6_sql(&mut historical, HISTORICAL_SCHEMA_V6);
+        let expected = SchemaCatalog::load(&mut historical).unwrap();
+
+        let (_fresh_root, mut fresh) = connection();
+        execute_v6_sql(&mut fresh, &schema::schema_v6_sql());
+        assert_eq!(SchemaCatalog::load(&mut fresh).unwrap(), expected);
+
+        let (_upgrade_root, mut upgraded) = connection();
+        execute_v6_sql(&mut upgraded, HISTORICAL_SCHEMA_V6);
+        upgraded.batch_execute(HISTORICAL_V6_TO_V2).unwrap();
+        assert_eq!(schema_version(&mut upgraded).unwrap(), 2);
+        for statement in schema::upgrade_v2_to_v6() {
+            execute(&mut upgraded, &statement).unwrap();
+        }
+        set_schema_version(&mut upgraded, 6).unwrap();
+        assert_eq!(SchemaCatalog::load(&mut upgraded).unwrap(), expected);
+    }
+
+    #[test]
+    fn untrusted_v6_catalog_drift_is_rejected_without_changes() {
+        for drift in V6CatalogDrift::ALL {
+            let (_root, mut db) = connection();
+            drift.initialize(&mut db);
+            diesel::insert_into(metadata::table)
+                .values((
+                    metadata::key.eq("catalog-validation-probe"),
+                    metadata::value.eq("unchanged"),
+                ))
+                .execute(&mut db)
+                .unwrap();
+            let before = SchemaCatalog::load(&mut db).unwrap();
+
+            assert!(
+                matches!(migrate(&mut db), Err(MigrationError::Catalog(_))),
+                "{drift:?} drift was accepted"
+            );
+
+            assert_eq!(schema_version(&mut db).unwrap(), 6, "{drift:?}");
+            assert_eq!(SchemaCatalog::load(&mut db).unwrap(), before, "{drift:?}");
+            assert_eq!(
+                metadata::table
+                    .find("catalog-validation-probe")
+                    .select(metadata::value)
+                    .first::<String>(&mut db)
+                    .unwrap(),
+                "unchanged",
+                "{drift:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_v6_metadata_does_not_mask_later_catalog_drift() {
+        let (_root, mut db) = connection();
+        execute_v6_sql(&mut db, &schema::schema_v6_sql());
+        let program = MigrationProgram::BaselineV6;
+        let record = MigrationRecord {
+            version: 6,
+            schema_hash: blake3::hash(schema::schema_v6_sql().as_bytes())
+                .to_hex()
+                .to_string(),
+            program,
+            program_hash: migration_program_hash(program),
+            source_revision: 0,
+            applied_unix_seconds: 0,
+        };
+        diesel::insert_into(metadata::table)
+            .values((
+                metadata::key.eq("schema.migration.v6"),
+                metadata::value.eq(serde_json::to_string(&record).unwrap()),
+            ))
+            .execute(&mut db)
+            .unwrap();
+        db.batch_execute("DROP INDEX files_hash").unwrap();
+        let before = SchemaCatalog::load(&mut db).unwrap();
+
+        assert!(matches!(migrate(&mut db), Err(MigrationError::Catalog(_))));
+
+        assert_eq!(schema_version(&mut db).unwrap(), 6);
+        assert_eq!(SchemaCatalog::load(&mut db).unwrap(), before);
+        assert!(
+            metadata::table
+                .find("schema.migration.v6")
+                .select(metadata::value)
+                .first::<String>(&mut db)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -769,6 +983,7 @@ mod tests {
     fn failed_v6_upgrade_rolls_back_all_catalog_changes() {
         let (_root, mut db) = connection();
         execute(&mut db, &schema::schema_v6_sql()).unwrap();
+        let before = SchemaCatalog::load(&mut db).unwrap();
         db.batch_execute("PRAGMA foreign_keys = OFF").unwrap();
         execute(
             &mut db,
@@ -785,6 +1000,45 @@ mod tests {
         .unwrap()
         .count;
         assert_eq!(count, 0);
+        assert_eq!(SchemaCatalog::load(&mut db).unwrap(), before);
+        assert!(
+            metadata::table
+                .find("schema.migration.v9")
+                .select(metadata::value)
+                .first::<String>(&mut db)
+                .optional()
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn injected_v2_upgrade_failure_rolls_back_v6_catalog_creation() {
+        let (_root, mut db) = connection();
+        execute_v6_sql(&mut db, HISTORICAL_SCHEMA_V6);
+        db.batch_execute(HISTORICAL_V6_TO_V2).unwrap();
+        db.batch_execute("PRAGMA foreign_keys = OFF").unwrap();
+        execute(
+            &mut db,
+            &schema::insert_v6_file(999, "orphan", "missing", 1),
+        )
+        .unwrap();
+        db.batch_execute("PRAGMA foreign_keys = ON").unwrap();
+        let before = SchemaCatalog::load(&mut db).unwrap();
+
+        assert!(matches!(migrate(&mut db), Err(MigrationError::Database(_))));
+
+        assert_eq!(schema_version(&mut db).unwrap(), 2);
+        assert_eq!(SchemaCatalog::load(&mut db).unwrap(), before);
+        assert!(
+            metadata::table
+                .find("schema.migration.v9")
+                .select(metadata::value)
+                .first::<String>(&mut db)
+                .optional()
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
