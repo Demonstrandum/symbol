@@ -78,7 +78,7 @@ test("media types and content formats are immutable and exact", async () => {
     }
 });
 
-test("all 36 installed endpoint mappings execute exact decoders", async () => {
+test("all 40 installed endpoint mappings execute exact decoders", async () => {
     const server = await startMockServer(artifacts.fixture);
     const hash = "a".repeat(64);
     server.expect(
@@ -90,6 +90,19 @@ test("all 36 installed endpoint mappings execute exact decoders", async () => {
         { operation: "installer hash", path: "/install.sh/HASH" },
         { operation: "client", path: "/symbol.sh" },
         { operation: "client hash", path: "/symbol.sh/HASH" },
+        { operation: "api client asset", path: "/api.ts" },
+        { operation: "api client hash", path: "/api.ts/HASH" },
+        { operation: "api documentation", path: "/API/TS" },
+        {
+            operation: "api version",
+            path: "/API/VERSION",
+            headers: { accept: "application/json" },
+            responseBody: JSON.stringify({
+                api_version: esm.API_VERSION,
+                absolute_revision: esm.API_REVISION,
+                source_hash: esm.SOURCE_HASH,
+            }),
+        },
         { operation: "site listing", path: "/FILES", headers: { accept: "application/json" } },
         { operation: "site redirect", path: "/hello" },
         { operation: "site index", path: "/hello/" },
@@ -191,7 +204,11 @@ test("all 36 installed endpoint mappings execute exact decoders", async () => {
     assert.equal((await client.installerHash()).length, 64);
     assert.equal((await client.shellClient()).status, 200);
     assert.equal((await client.shellClientHash()).length, 64);
-    assert.equal((await client.sites()).entries[0].kind, "site");
+    assert.equal((await client.apiClient("api.ts")).status, 200);
+    assert.equal((await client.apiClientHash("api.ts")).length, 64);
+    assert.equal((await client.apiManual("typescript")).status, 200);
+    assert.equal((await client.apiVersion()).identity.apiVersion, esm.API_VERSION);
+    assert.equal((await client.sites()).entries[0].kind, "builtin");
     assert.equal((await site.redirect()).status, 307);
     const index = await site.get();
     assert.equal(index.status, 200);
@@ -261,7 +278,7 @@ test("all 36 installed endpoint mappings execute exact decoders", async () => {
         sourceHash: esm.SOURCE_HASH,
     });
     await server.stop();
-    assert.equal(server.requests.length, 36);
+    assert.equal(server.requests.length, 40);
 });
 
 test("segment encoding, credentials, naming, and custom allocation are exact", async () => {

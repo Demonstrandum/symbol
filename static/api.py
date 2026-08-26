@@ -39,6 +39,13 @@ class ApiMetadata:
     dirty: bool
 
 
+@dataclass(frozen=True, slots=True)
+class ApiIdentity:
+    api_version: str
+    absolute_revision: int
+    source_hash: str
+
+
 METADATA_JSON: Final[str] = """{METADATA}"""
 
 
@@ -126,6 +133,39 @@ class HttpMethod(StrEnum):
     ALIAS = "ALIAS"
     REPLACE = "REPLACE"
     PATCH = "PATCH"
+
+
+class ApiClientAsset(StrEnum):
+    TYPESCRIPT = "api.ts"
+    JAVASCRIPT = "api.js"
+    GLOBAL_JAVASCRIPT = "api.global.js"
+    DECLARATIONS = "api.d.ts"
+    PYTHON = "api.py"
+
+
+class ApiManual(StrEnum):
+    INDEX = "index"
+    JAVASCRIPT = "javascript"
+    TYPESCRIPT = "typescript"
+    PYTHON = "python"
+    SHELL = "shell"
+    PROTOCOL = "protocol"
+
+
+def _api_manual_path(manual: ApiManual) -> str:
+    match manual:
+        case ApiManual.INDEX:
+            return "/API/"
+        case ApiManual.JAVASCRIPT:
+            return "/API/JS"
+        case ApiManual.TYPESCRIPT:
+            return "/API/TS"
+        case ApiManual.PYTHON:
+            return "/API/PY"
+        case ApiManual.SHELL:
+            return "/API/SH"
+        case ApiManual.PROTOCOL:
+            return "/API/CURL"
 
 
 @dataclass(frozen=True, slots=True)
@@ -911,6 +951,33 @@ def _symbol_stats(value: Mapping[str, Any]) -> SymbolStats:
     )
 
 
+def _api_identity(response: ApiResponse) -> ApiIdentity:
+    if response.status != 200:
+        _raise(response)
+    value = _json_object(response)
+    identity = ApiIdentity(
+        api_version=str(value["api_version"]),
+        absolute_revision=int(value["absolute_revision"]),
+        source_hash=str(value["source_hash"]),
+    )
+    if (
+        identity.absolute_revision <= 0
+        or len(identity.source_hash) != 64
+        or any(char not in "0123456789abcdef" for char in identity.source_hash)
+    ):
+        raise UnexpectedResponseError(response)
+    return identity
+
+
+def _raw_hash(response: ApiResponse) -> str:
+    if response.status != 200:
+        _raise(response)
+    value = response.text().strip()
+    if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+        raise UnexpectedResponseError(response)
+    return value
+
+
 def _date(value: object) -> datetime | None:
     return (
         datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(UTC)
@@ -1117,6 +1184,54 @@ class _SymbolSync:
             _raise(response)
         value = _json_object(response)
         return _symbol_stats(value)
+
+    def api_client(
+        self,
+        asset: ApiClientAsset,
+        options: RequestOptions = RequestOptions(),
+    ) -> ApiResponse:
+        response = self._send(
+            HttpMethod.GET,
+            f"{self.origin}/{asset.value}",
+            headers=_options(options),
+        )
+        if response.status not in (200, 304):
+            _raise(response)
+        return response
+
+    def api_client_hash(
+        self,
+        asset: ApiClientAsset,
+        options: RequestOptions = RequestOptions(),
+    ) -> str:
+        response = self._send(
+            HttpMethod.GET,
+            f"{self.origin}/{asset.value}/HASH",
+            headers=_options(options),
+        )
+        return _raw_hash(response)
+
+    def api_manual(
+        self,
+        manual: ApiManual = ApiManual.INDEX,
+        options: RequestOptions = RequestOptions(),
+    ) -> ApiResponse:
+        response = self._send(
+            HttpMethod.GET,
+            self.origin + _api_manual_path(manual),
+            headers=_options(options),
+        )
+        if response.status not in (200, 304):
+            _raise(response)
+        return response
+
+    def api_version(self, options: RequestOptions = RequestOptions()) -> ApiIdentity:
+        response = self._send(
+            HttpMethod.GET,
+            self.origin + "/API/VERSION",
+            headers=_options(options),
+        )
+        return _api_identity(response)
 
     def sites(self) -> DirectoryListing:
         response = self._send(
@@ -1501,9 +1616,7 @@ class FileClient:
 
     def hash(self) -> str:
         response = self.site.symbol._send(HttpMethod.GET, self.url + "/HASH")
-        if response.status != 200:
-            _raise(response)
-        return response.text().strip()
+        return _raw_hash(response)
 
     def replace(
         self,
@@ -1646,6 +1759,58 @@ class _SymbolAsync:
             _raise(response)
         value = _json_object(response)
         return _symbol_stats(value)
+
+    async def api_client(
+        self,
+        asset: ApiClientAsset,
+        options: RequestOptions = RequestOptions(),
+    ) -> ApiResponse:
+        response = await self._send(
+            HttpMethod.GET,
+            f"{self.origin}/{asset.value}",
+            headers=_options(options),
+        )
+        if response.status not in (200, 304):
+            _raise(response)
+        return response
+
+    async def api_client_hash(
+        self,
+        asset: ApiClientAsset,
+        options: RequestOptions = RequestOptions(),
+    ) -> str:
+        response = await self._send(
+            HttpMethod.GET,
+            f"{self.origin}/{asset.value}/HASH",
+            headers=_options(options),
+        )
+        if response.status != 200:
+            _raise(response)
+        return response.text().strip()
+
+    async def api_manual(
+        self,
+        manual: ApiManual = ApiManual.INDEX,
+        options: RequestOptions = RequestOptions(),
+    ) -> ApiResponse:
+        response = await self._send(
+            HttpMethod.GET,
+            self.origin + _api_manual_path(manual),
+            headers=_options(options),
+        )
+        if response.status not in (200, 304):
+            _raise(response)
+        return response
+
+    async def api_version(
+        self, options: RequestOptions = RequestOptions()
+    ) -> ApiIdentity:
+        response = await self._send(
+            HttpMethod.GET,
+            self.origin + "/API/VERSION",
+            headers=_options(options),
+        )
+        return _api_identity(response)
 
     def site(self, name: str, token: str | None = None) -> AsyncSiteClient:
         return AsyncSiteClient(self, name, token if token is not None else self.token)
@@ -1877,12 +2042,16 @@ __all__ = (
     "BUILD_DIRTY",
     "GENERATOR_VERSION",
     "METADATA",
+    "METADATA_JSON",
     "SOURCE_HASH",
     "AbsoluteExpiry",
     "AliasDefinition",
     "AliasInventoryEntry",
     "AliasReceipt",
     "AllocationReceipt",
+    "ApiClientAsset",
+    "ApiIdentity",
+    "ApiManual",
     "ApiMetadata",
     "ApiRequest",
     "ApiResponse",

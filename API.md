@@ -1,13 +1,303 @@
-# symbol HTTP API
+<!-- API:INDEX:START -->
+# Symbol API
+
+Symbol serves static sites and embeds clients for browsers, TypeScript,
+JavaScript, Python 3.14, POSIX shell, and raw HTTP.
+
+- [JavaScript and TypeScript](/API/JS)
+- [Python 3.14](/API/PY)
+- [Shell client](/API/SH)
+- [HTTP, curl, and protocol reference](/API/CURL)
+
+Downloadable clients:
+
+- [`/api.ts`](/api.ts), [`/api.js`](/api.js),
+  [`/api.global.js`](/api.global.js), and [`/api.d.ts`](/api.d.ts)
+- [`/api.py`](/api.py)
+- [`/symbol.sh`](/symbol.sh)
+
+Every client preserves the server's existing authorization rule: unmanaged
+sites are freely mutable; managed sites require a management token. Client
+retries do not weaken optimistic concurrency or idempotency.
+<!-- API:INDEX:END -->
+
+<!-- API:JS:START -->
+# JavaScript and TypeScript
+
+Use the ES module directly:
+
+```js
+import {
+  MediaTypes,
+  RetryPolicies,
+  SymbolClient,
+} from "https://symbol.example/api.js";
+
+await using symbol = new SymbolClient({
+  origin: "https://symbol.example",
+  retryPolicy: RetryPolicies.Default,
+});
+
+const site = symbol.site("notes");
+const text = await site.file("index.html").text();
+```
+
+Browsers without modules may load `/api.global.js`; its identical exports are
+available synchronously from `globalThis.SymbolAPI`. TypeScript may import
+`/api.ts` directly or pair `/api.js` with `/api.d.ts`.
+
+The hierarchy is `SymbolClient → SiteClient → FolderClient/FileClient`.
+Root methods cover stats, listing, unnamed creation, and the raw request escape
+hatch. Site methods cover inventory, aliases, archives, copy/move, undo,
+expiry, management, and conditional publication. File methods cover reads,
+typed decoding, PUT, DELETE, whole replacement, and byte splicing.
+
+Complete method inventory:
+
+- `SymbolClient`: `request`, `docs`, `docsHash`, `installer`,
+  `installerHash`, `shellClient`, `shellClientHash`, `apiClient`,
+  `apiClientHash`, `apiManual`, `apiVersion`, `stats`, `sites`, `create`,
+  `site`, `blob`, `assertExactApi`, and async disposal.
+- `SiteClient`: `file`, `folder`, `redirect`, `get`, `put`, `remove`,
+  `archive`, `pop`, `files`, `alias`, `aliases`, `copy`, `move`, `undo`,
+  `undoStack`, `setExpiry`, `expiry`, and `management`.
+- `FolderClient`: `bytes`, `text`, `json`, `html`, `blob`, and `create`.
+- `FileClient`: `get`, `bytes`, `text`, `json`, `put`, `putJson`, `replace`,
+  `splice`, `patch`, `remove`, `hash`, `setExpiry`, and `expiry`.
+- `ManagementClient`: `status`, `claim`, `rotate`, and `release`.
+- `Operation`: promise-compatible `then`, `retry`, `abort`, status/history
+  accessors, and async disposal.
+
+`apiClient` accepts only `api.ts`, `api.js`, `api.global.js`, `api.d.ts`, and
+`api.py`. `apiManual` accepts only `index`, `javascript`, `typescript`,
+`python`, `shell`, and `protocol`.
+
+## Allocated content-addressed files
+
+```ts
+const receipt = await symbol
+  .site("nlab")
+  .folder("annotations/pages/some-page")
+  .bytes(annotationBytes, {
+    name: { prefix: "comment-", extension: "anno" },
+  });
+
+console.log(receipt.path);       // hash-derived mutable site path
+console.log(receipt.blobUrl);    // immutable content-addressed URL
+console.log(receipt.hash);       // lowercase Blake3
+```
+
+Identical content and naming constraints resolve to the same path. For a
+custom proposed name, pass the synchronous proposal callback accepted by
+`create`; the server rejects a callback result that is invalid or already
+taken. Async clients use prefix, suffix, and extension constraints.
+
+## Aliases and atomic changes
+
+```ts
+const site = symbol.site("notes");
+await site.alias("latest", "releases/current");
+await site.aliases([
+  { path: "docs", target: "releases/current/docs" },
+  { path: "download", target: "releases/current/app.zip" },
+]);
+
+await site.file("data.bin").replace(newBytes, { baseHash });
+await site.file("data.bin").patch(
+  [
+    { offset: 8, deleteBytes: 4, insert: replacement },
+    { offset: 64, deleteBytes: 0, insert: trailer },
+  ],
+  { baseHash },
+);
+```
+
+Aliases have symlink semantics and follow the target path. Reads use the
+cached resolved hash; writes follow the target; dangling aliases remain
+visible; cycles and namespace shadowing are rejected. Batch alias creation and
+multi-splice are atomic.
+
+Operations are awaitable and retryable. The default retry policy is disabled;
+`RetryPolicies.Default` uses exponential backoff with full jitter for safe,
+replayable failures. Each logical idempotent operation generates one key when
+none is supplied and retains it across retries. `SymbolApiError` preserves the
+status, headers, bytes, response, and idempotency key. Owned clients,
+responses, streams, proposals, and operations support `using` or
+`await using`; borrowed transports are never closed by the SDK.
+<!-- API:JS:END -->
+
+<!-- API:PYTHON:START -->
+# Python 3.14
+
+Download the dependency-free generated module and import it directly:
+
+```sh
+curl -fsS "${SYMBOL_BASE}/api.py" -o symbol_api.py
+```
+
+The stdlib client is synchronous:
+
+```python
+from symbol_api import MediaTypes, Symbol
+
+with Symbol(origin="https://symbol.example") as symbol:
+    site = symbol.site("notes")
+    site.file("index.html").put(
+        "<h1>Notes</h1>",
+        media_type=MediaTypes.HTML,
+    )
+    print(site.file("index.html").text())
+```
+
+`HttpClient.stdlib()`, `.requests()`, `.urllib3()`, and `.httpx()` normalize
+the supported synchronous transports. `AsyncHttpClient.httpx()` and
+`.aiohttp()` select asynchronous operation; the overloaded `Symbol(...)`
+factory returns the matching sync or async hierarchy.
+
+```python
+import asyncio
+from symbol_api import AsyncHttpClient, CreateFileOptions, GeneratedName, Symbol
+
+async def main() -> None:
+    async with Symbol(
+        AsyncHttpClient.aiohttp(),
+        origin="https://symbol.example",
+    ) as symbol:
+        receipt = await (
+            symbol.site("nlab")
+            .folder("annotations/pages/some-page")
+            .create(
+                b"annotation bytes",
+                CreateFileOptions(
+                    name=GeneratedName(prefix="comment-", extension="anno"),
+                ),
+            )
+        )
+        print(receipt.path, receipt.blob_url)
+
+asyncio.run(main())
+```
+
+Optional backends import lazily; importing `/api.py` requires only Python
+3.14. Models are frozen, slotted dataclasses. Request methods use exact receipt
+and error classes; raw arbitrary JSON alone remains dynamically typed.
+Management tokens remain caller-owned in-memory values. Context-manager exit
+closes owned transports exactly once and leaves borrowed clients open.
+
+Both sync and async roots provide `stats`, `sites`, `site`, `api_client`,
+`api_client_hash`, `api_manual`, `api_version`, and raw `request`. Site
+clients provide `file`, `folder`, `files`, `alias`, `aliases`, `copy`, `move`,
+`archive`, `pop`, `undo`, expiry, and management operations. Folder clients
+provide `create`, `bytes`, `text`, and `json`; file clients provide `get`,
+`bytes`, `text`, `json`, `put`, `remove`, `hash`, `replace`, and `splice`.
+Use `ApiClientAsset` and `ApiManual` enums rather than unvalidated strings for
+the built-in resources.
+<!-- API:PYTHON:END -->
+
+<!-- API:SHELL:START -->
+# POSIX shell client
+
+Download:
+
+```sh
+curl -fsS "${SYMBOL_BASE}/symbol.sh" -o symbol
+chmod +x symbol
+```
+
+Core workflows:
+
+```sh
+symbol put index.html
+symbol put notes ./dist
+symbol sync
+symbol clone notes
+symbol get notes
+symbol copy notes notes-copy
+symbol move notes-copy notes-archive
+symbol alias notes latest releases/current
+symbol rm notes old.txt
+symbol undo --stack notes
+symbol expire notes --in 30d
+symbol manage notes --claim
+```
+
+`put` merges and never implicitly wipes unrelated paths. `sync` compares the
+checkout manifest and refuses upstream drift. `get` downloads without
+deleting; `pop` downloads and deletes; `rm` deletes without backup. A file
+argument of `-` reads stdin for upload and writes stdout for download.
+Archives preserve aliases as symlinks when supported and materialize safe
+copies otherwise.
+
+Commands resolve by unique proper-name prefix, then by substring only when no
+prefix matches. An ambiguous input reports only distinct proper operations.
+Proper command names are `put`, `clone`, `get`, `pop`, `copy`, `remix`,
+`move`, `alias`, `sync`, `undo`, `expire`, `manage`, `recover`, `ls`, `rm`,
+`url`, `stats`, `update`, and `help`.
+Aliases are footnotes, not additional proper commands:
+
+1. `push` → `put`
+2. `pull` → `clone`
+3. `rename` → `move`
+4. `add` → `put`
+5. `x` → `remix`
+6. `list` → `ls`
+7. `download` → `get`
+8. `delete` → `rm`
+9. `upgrade` → `update`
+
+Managed sites read tokens from `--token`, then `SYMBOL_TOKEN`, then the
+mode-0600 checkout manifest. Generated PUT/COPY operations retain pending
+idempotency records; `symbol recover` safely replays them after a dropped
+response.
+<!-- API:SHELL:END -->
+
+<!-- API:PROTOCOL:START -->
+# HTTP and curl protocol
 
 This is the implementation reference for the current public HTTP surface.
 Examples use `SYMBOL_BASE=https://symbol.example`; set it to the configured
-`SYMBOL_PUBLIC_URL`. The human-facing client guide is
-[`static/docs.md`](static/docs.md), and deployment details are in
-[`README.md`](README.md).
+`SYMBOL_PUBLIC_URL`.
 
-`symbol contract` on the server binary emits the typed route, method, header,
-and status inventory used by conformance tests for this document.
+`symbol contract` emits the typed route, method, header, and status inventory
+used by conformance tests for this document.
+
+<!-- contract:api documentation -->
+### `GET /API`
+
+Returns `307 Temporary Redirect` with `Location: /API/`. Mutation methods are
+rejected with `405` and `Allow: GET, HEAD`.
+
+### `GET /API/{manual}`
+
+`/API/`, `/API/JS`, `/API/PY`, `/API/SH`, and `/API/CURL` are compiled from
+the marked sections in this file. JS/TS, PY/PYTHON, SH, and
+CURL/HTTP/REST/PROTOCOL aliases return identical bytes, ETags, cache policy,
+and canonical `Link`. HTML is negotiated for browsers; explicit Markdown or
+plain requests receive the canonical section. Responses use `no-cache`,
+`Vary: Accept, User-Agent`, and support `If-None-Match`.
+
+The uppercase `API` namespace is built into the binary, absent from SQLite and
+storage statistics, and listed as `kind: "builtin"` in `/FILES`. Every
+mutation below it returns `405` with `Allow: GET, HEAD`.
+
+<!-- contract:api client asset -->
+### `GET /{sdk}`
+
+The exact paths `/api.ts`, `/api.js`, `/api.global.js`, `/api.d.ts`, and
+`/api.py` serve generated artifacts embedded in the binary. They use strong
+ETags, `Cache-Control: no-cache`, and conditional `304` responses.
+
+<!-- contract:api client hash -->
+### `GET /{sdk}/HASH`
+
+The same five paths followed by `/HASH` return the lowercase 64-hex Blake3
+digest plus a newline.
+
+<!-- contract:api version -->
+### `GET /API/VERSION`
+
+Returns `api_version`, `absolute_revision`, and `source_hash` as JSON with a
+strong ETag and `Cache-Control: no-cache`.
 
 ## Protocol conventions
 
@@ -1016,5 +1306,5 @@ The current service does **not** implement:
 - conditional `If-None-Match` handling for inventory JSON, stats, hash
   endpoints, expiry reports, undo stacks, or management status;
 - gzip response compression in the application itself (the sample Caddy proxy
-  supplies it);
-- a public `/API.md` HTTP route. This file is repository documentation.
+  supplies it).
+<!-- API:PROTOCOL:END -->

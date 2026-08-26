@@ -280,6 +280,11 @@
             python3 tests/sdk/py/optional.py
             python3 tests/sdk/py/real.py
           '';
+          sdkDocs = sdkCheck "symbol-sdk-docs" [ pkgs.python3 ] ''
+            export SYMBOL_BIN="${package}/bin/symbol"
+            python3 tests/api_contract.py
+            python3 tests/documentation_surface.py
+          '';
           named = posix // {
             inherit package;
             generated-sources = generatedSources;
@@ -291,6 +296,7 @@
             sdk-ts = sdkTs;
             sdk-browser = sdkBrowser;
             sdk-py = sdkPy;
+            sdk-docs = sdkDocs;
           };
         in
         named

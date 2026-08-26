@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import os
 import pathlib
 import re
 import shlex
@@ -9,8 +10,9 @@ import sys
 root = pathlib.Path(__file__).resolve().parent.parent
 api = (root / "API.md").read_text()
 freeze = json.loads((root / "public-api-freeze.json").read_text())
+symbol_bin = pathlib.Path(os.environ.get("SYMBOL_BIN", root / "target/debug/symbol"))
 contract = json.loads(
-    subprocess.check_output([root / "target/debug/symbol", "contract"], text=True)
+    subprocess.check_output([symbol_bin, "contract"], text=True)
 )
 
 

@@ -44,6 +44,7 @@ sh -n tests/production_guard.sh
 sh tests/production_guard.sh
 python3 tests/public_api_freeze.py
 python3 tests/api_contract.py
+python3 tests/documentation_surface.py
 python3 tests/command_matrix.py
 tests/symbol_client.sh
 sh tests/alias_transfer_e2e.sh

@@ -74,6 +74,11 @@ with tempfile.TemporaryDirectory() as root:
             raise AssertionError("temporary Symbol server did not start")
 
         symbol = api.Symbol(origin=origin)
+        assert symbol.api_client(api.ApiClientAsset.PYTHON).status == 200
+        assert len(symbol.api_client_hash(api.ApiClientAsset.PYTHON)) == 64
+        assert symbol.api_manual(api.ApiManual.PYTHON).status == 200
+        assert symbol.api_version().api_version == api.API_VERSION
+        assert symbol.sites().entries[0].kind == "builtin"
         created = (
             symbol.site("python-sdk")
             .file("index.html")

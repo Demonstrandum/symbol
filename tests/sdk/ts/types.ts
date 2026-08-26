@@ -3,7 +3,9 @@ import {
   type AllocationReceipt,
   type ArchiveDownload,
   BodyNotReplayableError,
+  type CachedApiIdentity,
   type CachedFileInventory,
+  type CachedTextAsset,
   ContentFormats,
   type ExpiryReport,
   type FileInventory,
@@ -34,6 +36,9 @@ const inventory: Operation<CachedFileInventory> = site.files();
 const listing = site.files("assets");
 const stats: Operation<SymbolStats> = client.stats();
 const creation: Operation<SiteCreationReceipt> = client.create("hello");
+const apiAsset: Operation<CachedTextAsset> = client.apiClient("api.ts");
+const apiManual: Operation<CachedTextAsset> = client.apiManual("typescript");
+const apiIdentity: Operation<CachedApiIdentity> = client.apiVersion();
 const allocation: Operation<AllocationReceipt> = site.folder("generated").json({ value: 1 });
 const alias: Operation<AliasReceipt> = site.alias("latest", "data.bin");
 const replacement: Operation<FileReplaceReceipt> = site
@@ -61,6 +66,13 @@ async function narrowing(): Promise<void> {
     cached.etag.toUpperCase();
     // @ts-expect-error 304 responses do not lie about having inventory fields.
     cached.files;
+  }
+  const identity = await apiIdentity;
+  if (identity.status === 200) {
+    identity.identity.apiVersion.toUpperCase();
+  } else {
+    const absent: null = identity.identity;
+    void absent;
   }
   const allocated = await allocation;
   if (allocated.changed) {
@@ -128,11 +140,17 @@ new Operation<SymbolStats>({} as never);
 site.put("body", { idempotencyKey: "unsupported" });
 // @ts-expect-error unsupported file PUTs cannot accept idempotency keys.
 site.file("data.bin").put("body", { idempotencyKey: "unsupported" });
+// @ts-expect-error generated assets are a closed set.
+client.apiClient("api.rb");
+// @ts-expect-error manuals are a closed set.
+client.apiManual("ruby");
 
 void inventory;
 void listing;
 void stats;
 void creation;
+void apiAsset;
+void apiManual;
 void alias;
 void splice;
 void narrowing;

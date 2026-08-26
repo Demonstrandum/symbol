@@ -660,8 +660,8 @@ function validateFixture(fixture) {
     assert.match(fixture.source_hash, /^[0-9a-f]{64}$/);
     assert.match(fixture.build.commit, /^(?:unknown|[0-9a-fA-F]{7,64})$/);
     assert.equal(typeof fixture.build.dirty, "boolean");
-    assert.equal(fixture.operations.length, 36);
-    assert.equal(new Set(fixture.operations.map((operation) => operation.name)).size, 36);
+    assert.equal(fixture.operations.length, 40);
+    assert.equal(new Set(fixture.operations.map((operation) => operation.name)).size, 40);
     for (const operation of fixture.operations) {
         assert.equal(operation.outcomes_exact, true, `${operation.name} outcomes must be exact`);
         for (const outcome of [...operation.success_outcomes, ...operation.error_outcomes]) {
@@ -774,6 +774,12 @@ function validateMockOutcome(operation, outcome, status, headers, body) {
 function validateSchema(schema, value) {
     const object = exactObject(value, schema);
     switch (schema) {
+        case "api_version":
+            exactKeys(object, ["api_version", "absolute_revision", "source_hash"], schema);
+            assert.match(object.api_version, /^\d+\.\d+\.\d+$/);
+            assert(Number.isSafeInteger(object.absolute_revision));
+            assert.match(object.source_hash, /^[0-9a-f]{64}$/);
+            return;
         case "stats":
             exactKeys(object, [
                 "sites", "files", "aliases", "blobs", "bytes", "logical_bytes", "saved_bytes",
@@ -924,11 +930,28 @@ function canonicalOutcome(
             return textAsset(base, "#!/bin/sh\n", status);
         case "client":
             return textAsset(base, "#!/bin/sh\n# symbol\n", status);
+        case "api client asset":
+            return textAsset(base, "export const generated = true;\n", status);
+        case "api documentation":
+            return textAsset(base, "# Symbol API\n", status);
         case "docs hash":
         case "installer hash":
         case "client hash":
+        case "api client hash":
         case "file hash":
             return plain(base, `${"a".repeat(64)}\n`);
+        case "api version":
+            if (status === 304) {
+                return empty({ ETag: quotedRawHash("a"), "Cache-Control": "no-cache" });
+            }
+            return json({
+                ETag: quotedRawHash("a"),
+                "Cache-Control": "no-cache",
+            }, {
+                api_version: "0.0.0",
+                absolute_revision: 1,
+                source_hash: "a".repeat(64),
+            });
         case "stats":
             return json(base, statsFixture());
         case "site listing":
@@ -945,7 +968,7 @@ function canonicalOutcome(
             return json({
                 ETag: quotedRawHash("1"),
                 "Cache-Control": "no-cache",
-            }, listingFixture());
+            }, listingFixture(operation.name === "site listing"));
         case "site redirect":
             return empty({ ...base, Location: "/hello/", "Content-Length": "0" });
         case "site index":
@@ -1333,13 +1356,16 @@ function allocationOutcome(base, requestHeaders, requestBody, status, requests) 
     });
 }
 
-function listingFixture() {
+function listingFixture(includeBuiltin = false) {
     return {
         path: "/",
         files: 1,
         aliases: 0,
         bytes: 8,
-        entries: [{ kind: "site", name: "hello", files: 1, bytes: 8 }],
+        entries: [
+            ...(includeBuiltin ? [{ kind: "builtin", name: "API", files: null, bytes: 0 }] : []),
+            { kind: "site", name: "hello", files: 1, bytes: 8 },
+        ],
     };
 }
 

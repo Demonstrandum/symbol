@@ -59,6 +59,10 @@ export type EndpointName =
   | "installer hash"
   | "client"
   | "client hash"
+  | "api client asset"
+  | "api client hash"
+  | "api documentation"
+  | "api version"
   | "site listing"
   | "site redirect"
   | "site index"
@@ -95,6 +99,7 @@ interface EmbeddedOutcome {
   readonly schema:
     | "empty"
     | "asset"
+    | "api_version"
     | "hash"
     | "stats"
     | "directory_listing"
@@ -695,6 +700,7 @@ export interface FileInventory {
 }
 
 export type DirectoryEntry =
+  | { readonly kind: "builtin"; readonly name: string; readonly files: null; readonly bytes: 0 }
   | { readonly kind: "site"; readonly name: string; readonly files: number; readonly bytes: number }
   | {
       readonly kind: "directory";
@@ -1311,6 +1317,10 @@ export interface EndpointErrorMap {
   readonly "installer hash": NotFoundError;
   readonly client: never;
   readonly "client hash": NotFoundError;
+  readonly "api client asset": never;
+  readonly "api client hash": NotFoundError;
+  readonly "api documentation": NotFoundError;
+  readonly "api version": never;
   readonly "site listing": ServerError;
   readonly "site redirect": ValidationError | NotFoundError;
   readonly "site index": ReadProtocolError;
@@ -1607,6 +1617,9 @@ interface RequestPlan<T> {
   readonly dispose: (() => Promise<void>) | null;
 }
 
+export type ApiClientAsset = "api.ts" | "api.js" | "api.global.js" | "api.d.ts" | "api.py";
+export type ApiManual = "index" | "javascript" | "typescript" | "python" | "shell" | "protocol";
+
 export class SymbolClient {
   constructor(options: SymbolClientOptions = {}) {
     const origin = normalizedOrigin(options.origin);
@@ -1716,6 +1729,42 @@ export class SymbolClient {
     return plainTextOperation(this, "client hash", "/symbol.sh/HASH", options);
   }
 
+  apiClient(asset: ApiClientAsset, options: CachedRequestOptions = {}): Operation<CachedTextAsset> {
+    return textAssetOperation(this, "api client asset", `/${asset}`, options);
+  }
+
+  apiClientHash(asset: ApiClientAsset, options: RequestOptions = {}): Operation<string> {
+    return plainTextOperation(this, "api client hash", `/${asset}/HASH`, options);
+  }
+
+  apiManual(
+    manual: ApiManual = "index",
+    options: CachedRequestOptions = {},
+  ): Operation<CachedTextAsset> {
+    return textAssetOperation(this, "api documentation", apiManualPath(manual), options);
+  }
+
+  apiVersion(options: CachedRequestOptions = {}): Operation<CachedApiIdentity> {
+    const headers = new Headers({ Accept: "application/json" });
+    if (options.ifNoneMatch !== undefined) {
+      headers.set("If-None-Match", options.ifNoneMatch);
+    }
+    return jsonOperation(this, {
+      endpoint: "api version",
+      path: "/API/VERSION",
+      method: "GET",
+      options,
+      headers,
+      body: replayBody(null),
+      idempotencyKey: null,
+      sendIdempotencyKey: false,
+      retrySafe: true,
+      successStatuses: [200, 304],
+      decode: decodeCachedApiVersion,
+      dispose: null,
+    });
+  }
+
   stats(options: RequestOptions = {}): Operation<SymbolStats> {
     return jsonOperation(this, {
       endpoint: "stats",
@@ -1796,6 +1845,22 @@ export type CachedTextAsset =
       readonly status: 304;
       readonly body: null;
       readonly contentType: null;
+      readonly etag: string;
+      readonly cacheControl: string;
+      readonly response: Response;
+    };
+
+export type CachedApiIdentity =
+  | {
+      readonly status: 200;
+      readonly identity: SymbolApiIdentity;
+      readonly etag: string;
+      readonly cacheControl: string;
+      readonly response: Response;
+    }
+  | {
+      readonly status: 304;
+      readonly identity: null;
       readonly etag: string;
       readonly cacheControl: string;
       readonly response: Response;
@@ -2985,7 +3050,7 @@ function hostedBodyOperation<T>(
 
 function textAssetOperation(
   client: SymbolClient,
-  endpoint: "docs" | "installer" | "client",
+  endpoint: "docs" | "installer" | "client" | "api client asset" | "api documentation",
   path: string,
   options: CachedRequestOptions,
 ): Operation<CachedTextAsset> {
@@ -3034,9 +3099,47 @@ function textAssetOperation(
   });
 }
 
+async function decodeCachedApiVersion(response: Response): Promise<CachedApiIdentity> {
+  const preserved = response.clone();
+  const etag = quotedHashHeader(response, "ETag");
+  requireCacheControl(response);
+  const cacheControl = requiredHeader(response, "Cache-Control");
+  if (response.status === 304) {
+    forbidHeaders(response, ["Content-Type", "Content-Length"]);
+    return Object.freeze({
+      status: 304,
+      identity: null,
+      etag,
+      cacheControl,
+      response: preserved,
+    });
+  }
+  const value = exactRecord(
+    await jsonValue(response),
+    ["api_version", "absolute_revision", "source_hash"],
+    "API version",
+  );
+  const sourceHash = stringValue(value.source_hash, "API version.source_hash");
+  if (!isSourceHash(sourceHash)) {
+    throw new TypeError("API version.source_hash must be 64 lowercase hexadecimal characters");
+  }
+  const identity = Object.freeze({
+    apiVersion: stringValue(value.api_version, "API version.api_version"),
+    absoluteRevision: unsigned(value.absolute_revision, "API version.absolute_revision"),
+    sourceHash,
+  });
+  return Object.freeze({
+    status: 200,
+    identity,
+    etag,
+    cacheControl,
+    response: preserved,
+  });
+}
+
 function plainTextOperation(
   client: SymbolClient,
-  endpoint: "docs hash" | "installer hash" | "client hash" | "file hash",
+  endpoint: "docs hash" | "installer hash" | "client hash" | "api client hash" | "file hash",
   path: string,
   options: RequestOptions,
 ): Operation<string> {
@@ -3325,6 +3428,23 @@ function normalizedOrigin(origin: string | URL | undefined): URL {
     );
   }
   return value;
+}
+
+function apiManualPath(manual: ApiManual): string {
+  switch (manual) {
+    case "index":
+      return "/API/";
+    case "javascript":
+      return "/API/JS";
+    case "typescript":
+      return "/API/TS";
+    case "python":
+      return "/API/PY";
+    case "shell":
+      return "/API/SH";
+    case "protocol":
+      return "/API/CURL";
+  }
 }
 
 function endpointUrl(client: SymbolClient, segments: readonly string[], trailing = false): URL {
@@ -4212,6 +4332,19 @@ async function decodeDirectoryListing(response: Response): Promise<DirectoryList
   const entries = array(value.entries, "directory listing.entries").map((entry, index) => {
     const record = recordValue(entry, `directory listing.entries[${index}]`);
     const kind = stringValue(record.kind, `directory listing.entries[${index}].kind`);
+    if (kind === "builtin") {
+      exactKeys(record, ["kind", "name", "files", "bytes"], "directory builtin entry");
+      requireNull(record.files, "directory builtin entry.files");
+      if (unsigned(record.bytes, "directory builtin entry.bytes") !== 0) {
+        throw new TypeError("directory builtin entry.bytes must be zero");
+      }
+      return Object.freeze({
+        kind,
+        name: stringValue(record.name, "directory builtin entry.name"),
+        files: null,
+        bytes: 0 as const,
+      });
+    }
     if (kind === "site" || kind === "directory") {
       exactKeys(record, ["kind", "name", "files", "bytes"], `directory ${kind} entry`);
       return Object.freeze({

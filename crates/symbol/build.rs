@@ -119,6 +119,17 @@ fn write_outputs(
         provenance: BuildProvenance::discover(root)?,
     };
     generate_artifacts(root, &metadata)?.write_to(out_dir)?;
+    let api_source = fs::read_to_string(root.join("API.md"))?;
+    for page in generation::docs::compile(&api_source)? {
+        write_generated_file(
+            &out_dir.join(format!("api-doc-{}.md", page.manual.slug())),
+            &page.markdown,
+        )?;
+        write_generated_file(
+            &out_dir.join(format!("api-doc-{}.html", page.manual.slug())),
+            &page.html,
+        )?;
+    }
     Ok(())
 }
 

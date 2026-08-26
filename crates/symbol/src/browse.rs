@@ -12,19 +12,24 @@ use crate::store::{AliasResolvedKind, DirList, EntryKind, SiteList};
 
 pub fn sites(headers: &HeaderMap, list: &SiteList) -> Response {
     if wants_json(headers) {
-        let entries = list
-            .entries
-            .iter()
-            .map(|entry| ListingEntry {
-                kind: ListingKind::Site,
-                name: entry.name.clone(),
-                files: Some(entry.files),
-                bytes: entry.bytes,
-                target: None,
-                target_kind: None,
-                dangling: None,
-            })
-            .collect();
+        let mut entries = vec![ListingEntry {
+            kind: ListingKind::Builtin,
+            name: "API".to_string(),
+            files: None,
+            bytes: 0,
+            target: None,
+            target_kind: None,
+            dangling: None,
+        }];
+        entries.extend(list.entries.iter().map(|entry| ListingEntry {
+            kind: ListingKind::Site,
+            name: entry.name.clone(),
+            files: Some(entry.files),
+            bytes: entry.bytes,
+            target: None,
+            target_kind: None,
+            dangling: None,
+        }));
         return json_response(
             headers,
             &Listing {
@@ -117,11 +122,13 @@ fn render_sites_plain(list: &SiteList) -> String {
         .iter()
         .map(|entry| HumanSize::new(entry.bytes))
         .collect();
+    sizes.push(HumanSize::new(0));
     sizes.push(HumanSize::new(list.bytes));
     let name_width = list
         .entries
         .iter()
         .map(|entry| entry.name.len() + 1)
+        .chain(std::iter::once("API/".len()))
         .max()
         .unwrap_or(0)
         .max(12);
@@ -139,6 +146,7 @@ fn render_sites_plain(list: &SiteList) -> String {
         size: SizeLayout::from_sizes(&sizes),
     };
     let mut out = String::new();
+    push_listing_row(&mut out, "API/", None, 0, layout, " built-in");
     for entry in &list.entries {
         push_listing_row(
             &mut out,
@@ -173,6 +181,10 @@ fn render_sites_html(list: &SiteList) -> String {
                 (list.files) " files · " (size_label(list.bytes)) " logical"
             }
             .list {
+                a.row href="/API/" {
+                    span.name { "API/" }
+                    span.meta { "built-in" }
+                }
                 @for entry in &list.entries {
                     a.row href=(format!("/{}/FILES/", entry.name)) {
                         span.name { (&entry.name) "/" }
@@ -572,6 +584,7 @@ mod tests {
         assert_eq!(
             render_sites_plain(&list),
             concat!(
+                "API/                      0    B   built-in\n",
                 "hello/        8 files     3.60 MiB\n",
                 "notes/        3 files   410    KiB\n",
                 "             11 files     4.00 MiB total\n",
@@ -633,13 +646,14 @@ mod tests {
         assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
         assert_eq!(
             body_text(response).await,
-            r#"{"path":"/","files":1,"aliases":0,"bytes":512,"entries":[{"kind":"site","name":"hello","files":1,"bytes":512}]}"#
+            r#"{"path":"/","files":1,"aliases":0,"bytes":512,"entries":[{"kind":"builtin","name":"API","files":null,"bytes":0},{"kind":"site","name":"hello","files":1,"bytes":512}]}"#
         );
 
         let response = sites(&accept("text/html"), &list);
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_text(response).await;
         assert!(body.contains("1 files · 512 B"));
+        assert!(body.contains(r#"href="/API/""#));
         assert!(body.contains(r#"href="/hello/FILES/""#));
         assert!(body.contains("font-variant-numeric: tabular-nums"));
     }

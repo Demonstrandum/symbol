@@ -4,6 +4,12 @@ macro_rules! static_asset {
     };
 }
 
+macro_rules! generated_asset {
+    ($name:literal) => {
+        include_str!(concat!(env!("OUT_DIR"), "/", $name))
+    };
+}
+
 mod blob_store;
 mod browse;
 #[cfg(test)]
@@ -59,10 +65,33 @@ const DEFAULT_MAX_FILE_SIZE: u64 = 4 * 1024 * 1024 * 1024;
 const STREAM_THRESHOLD: u64 = 1024 * 1024;
 const INSTALL_SH: &str = static_asset!("install.sh");
 const SYMBOL_SH: &str = static_asset!("symbol.sh");
+const API_TS: &str = generated_asset!("api.ts");
+const API_JS: &str = generated_asset!("api.js");
+const API_GLOBAL_JS: &str = generated_asset!("api.global.js");
+const API_D_TS: &str = generated_asset!("api.d.ts");
+const API_PY: &str = generated_asset!("api.py");
+const API_DOC_INDEX_MD: &str = generated_asset!("api-doc-index.md");
+const API_DOC_INDEX_HTML: &str = generated_asset!("api-doc-index.html");
+const API_DOC_JS_MD: &str = generated_asset!("api-doc-js.md");
+const API_DOC_JS_HTML: &str = generated_asset!("api-doc-js.html");
+const API_DOC_PYTHON_MD: &str = generated_asset!("api-doc-python.md");
+const API_DOC_PYTHON_HTML: &str = generated_asset!("api-doc-python.html");
+const API_DOC_SHELL_MD: &str = generated_asset!("api-doc-shell.md");
+const API_DOC_SHELL_HTML: &str = generated_asset!("api-doc-shell.html");
+const API_DOC_PROTOCOL_MD: &str = generated_asset!("api-doc-protocol.md");
+const API_DOC_PROTOCOL_HTML: &str = generated_asset!("api-doc-protocol.html");
 const API_VERSION: &str = env!("SYMBOL_API_VERSION");
 const API_REVISION: &str = env!("SYMBOL_API_REVISION");
 const API_SOURCE_HASH: &str = env!("SYMBOL_API_SOURCE_HASH");
 static NEXT_MUTATION_SIGNAL_ID: AtomicU64 = AtomicU64::new(1);
+static API_VERSION_DOCUMENT: LazyLock<String> = LazyLock::new(|| {
+    serde_json::json!({
+        "api_version": API_VERSION,
+        "absolute_revision": API_REVISION.parse::<u64>().expect("generated API revision"),
+        "source_hash": API_SOURCE_HASH,
+    })
+    .to_string()
+});
 static CUSTOM_MUTATION_METHODS: LazyLock<[Method; 7]> = LazyLock::new(|| {
     [
         contract::METHOD_ALIAS,
@@ -466,6 +495,7 @@ fn router(app: App) -> Router {
         .route(contract::INSTALL_HASH, get(install_sh_hash))
         .route(contract::CLIENT, get(symbol_sh))
         .route(contract::CLIENT_HASH, get(symbol_sh_hash))
+        .merge(api_router())
         .route(contract::FILES, get(list_sites))
         .route(contract::FILES_SLASH, get(list_sites))
         .route(
@@ -539,12 +569,67 @@ fn router(app: App) -> Router {
         .with_state(app)
 }
 
+fn api_router() -> Router<App> {
+    Router::new()
+        .route(contract::API_TS, get(api_ts))
+        .route(contract::API_TS_HASH, get(api_ts_hash))
+        .route(contract::API_JS, get(api_js))
+        .route(contract::API_JS_HASH, get(api_js_hash))
+        .route(contract::API_GLOBAL_JS, get(api_global_js))
+        .route(contract::API_GLOBAL_JS_HASH, get(api_global_js_hash))
+        .route(contract::API_D_TS, get(api_d_ts))
+        .route(contract::API_D_TS_HASH, get(api_d_ts_hash))
+        .route(contract::API_PY, get(api_py))
+        .route(contract::API_PY_HASH, get(api_py_hash))
+        .route(contract::API, api_manual_methods(get(api_redirect)))
+        .route(contract::API_INDEX, api_manual_methods(get(api_index)))
+        .route(
+            contract::API_JS_MANUAL,
+            api_manual_methods(get(api_javascript)),
+        )
+        .route(
+            contract::API_TS_MANUAL,
+            api_manual_methods(get(api_javascript)),
+        )
+        .route(contract::API_PY_MANUAL, api_manual_methods(get(api_python)))
+        .route(
+            contract::API_PYTHON_MANUAL,
+            api_manual_methods(get(api_python)),
+        )
+        .route(contract::API_SH_MANUAL, api_manual_methods(get(api_shell)))
+        .route(
+            contract::API_CURL_MANUAL,
+            api_manual_methods(get(api_protocol)),
+        )
+        .route(
+            contract::API_HTTP_MANUAL,
+            api_manual_methods(get(api_protocol)),
+        )
+        .route(
+            contract::API_REST_MANUAL,
+            api_manual_methods(get(api_protocol)),
+        )
+        .route(
+            contract::API_PROTOCOL_MANUAL,
+            api_manual_methods(get(api_protocol)),
+        )
+        .route(contract::API_VERSION, api_manual_methods(get(api_version)))
+        .route(
+            contract::API_PATH,
+            api_manual_methods(get(api_manual_not_found)),
+        )
+}
+
 fn control_namespace_methods(methods: MethodRouter<App>) -> MethodRouter<App> {
     methods
         .post(mutation_http::reject_control_allocation)
         .put(mutation_http::reject_control_allocation)
         .patch(mutation_http::reject_control_allocation)
         .fallback(control_namespace_method)
+}
+
+fn api_manual_methods(methods: MethodRouter<App>) -> MethodRouter<App> {
+    methods.fallback(api_manual_method_not_allowed)
 }
 
 fn make_http_span(request: &Request<Body>) -> tracing::Span {
@@ -810,6 +895,150 @@ fn lookup_hash(store: &Store, name: &str, rel: &str) -> Result<Option<String>, S
 async fn docs(State(app): State<App>, headers: HeaderMap) -> Response {
     page::render(&headers, &app.public_url, page::negotiate(&headers))
 }
+
+async fn api_redirect() -> Redirect {
+    Redirect::temporary("/API/")
+}
+
+async fn api_index(headers: HeaderMap) -> Response {
+    api_manual_response(
+        &headers,
+        API_DOC_INDEX_MD,
+        API_DOC_INDEX_HTML,
+        "</API/>; rel=\"canonical\"",
+    )
+}
+
+async fn api_javascript(headers: HeaderMap) -> Response {
+    api_manual_response(
+        &headers,
+        API_DOC_JS_MD,
+        API_DOC_JS_HTML,
+        "</API/JS>; rel=\"canonical\"",
+    )
+}
+
+async fn api_python(headers: HeaderMap) -> Response {
+    api_manual_response(
+        &headers,
+        API_DOC_PYTHON_MD,
+        API_DOC_PYTHON_HTML,
+        "</API/PY>; rel=\"canonical\"",
+    )
+}
+
+async fn api_shell(headers: HeaderMap) -> Response {
+    api_manual_response(
+        &headers,
+        API_DOC_SHELL_MD,
+        API_DOC_SHELL_HTML,
+        "</API/SH>; rel=\"canonical\"",
+    )
+}
+
+async fn api_protocol(headers: HeaderMap) -> Response {
+    api_manual_response(
+        &headers,
+        API_DOC_PROTOCOL_MD,
+        API_DOC_PROTOCOL_HTML,
+        "</API/CURL>; rel=\"canonical\"",
+    )
+}
+
+async fn api_version(headers: HeaderMap) -> Response {
+    generated_asset_response(
+        &headers,
+        &API_VERSION_DOCUMENT,
+        "application/json; charset=utf-8",
+    )
+}
+
+async fn api_manual_not_found() -> Response {
+    plain(StatusCode::NOT_FOUND, "error: API manual not found\n")
+}
+
+async fn api_manual_method_not_allowed() -> Response {
+    let mut response = plain(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "error: the built-in API site is read-only\n",
+    );
+    response
+        .headers_mut()
+        .insert(header::ALLOW, HeaderValue::from_static("GET, HEAD"));
+    response
+}
+
+fn api_manual_response(
+    headers: &HeaderMap,
+    markdown: &'static str,
+    html: &'static str,
+    canonical: &'static str,
+) -> Response {
+    let (body, content_type) = match page::negotiate(headers) {
+        page::Flavor::Html => (html, "text/html; charset=utf-8"),
+        page::Flavor::Plain | page::Flavor::Man => (markdown, "text/markdown; charset=utf-8"),
+    };
+    let mut representation = http_cache::Representation::new(body, content_type);
+    representation.vary = Some(HeaderValue::from_static("Accept, User-Agent"));
+    representation.link = Some(HeaderValue::from_static(canonical));
+    http_cache::respond(headers, representation)
+}
+
+fn generated_asset_response(
+    headers: &HeaderMap,
+    body: &'static str,
+    content_type: &'static str,
+) -> Response {
+    http_cache::respond(headers, http_cache::Representation::new(body, content_type))
+}
+
+macro_rules! generated_asset_handlers {
+    ($handler:ident, $hash_handler:ident, $body:ident, $content_type:literal, $key:literal) => {
+        async fn $handler(headers: HeaderMap) -> Response {
+            generated_asset_response(&headers, $body, $content_type)
+        }
+
+        async fn $hash_handler(State(app): State<App>) -> Response {
+            hash_body(&app, $key, $body.as_bytes())
+        }
+    };
+}
+
+generated_asset_handlers!(
+    api_ts,
+    api_ts_hash,
+    API_TS,
+    "text/typescript; charset=utf-8",
+    "api.ts"
+);
+generated_asset_handlers!(
+    api_js,
+    api_js_hash,
+    API_JS,
+    "text/javascript; charset=utf-8",
+    "api.js"
+);
+generated_asset_handlers!(
+    api_global_js,
+    api_global_js_hash,
+    API_GLOBAL_JS,
+    "text/javascript; charset=utf-8",
+    "api.global.js"
+);
+generated_asset_handlers!(
+    api_d_ts,
+    api_d_ts_hash,
+    API_D_TS,
+    "text/typescript; charset=utf-8",
+    "api.d.ts"
+);
+generated_asset_handlers!(
+    api_py,
+    api_py_hash,
+    API_PY,
+    "text/x-python; charset=utf-8",
+    "api.py"
+);
 
 async fn install_sh(State(app): State<App>, headers: HeaderMap) -> Response {
     render_script(INSTALL_SH, &app.public_url, &headers)
@@ -2938,12 +3167,6 @@ mod tests {
     #[tokio::test]
     async fn every_typed_contract_endpoint_observes_a_declared_status() {
         for endpoint in contract::ENDPOINTS {
-            if matches!(
-                endpoint.name,
-                "api client asset" | "api client hash" | "api documentation" | "api version"
-            ) {
-                continue;
-            }
             let root = tempfile::tempdir().unwrap();
             let store = Store::new(root.path().to_path_buf()).unwrap();
             let app = router(test_app(store));
@@ -2955,6 +3178,10 @@ mod tests {
                 "installer hash" => "/install.sh/HASH",
                 "client" => "/symbol.sh",
                 "client hash" => "/symbol.sh/HASH",
+                "api documentation" => "/API/JS",
+                "api client asset" => "/api.js",
+                "api client hash" => "/api.js/HASH",
+                "api version" => "/API/VERSION",
                 "site listing" => "/FILES",
                 "site redirect" | "site put" | "site pop" | "site copy" | "site move"
                 | "site undo" | "site expire" | "site management" => "/missing",
@@ -4583,5 +4810,176 @@ mod tests {
                 .unwrap();
             assert_eq!(source_ip.as_deref(), Some(expected));
         }
+    }
+
+    #[tokio::test]
+    async fn api_virtual_site_redirects_negotiates_and_aliases_identically() {
+        let root = tempfile::tempdir().unwrap();
+        let app = router(test_app(Store::new(root.path().to_path_buf()).unwrap()));
+
+        let redirect = app
+            .clone()
+            .oneshot(Request::builder().uri("/API").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(redirect.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(redirect.headers()[header::LOCATION], "/API/");
+
+        let index = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/API/")
+                    .header(header::ACCEPT, "text/html")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(index.status(), StatusCode::OK);
+        assert_eq!(
+            index.headers()[header::CONTENT_TYPE],
+            "text/html; charset=utf-8"
+        );
+        assert!(
+            to_bytes(index.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .windows(b"<h1>Symbol API</h1>".len())
+                .any(|window| window == b"<h1>Symbol API</h1>")
+        );
+
+        let canonical = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/API/JS")
+                    .header(header::ACCEPT, "text/markdown")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(canonical.status(), StatusCode::OK);
+        assert_eq!(
+            canonical.headers()[header::CONTENT_TYPE],
+            "text/markdown; charset=utf-8"
+        );
+        let etag = canonical.headers()[header::ETAG].clone();
+        let canonical_body = to_bytes(canonical.into_body(), usize::MAX).await.unwrap();
+
+        let alias = app
+            .oneshot(
+                Request::builder()
+                    .uri("/API/TS")
+                    .header(header::ACCEPT, "text/markdown")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(alias.status(), StatusCode::OK);
+        assert_eq!(alias.headers()[header::ETAG], etag);
+        assert_eq!(
+            to_bytes(alias.into_body(), usize::MAX).await.unwrap(),
+            canonical_body
+        );
+    }
+
+    #[tokio::test]
+    async fn api_virtual_site_rejects_mutations_and_is_listed_as_builtin() {
+        let root = tempfile::tempdir().unwrap();
+        let app = router(test_app(Store::new(root.path().to_path_buf()).unwrap()));
+
+        for method in [
+            "PUT", "POST", "DELETE", "COPY", "MOVE", "PATCH", "ALIAS", "REPLACE", "EXPIRE", "UNDO",
+            "MANAGE",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri("/API/JS")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{method}"
+            );
+            assert_eq!(response.headers()[header::ALLOW], "GET, HEAD");
+        }
+
+        let listing = app
+            .oneshot(
+                Request::builder()
+                    .uri("/FILES")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(listing.into_body(), usize::MAX).await.unwrap();
+        assert!(body.windows(b"API/".len()).any(|window| window == b"API/"));
+    }
+
+    #[tokio::test]
+    async fn generated_sdk_assets_and_hashes_are_served_from_the_binary() {
+        let root = tempfile::tempdir().unwrap();
+        let app = router(test_app(Store::new(root.path().to_path_buf()).unwrap()));
+
+        for (path, content_type) in [
+            ("/api.ts", "text/typescript; charset=utf-8"),
+            ("/api.js", "text/javascript; charset=utf-8"),
+            ("/api.global.js", "text/javascript; charset=utf-8"),
+            ("/api.d.ts", "text/typescript; charset=utf-8"),
+            ("/api.py", "text/x-python; charset=utf-8"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert_eq!(response.headers()[header::CONTENT_TYPE], content_type);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-cache");
+
+            let hash = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("{path}/HASH"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(hash.status(), StatusCode::OK, "{path}/HASH");
+            assert_eq!(
+                to_bytes(hash.into_body(), usize::MAX).await.unwrap().len(),
+                65
+            );
+        }
+
+        let version = app
+            .oneshot(
+                Request::builder()
+                    .uri("/API/VERSION")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(version.status(), StatusCode::OK);
+        let version: serde_json::Value =
+            serde_json::from_slice(&to_bytes(version.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(version["api_version"], API_VERSION);
+        assert_eq!(version["absolute_revision"].to_string(), API_REVISION);
+        assert_eq!(version["source_hash"], API_SOURCE_HASH);
     }
 }

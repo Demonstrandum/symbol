@@ -140,6 +140,27 @@ def test_sync_client_mapping() -> None:
     )
     assert symbol.stats().files == 2
 
+    backend.queue(200, b"export {}", (("Content-Type", "text/typescript"),))
+    assert symbol.api_client(api.ApiClientAsset.TYPESCRIPT).status == 200
+    assert backend.requests[-1].url == "http://symbol/api.ts"
+
+    backend.queue(200, ("a" * 64 + "\n").encode())
+    assert symbol.api_client_hash(api.ApiClientAsset.TYPESCRIPT) == "a" * 64
+
+    backend.queue(200, b"# TypeScript", (("Content-Type", "text/markdown"),))
+    assert symbol.api_manual(api.ApiManual.TYPESCRIPT).text() == "# TypeScript"
+
+    backend.queue(
+        200,
+        {
+            "api_version": api.API_VERSION,
+            "absolute_revision": api.API_REVISION,
+            "source_hash": api.SOURCE_HASH,
+        },
+        (("Content-Type", "application/json"),),
+    )
+    assert symbol.api_version().source_hash == api.SOURCE_HASH
+
     backend.queue(200, b"hello", (("Content-Type", "text/plain"),))
     assert symbol.site("demo").file("space name.txt").text() == "hello"
     assert backend.requests[-1].url.endswith("/demo/space%20name.txt")

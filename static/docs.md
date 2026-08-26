@@ -68,94 +68,12 @@ claim; Symbol does not terminate TLS itself. PUT adds or updates paths;
 copy creates a new site, and move changes its name. each mutation prints its
 inverse `symbol undo` command while retained.
 
-## curl
+## full API manuals
 
-no name provided gets you a 4-character id, e.g. [{host}/k7qm/]({host}/k7qm/)
+- [JavaScript and TypeScript]({host}/API/JS)
+- [Python 3.14]({host}/API/PY)
+- [shell client]({host}/API/SH)
+- [curl and HTTP protocol]({host}/API/CURL)
 
-```
-curl -T index.html {host}/
-curl -T index.html {host}/hello
-```
-
-add a file to that site: PUT
-
-```
-curl -T style.css {host}/hello/style.css
-curl -T style.css {host}/hello/  # same; curl appends the local filename
-curl -T style.css {host}/hello/style.css \
-  -H 'If-Match: "blake3:CURRENT_TREE_HASH"' # 412 if upstream changed
-```
-
-large stored files are uploaded and served as streams. byte ranges, seeking,
-resume, HEAD, and browser buffering are supported for media such as mp3/mp4.
-
-```
-curl -T movie.mp4 {host}/media/movie.mp4
-curl -H 'Range: bytes=1000000-' {host}/media/movie.mp4
-```
-
-individual stored files can be up to 4 GiB. archive unpacking is limited to
-50 MiB compressed and 80 MiB extracted.
-
-a zip, stored as a file
-
-```
-curl -T site.zip {host}/hello
-```
-
-unpack a zip / tar / tar.gz / gz into the site
-
-```
-curl -T site.zip -H unpack:1 {host}/hello
-curl -T site.tar.gz -H unpack:1 {host}/hello
-curl -T notes.txt.gz -H unpack:1 {host}/hello
-```
-
-a directory, via tar (always unpacked)
-
-```
-tar -czf - -C ./dist . | curl -T -    \
-  -H 'Content-Type: application/gzip' \
-  -H unpack:1 {host}/hello
-```
-
-file browse: GET {host}/FILES lists sites. site and folder sizes are recursive
-logical sizes, so duplicate content is counted once per file reference.
-GET {host}/path/HASH is that file's hash.
-
-```
-curl {host}/FILES
-curl {host}/hello/FILES
-curl {host}/hello/FILES/css/
-curl -H 'Accept: application/json' {host}/hello/FILES
-curl {host}/hello/index.html/HASH
-```
-
-copy, move, undo, and expiry are HTTP methods too
-
-```
-curl -X COPY {host}/hello -H 'Destination: /hello-copy'
-curl -X MOVE {host}/hello-copy -H 'Destination: /hello-moved'
-curl {host}/hello/UNDO
-curl -X UNDO {host}/hello
-curl -X EXPIRE {host}/hello
-curl -X MANAGE {host}/hello -H 'Management-Action: status'
-```
-
-download a site without removing it
-
-```
-curl -OJ {host}/hello.tar.gz
-curl -OJ {host}/hello.tar
-curl -OJ {host}/hello.zip
-```
-
-delete a file, or pop a site (DELETE returns the site as tar.gz)
-
-```
-curl -X DELETE {host}/hello/style.css
-curl -OJ -X DELETE {host}/hello  # removes, saves locally as hello.tar.gz
-```
-
-full request and response details are in
-[API.md](https://github.com/Demonstrandum/symbol/blob/main/API.md).
+the built-in [{host}/API/]({host}/API/) site is compiled from the canonical
+API reference and cannot be modified like a hosted site.

@@ -33,6 +33,7 @@ libsqlite3-sys = { version = "0.38.2", features = ["bundled"] }
 sea-query = { version = "1.0.2", features = ["backend-sqlite", "derive"], default-features = false }
 
 [dev-dependencies]
+pulldown-cmark = "0.13.4"
 swc_core = { version = "77.0.3", default-features = false, features = ["common", "ecma_ast", "ecma_codegen", "ecma_parser_typescript", "ecma_transforms_typescript", "ecma_transforms_module", "ecma_visit"] }
 tempfile = "3"
 toml = "1.1.4"
@@ -91,6 +92,7 @@ use_self = "warn"
 [build-dependencies]
 blake3 = "1"
 lightningcss = { version = "1.0.0-alpha.72", default-features = false }
+pulldown-cmark = "0.13.4"
 sea-query = { version = "1.0.2", default-features = false, features = ["backend-sqlite", "derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

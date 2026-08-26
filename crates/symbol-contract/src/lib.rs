@@ -36,6 +36,29 @@ pub const INSTALL: &str = "/install.sh";
 pub const INSTALL_HASH: &str = "/install.sh/HASH";
 pub const CLIENT: &str = "/symbol.sh";
 pub const CLIENT_HASH: &str = "/symbol.sh/HASH";
+pub const API_TS: &str = "/api.ts";
+pub const API_TS_HASH: &str = "/api.ts/HASH";
+pub const API_JS: &str = "/api.js";
+pub const API_JS_HASH: &str = "/api.js/HASH";
+pub const API_GLOBAL_JS: &str = "/api.global.js";
+pub const API_GLOBAL_JS_HASH: &str = "/api.global.js/HASH";
+pub const API_D_TS: &str = "/api.d.ts";
+pub const API_D_TS_HASH: &str = "/api.d.ts/HASH";
+pub const API_PY: &str = "/api.py";
+pub const API_PY_HASH: &str = "/api.py/HASH";
+pub const API: &str = "/API";
+pub const API_INDEX: &str = "/API/";
+pub const API_JS_MANUAL: &str = "/API/JS";
+pub const API_TS_MANUAL: &str = "/API/TS";
+pub const API_PY_MANUAL: &str = "/API/PY";
+pub const API_PYTHON_MANUAL: &str = "/API/PYTHON";
+pub const API_SH_MANUAL: &str = "/API/SH";
+pub const API_CURL_MANUAL: &str = "/API/CURL";
+pub const API_HTTP_MANUAL: &str = "/API/HTTP";
+pub const API_REST_MANUAL: &str = "/API/REST";
+pub const API_PROTOCOL_MANUAL: &str = "/API/PROTOCOL";
+pub const API_VERSION: &str = "/API/VERSION";
+pub const API_PATH: &str = "/API/{*path}";
 pub const SITE_FILES: &str = "/{name}/FILES";
 pub const SITE_FILES_SLASH: &str = "/{name}/FILES/";
 pub const SITE_FILES_PATH: &str = "/{name}/FILES/{*path}";
@@ -177,6 +200,53 @@ pub static ENDPOINTS: &[EndpointContract] = &[
         &[404],
         &[],
         &["Content-Type"]
+    ),
+    endpoint!(
+        "api client asset",
+        "GET",
+        true,
+        "/{api.ts|api.js|api.global.js|api.d.ts|api.py}",
+        &[200, 304],
+        &[304],
+        &["If-None-Match"],
+        &["Cache-Control", "Content-Type", "ETag"]
+    ),
+    endpoint!(
+        "api client hash",
+        "GET",
+        true,
+        "/{api.ts|api.js|api.global.js|api.d.ts|api.py}/HASH",
+        &[200],
+        &[404],
+        &[],
+        &["Content-Type"]
+    ),
+    endpoint!(
+        "api documentation",
+        "GET",
+        true,
+        "/API[/]|/API/{JS|TS|PY|PYTHON|SH|CURL|HTTP|REST|PROTOCOL}",
+        &[200, 304, 307],
+        &[304, 404],
+        &["Accept", "If-None-Match"],
+        &[
+            "Cache-Control",
+            "Content-Type",
+            "ETag",
+            "Link",
+            "Location",
+            "Vary"
+        ]
+    ),
+    endpoint!(
+        "api version",
+        "GET",
+        true,
+        "/API/VERSION",
+        &[200, 304],
+        &[304],
+        &["If-None-Match"],
+        &["Cache-Control", "Content-Type", "ETag"]
     ),
     endpoint!(
         "site listing",
@@ -649,6 +719,7 @@ pub enum WireBody {
 pub enum WireSchema {
     Empty,
     Asset,
+    ApiVersion,
     Hash,
     Stats,
     DirectoryListing,
@@ -841,6 +912,7 @@ pub struct ExpirySiteReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ListingKind {
+    Builtin,
     Site,
     Directory,
     File,
@@ -866,7 +938,7 @@ impl serde::Serialize for ListingEntry {
         use serde::ser::SerializeStruct as _;
 
         match self.kind {
-            ListingKind::Site | ListingKind::Directory => {
+            ListingKind::Builtin | ListingKind::Site | ListingKind::Directory => {
                 let mut entry = serializer.serialize_struct("ListingEntry", 4)?;
                 entry.serialize_field("kind", &self.kind)?;
                 entry.serialize_field("name", &self.name)?;
@@ -1238,15 +1310,16 @@ fn typed_success_outcomes(endpoint: &'static EndpointContract) -> Vec<FixtureOut
 )]
 fn typed_success_outcome(name: &str, status: u16) -> FixtureOutcome {
     let (body, schema, required_headers, forbidden_headers) = match (name, status) {
-        ("docs" | "installer" | "client", 200) => (
+        ("docs" | "installer" | "client" | "api documentation" | "api client asset", 200) => (
             WireBody::PlainText,
             WireSchema::Asset,
             &["Content-Type", "ETag", "Cache-Control"][..],
             &["Content-Range", "Location"][..],
         ),
         (
-            "docs" | "installer" | "client" | "site listing" | "site index" | "site file"
-            | "files inventory" | "files subtree" | "immutable blob",
+            "docs" | "installer" | "client" | "api documentation" | "api client asset"
+            | "api version" | "site listing" | "site index" | "site file" | "files inventory"
+            | "files subtree" | "immutable blob",
             304,
         ) => (
             WireBody::Empty,
@@ -1259,16 +1332,24 @@ fn typed_success_outcome(name: &str, status: u16) -> FixtureOutcome {
                 "Location",
             ][..],
         ),
-        ("docs hash" | "installer hash" | "client hash" | "file hash", 200) => (
-            WireBody::PlainText,
-            WireSchema::Hash,
-            &["Content-Type"][..],
-            &["Content-Range", "Location"][..],
-        ),
+        ("docs hash" | "installer hash" | "client hash" | "api client hash" | "file hash", 200) => {
+            (
+                WireBody::PlainText,
+                WireSchema::Hash,
+                &["Content-Type"][..],
+                &["Content-Range", "Location"][..],
+            )
+        }
         ("stats", 200) => (
             WireBody::Json,
             WireSchema::Stats,
             &["Content-Type"][..],
+            &["Content-Range", "Location"][..],
+        ),
+        ("api version", 200) => (
+            WireBody::Json,
+            WireSchema::ApiVersion,
+            &["Content-Type", "ETag", "Cache-Control"][..],
             &["Content-Range", "Location"][..],
         ),
         ("site listing" | "files subtree", 200) => (
@@ -1276,6 +1357,12 @@ fn typed_success_outcome(name: &str, status: u16) -> FixtureOutcome {
             WireSchema::DirectoryListing,
             &["Content-Type", "ETag", "Cache-Control"][..],
             &["Content-Range", "Location"][..],
+        ),
+        ("api documentation", 307) => (
+            WireBody::Empty,
+            WireSchema::Empty,
+            &["Location"][..],
+            &["Content-Type", "Content-Range", "ETag"][..],
         ),
         ("site redirect" | "site index" | "site file" | "files subtree", 307) => (
             WireBody::Empty,

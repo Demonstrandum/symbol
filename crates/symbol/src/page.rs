@@ -791,9 +791,13 @@ mod tests {
         let page = parse(SOURCE).unwrap();
         assert!(page.title.contains("symbol"));
         assert!(!page.lead.is_empty());
-        assert!(page.sections.iter().any(|s| s.heading == "curl"));
+        assert!(
+            page.sections
+                .iter()
+                .any(|s| s.heading == "full API manuals")
+        );
         assert!(page.sections.iter().any(|s| {
-            s.blocks.iter().any(|b| matches!(b, Block::Example { commands, .. } if commands.contains("{host}/hello")))
+            s.blocks.iter().any(|b| matches!(b, Block::Example { commands, .. } if commands.contains("symbol put hello")))
         }));
     }
 
@@ -843,9 +847,8 @@ mod tests {
         assert!(text.contains("NAME\n"));
         assert!(text.contains("symbol - tailnet hosting of static sites on http://symbol."));
         assert!(text.contains("DESCRIPTION\n"));
-        assert!(text.contains("curl -T index.html http://symbol/hello"));
-        assert!(text.contains("e.g. http://symbol/k7qm/"));
-        assert!(!text.contains("[http://symbol/k7qm/]"));
+        assert!(text.contains("http://symbol/API/JS"));
+        assert!(text.contains("http://symbol/API/CURL"));
         assert!(!text.contains("{host}"));
         assert!(!text.contains('`'));
         assert!(text.trim_end().ends_with("SYMBOL(1)"));
@@ -856,7 +859,7 @@ mod tests {
     fn man_overstrike_for_less() {
         let text = fill_man("http://symbol");
         assert!(text.contains('\u{8}'));
-        assert!(text.contains("http://symbol/hello"));
+        assert!(text.contains("http://symbol/API/JS"));
         assert!(!text.contains("{host}"));
         assert!(text.contains(&overstrike("NAME")));
         assert!(text.contains(&overstrike("symbol")));
@@ -866,13 +869,12 @@ mod tests {
     #[test]
     fn html_is_prebuilt_and_host_is_filled() {
         let html = fill_html("http://symbol");
-        assert!(html.contains("class=\"url\">http://symbol/hello</span>"));
-        assert!(html.contains("class=\"cmd\">curl</span>"));
-        assert!(html.contains("<a href=\"http://symbol/k7qm/\">http://symbol/k7qm/</a>"));
+        assert!(html.contains("<a href=\"http://symbol/API/JS\">"));
+        assert!(html.contains("class=\"cmd\">symbol</span>"));
         assert!(html.contains("<h2>NAME</h2>"));
         assert!(!html.contains("{host}"));
         assert!(templates().html.contains("{host}"));
-        assert!(templates().html.contains("class=\"cmd\">curl</span>"));
+        assert!(templates().html.contains("class=\"cmd\">symbol</span>"));
     }
 
     #[test]
