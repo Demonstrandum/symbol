@@ -80,6 +80,7 @@
           ./api-version.toml
           ./check
           ./crates
+          ./examples
           ./flake.nix
           ./nix
           ./public-api-freeze.json
@@ -257,7 +258,10 @@
             pkgs.nodejs
             pkgs.typescript
           ] ''
-            biome check --config-path=tooling/biome.json static/api.ts tests/sdk/ts/*.ts
+            biome check --config-path=tooling/biome.json \
+              static/api.ts tests/sdk/ts/*.ts \
+              examples/annotation-site/app.js examples/annotation-site/styles.css
+            node --input-type=module --check < examples/annotation-site/app.js
             export TSC="${pkgs.typescript}/bin/tsc"
             export SYMBOL_BIN="${package}/bin/symbol"
             node tests/sdk/ts/run.mjs

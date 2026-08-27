@@ -28,7 +28,10 @@ cargo build --workspace --locked
 node tests/sdk/mock-server.mjs
 node tests/sdk/js/runtime.mjs
 node tests/sdk/js/real.mjs
-biome check --config-path=tooling/biome.json static/api.ts tests/sdk/ts/*.ts
+biome check --config-path=tooling/biome.json \
+  static/api.ts tests/sdk/ts/*.ts \
+  examples/annotation-site/app.js examples/annotation-site/styles.css
+node --input-type=module --check < examples/annotation-site/app.js
 node tests/sdk/ts/run.mjs
 node tests/sdk/js/browser-smoke.mjs
 uv --project tooling run --frozen ruff check --config tooling/pyproject.toml static/api.py tests/sdk/py

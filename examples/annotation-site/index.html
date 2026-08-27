@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Margin — text annotations on Symbol</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <header class="masthead">
+      <div>
+        <p class="kicker">A same-site Symbol API demo</p>
+        <h1>Margin</h1>
+      </div>
+      <div class="connection">
+        <span id="site-label">connecting</span>
+        <button id="settings-button" type="button">Access</button>
+      </div>
+    </header>
+
+    <main>
+      <section class="reading-pane" aria-labelledby="document-title">
+        <div class="document-meta">
+          <span>Working paper 07</span>
+          <span>Select within a paragraph to annotate</span>
+        </div>
+        <article id="document">
+          <h2 id="document-title">The useful life of a small tool</h2>
+          <p class="dek">
+            Software becomes durable when its ordinary path stays obvious and
+            its advanced machinery remains available without becoming mandatory.
+          </p>
+          <p data-block="opening">
+            A small tool earns trust through proportion. The first action should
+            be visible, reversible, and unsurprising. Features can accumulate,
+            but each one should preserve the shape of the simple case rather than
+            forcing every user to understand the most complicated one.
+          </p>
+          <p data-block="names">
+            Names matter because they become the handles people remember. A good
+            interface uses familiar nouns for stable things and precise verbs for
+            change. It should be possible to guess a command, read its help, and
+            recover from a mistake without learning the implementation beneath it.
+          </p>
+          <p data-block="storage">
+            Storage systems have a second obligation: uncertainty must bias
+            toward preservation. Metadata can be rebuilt and indexes can be
+            compacted, but user bytes should move to quarantine before any process
+            is allowed to call them disposable.
+          </p>
+          <p data-block="protocol">
+            A typed protocol helps only when the types survive contact with the
+            wire. Structured versions should be parsed as versions, hashes should
+            be validated as hashes, and malformed responses should fail loudly
+            instead of becoming plausible empty objects.
+          </p>
+          <p data-block="ending">
+            The result is not minimal software. It is software with a clear
+            centre: easy to begin, transparent when examined, and conservative
+            with anything that cannot be recreated.
+          </p>
+        </article>
+      </section>
+
+      <aside class="annotation-pane" aria-labelledby="annotation-title">
+        <div class="rail-heading">
+          <div>
+            <p class="kicker">Live margin</p>
+            <h2 id="annotation-title">Annotations</h2>
+          </div>
+          <button id="new-button" type="button" disabled>Annotate selection</button>
+        </div>
+
+        <section id="composer" class="composer" hidden>
+          <p id="composer-mode" class="composer-mode">New annotation</p>
+          <blockquote id="selection-preview"></blockquote>
+          <label for="comment">Comment</label>
+          <textarea id="comment" rows="5" maxlength="4000"></textarea>
+          <div class="composer-actions">
+            <button id="cancel-button" class="quiet" type="button">Cancel</button>
+            <button id="save-button" type="button">Save annotation</button>
+          </div>
+        </section>
+
+        <p id="status" class="status" role="status">Loading annotations…</p>
+        <div id="annotations" class="annotations"></div>
+      </aside>
+    </main>
+
+    <dialog id="settings" class="settings-dialog">
+      <form method="dialog">
+        <p class="kicker">Managed sites only</p>
+        <h2>Access token</h2>
+        <p>
+          Leave this empty for an unmanaged site. The token stays in this browser
+          tab and is sent only to the current origin.
+        </p>
+        <label for="token">Management token</label>
+        <input id="token" type="password" autocomplete="off">
+        <div class="composer-actions">
+          <button value="cancel" class="quiet">Cancel</button>
+          <button id="apply-token" value="default">Apply</button>
+        </div>
+      </form>
+    </dialog>
+
+    <template id="annotation-template">
+      <article class="annotation-card">
+        <button class="annotation-target" type="button">
+          <span class="annotation-number"></span>
+          <q class="annotation-quote"></q>
+        </button>
+        <p class="annotation-comment"></p>
+        <footer>
+          <code class="annotation-path"></code>
+          <button class="edit-button" type="button">Edit</button>
+        </footer>
+      </article>
+    </template>
+
+    <script type="module" src="app.js"></script>
+  </body>
+</html>

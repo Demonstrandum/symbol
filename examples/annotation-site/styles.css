@@ -1,0 +1,405 @@
+:root {
+  --paper: #e9f0f4;
+  --sheet: #f8fbfc;
+  --ink: #102a43;
+  --muted: #627d98;
+  --rule: #b8c8d3;
+  --pencil: #c43d2f;
+  --pencil-dark: #8f2d24;
+  --blue: #2f6f8f;
+  --highlight: rgb(240 184 74 / 34%);
+  color-scheme: light;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  min-height: 100%;
+  background:
+    linear-gradient(90deg, transparent 0 31px, rgb(47 111 143 / 8%) 32px 33px, transparent 34px),
+    var(--paper);
+}
+
+body {
+  min-height: 100vh;
+  margin: 0;
+  color: var(--ink);
+  font-family: Georgia, "Times New Roman", serif;
+}
+
+button,
+textarea,
+input {
+  font: inherit;
+}
+
+button {
+  border: 1px solid var(--ink);
+  border-radius: 2px;
+  padding: 0.55rem 0.8rem;
+  background: var(--ink);
+  color: white;
+  cursor: pointer;
+}
+
+button:hover {
+  background: var(--blue);
+  border-color: var(--blue);
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.35;
+}
+
+button:focus-visible,
+textarea:focus-visible,
+input:focus-visible {
+  outline: 3px solid rgb(47 111 143 / 30%);
+  outline-offset: 2px;
+}
+
+.quiet {
+  background: transparent;
+  color: var(--ink);
+}
+
+.masthead {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  min-height: 8rem;
+  border-bottom: 1px solid var(--ink);
+  padding: 2rem clamp(1rem, 4vw, 4rem) 1.1rem;
+  background: rgb(248 251 252 / 82%);
+}
+
+.masthead h1,
+.rail-heading h2,
+.settings-dialog h2 {
+  margin: 0;
+  font-family: "Arial Narrow", "Helvetica Neue", sans-serif;
+  font-size: clamp(2.2rem, 6vw, 4.6rem);
+  font-weight: 800;
+  letter-spacing: -0.06em;
+  line-height: 0.84;
+}
+
+.kicker,
+.document-meta,
+.connection,
+.composer-mode,
+.annotation-card footer,
+.status {
+  font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.kicker {
+  margin: 0 0 0.65rem;
+  color: var(--pencil);
+  font-weight: 700;
+}
+
+.connection {
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+  color: var(--muted);
+}
+
+main {
+  display: grid;
+  grid-template-columns: minmax(0, 1.75fr) minmax(20rem, 1fr);
+  min-height: calc(100vh - 8rem);
+}
+
+.reading-pane {
+  border-right: 1px solid var(--ink);
+  padding: clamp(2rem, 6vw, 6rem) clamp(1.25rem, 7vw, 7rem);
+  background: var(--sheet);
+}
+
+.document-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  border-bottom: 1px solid var(--rule);
+  padding-bottom: 0.7rem;
+  color: var(--muted);
+}
+
+#document {
+  max-width: 45rem;
+  margin: 3rem auto 0;
+}
+
+#document h2 {
+  max-width: 11ch;
+  margin: 0 0 1.2rem;
+  font-family: "Arial Narrow", "Helvetica Neue", sans-serif;
+  font-size: clamp(2.8rem, 7vw, 6.4rem);
+  font-weight: 800;
+  letter-spacing: -0.06em;
+  line-height: 0.88;
+}
+
+#document .dek {
+  margin: 0 0 3rem;
+  color: var(--blue);
+  font-size: 1.25rem;
+  font-style: italic;
+  line-height: 1.5;
+}
+
+#document p[data-block] {
+  position: relative;
+  margin: 0;
+  padding: 1.15rem 0 1.15rem 2.4rem;
+  border-top: 1px solid var(--rule);
+  font-size: clamp(1rem, 1.6vw, 1.18rem);
+  line-height: 1.78;
+}
+
+#document p[data-block]::before {
+  position: absolute;
+  top: 1.45rem;
+  left: 0;
+  color: var(--muted);
+  content: attr(data-block);
+  font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font-size: 0.62rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  writing-mode: vertical-rl;
+}
+
+::highlight(symbol-annotations) {
+  background: var(--highlight);
+  text-decoration: underline 2px var(--pencil);
+  text-underline-offset: 3px;
+}
+
+::selection {
+  background: rgb(47 111 143 / 24%);
+}
+
+.annotation-pane {
+  padding: 2rem clamp(1rem, 3vw, 2.5rem) 4rem;
+  background:
+    repeating-linear-gradient(0deg, transparent 0 31px, rgb(98 125 152 / 10%) 32px), var(--paper);
+}
+
+.rail-heading {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 1rem;
+  border-bottom: 3px double var(--ink);
+  padding-bottom: 1rem;
+}
+
+.rail-heading h2,
+.settings-dialog h2 {
+  font-size: 2rem;
+  letter-spacing: -0.04em;
+}
+
+.composer {
+  margin: 1.5rem 0;
+  border: 1px solid var(--ink);
+  border-left: 5px solid var(--pencil);
+  padding: 1rem;
+  background: var(--sheet);
+  box-shadow: 5px 5px 0 rgb(16 42 67 / 12%);
+}
+
+.composer-mode {
+  margin: 0 0 0.6rem;
+  color: var(--pencil);
+}
+
+blockquote {
+  margin: 0 0 1rem;
+  border-left: 1px solid var(--rule);
+  padding-left: 0.8rem;
+  color: var(--blue);
+  font-style: italic;
+}
+
+label {
+  display: block;
+  margin-bottom: 0.35rem;
+  font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+textarea,
+input {
+  width: 100%;
+  border: 1px solid var(--ink);
+  border-radius: 0;
+  padding: 0.7rem;
+  background: white;
+  color: var(--ink);
+}
+
+textarea {
+  resize: vertical;
+}
+
+.composer-actions {
+  display: flex;
+  justify-content: end;
+  gap: 0.6rem;
+  margin-top: 0.8rem;
+}
+
+.status {
+  margin: 1.2rem 0;
+  color: var(--muted);
+}
+
+.annotations {
+  display: grid;
+  gap: 1rem;
+}
+
+.annotation-card {
+  position: relative;
+  border: 1px solid var(--ink);
+  padding: 1rem;
+  background: var(--sheet);
+  box-shadow: 4px 4px 0 rgb(16 42 67 / 10%);
+}
+
+.annotation-card::before,
+.annotation-card::after {
+  position: absolute;
+  left: -0.65rem;
+  color: var(--pencil);
+  content: "[";
+  font-family: Georgia, serif;
+  font-size: 1.6rem;
+}
+
+.annotation-card::before {
+  top: -0.45rem;
+}
+
+.annotation-card::after {
+  bottom: -0.45rem;
+  transform: scaleY(-1);
+}
+
+.annotation-target {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.6rem;
+  width: 100%;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--ink);
+  text-align: left;
+}
+
+.annotation-target:hover {
+  background: transparent;
+  color: var(--pencil-dark);
+}
+
+.annotation-number {
+  color: var(--pencil);
+  font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font-size: 0.72rem;
+}
+
+.annotation-quote {
+  color: var(--blue);
+  font-size: 0.92rem;
+  font-style: italic;
+  line-height: 1.4;
+}
+
+.annotation-comment {
+  margin: 0.8rem 0 1rem 2rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.annotation-card footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  border-top: 1px solid var(--rule);
+  padding-top: 0.65rem;
+  color: var(--muted);
+}
+
+.annotation-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.edit-button {
+  border: 0;
+  padding: 0.2rem 0;
+  background: transparent;
+  color: var(--pencil);
+  font-family: inherit;
+  font-size: inherit;
+  text-transform: uppercase;
+}
+
+dialog {
+  width: min(30rem, calc(100vw - 2rem));
+  border: 1px solid var(--ink);
+  border-radius: 0;
+  padding: 1.4rem;
+  background: var(--sheet);
+  color: var(--ink);
+  box-shadow: 10px 10px 0 rgb(16 42 67 / 22%);
+}
+
+dialog::backdrop {
+  background: rgb(16 42 67 / 45%);
+}
+
+@media (max-width: 800px) {
+  main {
+    grid-template-columns: 1fr;
+  }
+
+  .reading-pane {
+    border-right: 0;
+    border-bottom: 1px solid var(--ink);
+    padding: 2.5rem 1.1rem;
+  }
+
+  .annotation-pane {
+    padding: 2rem 1.1rem 4rem;
+  }
+
+  .document-meta {
+    align-items: start;
+    flex-direction: column;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto;
+  }
+}

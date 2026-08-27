@@ -3891,6 +3891,9 @@ async function cancelOwnedResponseBody(response: Response): Promise<void> {
     }
     return;
   }
+  if (response.bodyUsed) {
+    return;
+  }
   await body.cancel();
 }
 

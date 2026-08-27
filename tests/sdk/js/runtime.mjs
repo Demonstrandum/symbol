@@ -781,6 +781,21 @@ test("unsupported PUT mutations never expose or send idempotency keys", async ()
 });
 
 test("concurrent disposal removes listeners and cancels partial owned streams once", async () => {
+    const consumed = await new esm.SymbolClient({
+        origin: "https://consumed.invalid",
+        fetch: async () => new Response("fully consumed", {
+            status: 200,
+            headers: {
+                "Symbol-API-Version": esm.API_VERSION,
+                "Symbol-API-Revision": String(esm.API_REVISION),
+                "Symbol-API-Source-Hash": esm.SOURCE_HASH,
+            },
+        }),
+    }).request("/complete");
+    assert.equal(await consumed.text(), "fully consumed");
+    await consumed[Symbol.asyncDispose]();
+    await consumed[Symbol.asyncDispose]();
+
     const external = new AbortController();
     const signal = external.signal;
     const add = signal.addEventListener.bind(signal);
