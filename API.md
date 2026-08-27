@@ -193,6 +193,16 @@ and error classes; raw arbitrary JSON alone remains dynamically typed.
 Management tokens remain caller-owned in-memory values. Context-manager exit
 closes owned transports exactly once and leaves borrowed clients open.
 
+Synchronous uploads accept bytes, text, `Path`, and `ByteReader`. Async uploads
+accept bytes, text, or a native `AsyncIterable[bytes]`; they deliberately reject
+`Path` and synchronous readers instead of hiding blocking file I/O in worker
+threads. Responses stream through `iter_bytes`/`aiter_bytes`.
+
+Successful operations cannot be retried. Failed replayable HTTP and network
+operations preserve immutable attempt history, idempotency identity, and
+`retry`/`aretry`; every automatic or manual delay, including `Retry-After`, is
+capped by the configured maximum.
+
 Both sync and async roots provide `stats`, `sites`, `site`, `api_client`,
 `api_client_hash`, `api_manual`, `api_version`, and raw `request`. Site
 clients provide `file`, `folder`, `files`, `alias`, `aliases`, `copy`, `move`,

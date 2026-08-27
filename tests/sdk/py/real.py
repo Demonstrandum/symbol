@@ -134,10 +134,14 @@ with tempfile.TemporaryDirectory() as root:
             ):
                 async with api.Symbol(client, origin=origin) as backend_symbol:
                     assert (await backend_symbol.stats()).sites >= 1
+
+                    async def upload_chunks():
+                        yield upload_source.read_bytes()
+
                     await (
                         backend_symbol.site("python-sdk")
                         .file(f"backend-async-{index}.bin")
-                        .put(upload_source)
+                        .put(upload_chunks())
                     )
                     response = await (
                         backend_symbol.site("python-sdk").file("index.html").get()

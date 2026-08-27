@@ -190,7 +190,7 @@ installed_unit=${SYMBOL_INSTALLED_UNIT:-/etc/systemd/system/symbol.service}
 backup_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 backup_dir=${backup_root}/${backup_id}
 sudo mkdir -m 0700 -p "${backup_dir}"
-sudo cp --archive --reflink=auto \
+sudo cp --dereference --preserve=mode,timestamps,ownership --reflink=auto \
   "${running_exe}" "${backup_dir}/symbol"
 if [ -e "${data_root}/symbol.db" ]; then
   sudo python3 - "${data_root}/symbol.db" "${backup_dir}/symbol.db" <<'PY'
@@ -222,8 +222,27 @@ fi
 sudo cp "${backup_inventory}" "${backup_dir}/blob-files.tsv"
 if sudo test -e "${installed_unit}"; then
   sudo cp --archive "${installed_unit}" "${backup_dir}/symbol.service"
+else
+  sudo touch "${backup_dir}/symbol.service.absent"
 fi
 printf 'symbol backup: %s\n' "${backup_dir}"
+
+wait_for_readiness() {
+  attempts=${SYMBOL_STARTUP_ATTEMPTS:-180}
+  attempt=1
+  while ! stats=$(curl -fsS http://127.0.0.1:4340/STATS 2>/dev/null)
+  do
+    if [ "${attempt}" -ge "${attempts}" ]; then
+      return 1
+    fi
+    attempt=$((attempt + 1))
+    sleep 1
+  done
+  printf '%s' "${stats}" |
+    python3 -c 'import json,sys; assert isinstance(json.load(sys.stdin), dict)' &&
+    curl -fsS -o /dev/null http://127.0.0.1:4340/ &&
+    curl -fsS -o /dev/null http://127.0.0.1:4340/API/
+}
 
 rollback() {
   printf 'new Symbol failed readiness; restoring backup\n' >&2
@@ -243,8 +262,17 @@ rollback() {
   if sudo test -e "${backup_dir}/symbol.service"; then
     sudo cp --archive "${backup_dir}/symbol.service" "${installed_unit}"
     sudo systemctl daemon-reload
+  elif sudo test -e "${backup_dir}/symbol.service.absent"; then
+    sudo rm -f "${installed_unit}"
+    sudo systemctl daemon-reload
   fi
-  sudo systemctl start symbol
+  if ! sudo systemctl start symbol ||
+    ! sudo systemctl is-active --quiet symbol ||
+    ! wait_for_readiness; then
+    paused=0
+    printf 'restored Symbol service failed readiness checks\n' >&2
+    exit 2
+  fi
   paused=0
   exit 1
 }
@@ -257,20 +285,8 @@ if sudo systemctl restart symbol &&
 else
   rollback
 fi
-attempts=${SYMBOL_STARTUP_ATTEMPTS:-180}
-attempt=1
-while ! stats=$(curl -fsS http://127.0.0.1:4340/STATS 2>/dev/null)
-do
-  if [ "${attempt}" -ge "${attempts}" ]; then
-    printf 'symbol did not become ready after %s seconds\n' "${attempts}" >&2
-    rollback
-  fi
-  attempt=$((attempt + 1))
-  sleep 1
-done
-printf '%s' "${stats}" |
-  python3 -c 'import json,sys; assert isinstance(json.load(sys.stdin), dict)' ||
+if ! wait_for_readiness; then
+  printf 'new Symbol failed readiness checks\n' >&2
   rollback
-curl -fsS -o /dev/null http://127.0.0.1:4340/ || rollback
-curl -fsS -o /dev/null http://127.0.0.1:4340/API/ || rollback
+fi
 echo "symbol rebuilt and restarted"

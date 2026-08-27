@@ -9,6 +9,7 @@ import math
 import secrets
 import time
 from collections.abc import (
+    AsyncIterable,
     AsyncIterator,
     Awaitable,
     Callable,
@@ -205,6 +206,8 @@ class ByteReader(Protocol):
 
 type ByteSource = bytes | bytearray | memoryview[int] | ByteReader | Path
 type Source = ByteSource | str
+type AsyncByteSource = bytes | bytearray | memoryview[int] | AsyncIterable[bytes]
+type AsyncSource = AsyncByteSource | str
 type Headers = tuple[tuple[str, str], ...]
 
 
@@ -250,23 +253,7 @@ def _reader_iterator(
         yield chunk
 
 
-async def _path_chunks(path: Path, chunk_size: int = 64 * 1024) -> AsyncIterator[bytes]:
-    stream = await asyncio.to_thread(path.open, "rb")
-    try:
-        while chunk := await asyncio.to_thread(stream.read, chunk_size):
-            yield chunk
-    finally:
-        await asyncio.to_thread(stream.close)
-
-
-async def _reader_chunks(
-    stream: ByteReader, chunk_size: int = 64 * 1024
-) -> AsyncIterator[bytes]:
-    while chunk := await asyncio.to_thread(stream.read, chunk_size):
-        yield chunk
-
-
-def _async_body(value: Source | None) -> bytes | AsyncIterator[bytes] | None:
+def _async_body(value: object) -> bytes | AsyncIterable[bytes] | None:
     match value:
         case None:
             return None
@@ -274,15 +261,19 @@ def _async_body(value: Source | None) -> bytes | AsyncIterator[bytes] | None:
             return value.encode()
         case bytes():
             return value
-        case bytearray() | memoryview():
+        case bytearray():
             return bytes(value)
-        case Path():
-            return _path_chunks(value)
+        case memoryview():
+            return value.tobytes()
+        case AsyncIterable():
+            return cast(AsyncIterable[bytes], value)
         case _:
-            return _reader_chunks(value)
+            raise TypeError(
+                "async request bodies require bytes, text, or AsyncIterable[bytes]"
+            )
 
 
-def _source_replayable(value: Source | None) -> bool:
+def _source_replayable(value: object) -> bool:
     return value is None or isinstance(
         value, str | bytes | bytearray | memoryview | Path
     )
@@ -395,6 +386,15 @@ class ApiRequest:
     url: str
     headers: Headers = ()
     body: Source | None = None
+    timeout: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AsyncApiRequest:
+    method: HttpMethod | str
+    url: str
+    headers: Headers = ()
+    body: AsyncSource | None = None
     timeout: float | None = None
 
 
@@ -525,16 +525,14 @@ class ApiResponse:
         if not self.replayable:
             raise BodyNotReplayableError
         if self._retry is None:
-            raise RuntimeError("response does not have a synchronous request operation")
+            raise OperationStateError("successful response cannot be retried")
         return self._retry(policy)
 
     async def aretry(self, policy: RetryPolicy | None = None) -> ApiResponse:
         if not self.replayable:
             raise BodyNotReplayableError
         if self._async_retry is None:
-            raise RuntimeError(
-                "response does not have an asynchronous request operation"
-            )
+            raise OperationStateError("successful response cannot be retried")
         return await self._async_retry(policy)
 
     def abort(self) -> None:
@@ -591,7 +589,7 @@ class SyncHttpBackend(Protocol):
 
 
 class AsyncHttpBackend(Protocol):
-    async def request(self, request: ApiRequest) -> ApiResponse: ...
+    async def request(self, request: AsyncApiRequest) -> ApiResponse: ...
     async def close(self) -> None: ...
 
 
@@ -600,6 +598,26 @@ class NetworkRequestError(OSError):
         super().__init__(str(cause) or "network request failed")
         self.cause = cause
         self.attempts: tuple[RequestAttempt, ...] = ()
+        self.idempotency_key: IdempotencyKey | None = None
+        self.replayable = False
+        self._retry: Callable[[RetryPolicy | None], ApiResponse] | None = None
+        self._async_retry: (
+            Callable[[RetryPolicy | None], Awaitable[ApiResponse]] | None
+        ) = None
+
+    def retry(self, policy: RetryPolicy | None = None) -> ApiResponse:
+        if not self.replayable:
+            raise BodyNotReplayableError
+        if self._retry is None:
+            raise OperationStateError("network operation has no synchronous retry")
+        return self._retry(policy)
+
+    async def aretry(self, policy: RetryPolicy | None = None) -> ApiResponse:
+        if not self.replayable:
+            raise BodyNotReplayableError
+        if self._async_retry is None:
+            raise OperationStateError("network operation has no asynchronous retry")
+        return await self._async_retry(policy)
 
 
 class MissingOptionalDependency(ImportError):
@@ -607,6 +625,10 @@ class MissingOptionalDependency(ImportError):
 
 
 class BodyNotReplayableError(RuntimeError):
+    pass
+
+
+class OperationStateError(RuntimeError):
     pass
 
 
@@ -673,13 +695,13 @@ class _SyncAdapter:
 class _AsyncAdapter:
     def __init__(
         self,
-        send: Callable[[ApiRequest], Awaitable[ApiResponse]],
+        send: Callable[[AsyncApiRequest], Awaitable[ApiResponse]],
         close: Callable[[], Awaitable[None]],
     ) -> None:
         self.send = send
         self.closer = close
 
-    async def request(self, request: ApiRequest) -> ApiResponse:
+    async def request(self, request: AsyncApiRequest) -> ApiResponse:
         return await self.send(request)
 
     async def close(self) -> None:
@@ -718,6 +740,8 @@ class HttpClient:
                     timeout=request.timeout,
                     stream=True,
                 )
+            except package.RequestException as error:
+                raise NetworkRequestError(error) from error
             finally:
                 close_body()
 
@@ -754,6 +778,8 @@ class HttpClient:
                     timeout=request.timeout,
                     preload_content=False,
                 )
+            except package.exceptions.HTTPError as error:
+                raise NetworkRequestError(error) from error
             finally:
                 close_body()
 
@@ -795,6 +821,8 @@ class HttpClient:
                     timeout=request.timeout,
                 )
                 response = client.send(built, stream=True)
+            except package.HTTPError as error:
+                raise NetworkRequestError(error) from error
             finally:
                 close_body()
             return ApiResponse(
@@ -816,7 +844,9 @@ class HttpClient:
             raise RuntimeError("HTTP client is closed")
         try:
             return self._backend.request(request)
-        except Exception as error:
+        except (OSError, TimeoutError) as error:
+            if isinstance(error, NetworkRequestError):
+                raise
             raise NetworkRequestError(error) from error
 
     def close(self) -> None:
@@ -853,15 +883,18 @@ class AsyncHttpClient:
         owned = client is None
         client = client or package.AsyncClient()
 
-        async def send(request: ApiRequest) -> ApiResponse:
-            built = client.build_request(
-                str(request.method),
-                request.url,
-                headers=dict(request.headers),
-                content=_async_body(request.body),
-                timeout=request.timeout,
-            )
-            response = await client.send(built, stream=True)
+        async def send(request: AsyncApiRequest) -> ApiResponse:
+            try:
+                built = client.build_request(
+                    str(request.method),
+                    request.url,
+                    headers=dict(request.headers),
+                    content=_async_body(request.body),
+                    timeout=request.timeout,
+                )
+                response = await client.send(built, stream=True)
+            except package.HTTPError as error:
+                raise NetworkRequestError(error) from error
             return ApiResponse(
                 response.status_code,
                 tuple(response.headers.items()),
@@ -887,19 +920,22 @@ class AsyncHttpClient:
         owned = session is None
         session = session or package.ClientSession()
 
-        async def send(request: ApiRequest) -> ApiResponse:
+        async def send(request: AsyncApiRequest) -> ApiResponse:
             timeout = (
                 package.ClientTimeout(total=request.timeout)
                 if request.timeout is not None
                 else package.ClientTimeout()
             )
-            response = await session.request(
-                str(request.method),
-                request.url,
-                headers=dict(request.headers),
-                data=_async_body(request.body),
-                timeout=timeout,
-            )
+            try:
+                response = await session.request(
+                    str(request.method),
+                    request.url,
+                    headers=dict(request.headers),
+                    data=_async_body(request.body),
+                    timeout=timeout,
+                )
+            except (TimeoutError, package.ClientError) as error:
+                raise NetworkRequestError(error) from error
 
             async def close_response() -> None:
                 response.close()
@@ -920,12 +956,14 @@ class AsyncHttpClient:
 
         return cls(_AsyncAdapter(send, close), owned=True)
 
-    async def request(self, request: ApiRequest) -> ApiResponse:
+    async def request(self, request: AsyncApiRequest) -> ApiResponse:
         if self._closed:
             raise RuntimeError("HTTP client is closed")
         try:
             return await self._backend.request(request)
-        except Exception as error:
+        except (OSError, TimeoutError) as error:
+            if isinstance(error, NetworkRequestError):
+                raise
             raise NetworkRequestError(error) from error
 
     async def close(self) -> None:
@@ -1382,6 +1420,39 @@ class ExpirySiteReport:
 
 
 @dataclass(frozen=True, slots=True)
+class SizeDistribution:
+    min: float | None
+    p25: float | None
+    median: float | None
+    mean: float | None
+    p75: float | None
+    max: float | None
+    iqr: float | None
+    stddev: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class CacheStats:
+    hits: int
+    misses: int
+    evictions: int
+
+
+@dataclass(frozen=True, slots=True)
+class ReaderStats:
+    operations: int
+    waits: int
+    wait_micros: int
+    query_micros: int
+
+
+@dataclass(frozen=True, slots=True)
+class ServingStats:
+    cache: CacheStats
+    readers: ReaderStats
+
+
+@dataclass(frozen=True, slots=True)
 class SymbolStats:
     sites: int
     files: int
@@ -1391,7 +1462,9 @@ class SymbolStats:
     logical_bytes: int
     saved_bytes: int
     saved_fraction: float
-    raw: Mapping[str, object]
+    file_sizes: SizeDistribution
+    blob_sizes: SizeDistribution
+    serving: ServingStats
 
 
 @dataclass(frozen=True, slots=True)
@@ -1582,6 +1655,10 @@ def _number(value: object, response: ApiResponse) -> float:
     return result
 
 
+def _nullable_number(value: object, response: ApiResponse) -> float | None:
+    return None if value is None else _number(value, response)
+
+
 def _boolean(value: object, response: ApiResponse) -> bool:
     if not isinstance(value, bool):
         raise MalformedResponseError(response)
@@ -1604,6 +1681,30 @@ def _array(value: object, response: ApiResponse) -> list[object]:
 
 
 def _symbol_stats(value: Mapping[str, object], response: ApiResponse) -> SymbolStats:
+    value = _exact_object(
+        value,
+        (
+            "sites",
+            "files",
+            "aliases",
+            "blobs",
+            "bytes",
+            "logical_bytes",
+            "saved_bytes",
+            "saved_fraction",
+            "file_sizes",
+            "blob_sizes",
+            "serving",
+        ),
+        response,
+    )
+    serving = _exact_object(value["serving"], ("cache", "readers"), response)
+    cache = _exact_object(serving["cache"], ("hits", "misses", "evictions"), response)
+    readers = _exact_object(
+        serving["readers"],
+        ("operations", "waits", "wait_micros", "query_micros"),
+        response,
+    )
     return SymbolStats(
         sites=_integer(value.get("sites"), response),
         files=_integer(value.get("files"), response),
@@ -1613,7 +1714,39 @@ def _symbol_stats(value: Mapping[str, object], response: ApiResponse) -> SymbolS
         logical_bytes=_integer(value.get("logical_bytes"), response),
         saved_bytes=_integer(value.get("saved_bytes"), response),
         saved_fraction=_number(value.get("saved_fraction"), response),
-        raw=value,
+        file_sizes=_size_distribution(value["file_sizes"], response),
+        blob_sizes=_size_distribution(value["blob_sizes"], response),
+        serving=ServingStats(
+            cache=CacheStats(
+                hits=_integer(cache["hits"], response),
+                misses=_integer(cache["misses"], response),
+                evictions=_integer(cache["evictions"], response),
+            ),
+            readers=ReaderStats(
+                operations=_integer(readers["operations"], response),
+                waits=_integer(readers["waits"], response),
+                wait_micros=_integer(readers["wait_micros"], response),
+                query_micros=_integer(readers["query_micros"], response),
+            ),
+        ),
+    )
+
+
+def _size_distribution(value: object, response: ApiResponse) -> SizeDistribution:
+    distribution = _exact_object(
+        value,
+        ("min", "p25", "median", "mean", "p75", "max", "iqr", "stddev"),
+        response,
+    )
+    return SizeDistribution(
+        min=_nullable_number(distribution["min"], response),
+        p25=_nullable_number(distribution["p25"], response),
+        median=_nullable_number(distribution["median"], response),
+        mean=_nullable_number(distribution["mean"], response),
+        p75=_nullable_number(distribution["p75"], response),
+        max=_nullable_number(distribution["max"], response),
+        iqr=_nullable_number(distribution["iqr"], response),
+        stddev=_nullable_number(distribution["stddev"], response),
     )
 
 
@@ -2151,14 +2284,18 @@ def _retry_delay(
         retry_after = response.header("Retry-After")
         if retry_after is not None:
             if retry_after.isascii() and retry_after.isdecimal():
-                return float(retry_after)
+                return min(policy.maximum_delay, float(retry_after))
             try:
                 parsed = email.utils.parsedate_to_datetime(retry_after)
             except TypeError, ValueError:
                 parsed = None
             if parsed is not None:
-                return max(
-                    0.0, (parsed.astimezone(UTC) - datetime.now(UTC)).total_seconds()
+                return min(
+                    policy.maximum_delay,
+                    max(
+                        0.0,
+                        (parsed.astimezone(UTC) - datetime.now(UTC)).total_seconds(),
+                    ),
                 )
     delay = min(
         policy.maximum_delay,
@@ -2261,6 +2398,23 @@ class _SymbolSync:
                     or attempt + 1 == attempts
                 ):
                     error.attempts = tuple(history)
+                    error.idempotency_key = _header(tuple(headers), "Idempotency-Key")
+                    error.replayable = replayable
+
+                    def retry_network(
+                        selected: RetryPolicy | None,
+                    ) -> ApiResponse:
+                        return self._send(
+                            method,
+                            url,
+                            headers=headers,
+                            body=body,
+                            timeout=timeout,
+                            _policy=selected or RetryPolicies.DEFAULT,
+                            _previous_attempts=tuple(history),
+                        )
+
+                    error._retry = retry_network
                     raise
             else:
                 history.append(
@@ -2285,18 +2439,20 @@ class _SymbolSync:
                     response.attempts = tuple(history)
                     response.replayable = replayable
 
-                    def retry(selected: RetryPolicy | None) -> ApiResponse:
-                        return self._send(
-                            method,
-                            url,
-                            headers=headers,
-                            body=body,
-                            timeout=timeout,
-                            _policy=selected or RetryPolicies.DEFAULT,
-                            _previous_attempts=tuple(history),
-                        )
+                    if response.status >= 400:
 
-                    response._retry = retry
+                        def retry(selected: RetryPolicy | None) -> ApiResponse:
+                            return self._send(
+                                method,
+                                url,
+                                headers=headers,
+                                body=body,
+                                timeout=timeout,
+                                _policy=selected or RetryPolicies.DEFAULT,
+                                _previous_attempts=tuple(history),
+                            )
+
+                        response._retry = retry
                     return response
                 response.close()
             time.sleep(_retry_delay(policy, attempt, response))
@@ -2925,11 +3081,11 @@ class _SymbolAsync:
         url: str,
         *,
         headers: Iterable[tuple[str, str]] = (),
-        body: Source | None = None,
+        body: AsyncSource | None = None,
         _policy: RetryPolicy | None = None,
         _previous_attempts: tuple[RequestAttempt, ...] = (),
     ) -> ApiResponse:
-        request = ApiRequest(method, url, tuple(headers), body)
+        request = AsyncApiRequest(method, url, tuple(headers), body)
         policy = self.retry_policy if _policy is None else _policy
         replayable = _source_replayable(body)
         history = list(_previous_attempts)
@@ -2955,6 +3111,22 @@ class _SymbolAsync:
                     or attempt + 1 == attempts
                 ):
                     error.attempts = tuple(history)
+                    error.idempotency_key = _header(tuple(headers), "Idempotency-Key")
+                    error.replayable = replayable
+
+                    async def retry_network(
+                        selected: RetryPolicy | None,
+                    ) -> ApiResponse:
+                        return await self._send(
+                            method,
+                            url,
+                            headers=headers,
+                            body=body,
+                            _policy=selected or RetryPolicies.DEFAULT,
+                            _previous_attempts=tuple(history),
+                        )
+
+                    error._async_retry = retry_network
                     raise
             else:
                 history.append(
@@ -2987,23 +3159,27 @@ class _SymbolAsync:
                     response.attempts = tuple(history)
                     response.replayable = replayable
 
-                    async def retry(selected: RetryPolicy | None) -> ApiResponse:
-                        return await self._send(
-                            method,
-                            url,
-                            headers=headers,
-                            body=body,
-                            _policy=selected or RetryPolicies.DEFAULT,
-                            _previous_attempts=tuple(history),
-                        )
+                    if response.status >= 400:
 
-                    response._async_retry = retry
+                        async def retry(
+                            selected: RetryPolicy | None,
+                        ) -> ApiResponse:
+                            return await self._send(
+                                method,
+                                url,
+                                headers=headers,
+                                body=body,
+                                _policy=selected or RetryPolicies.DEFAULT,
+                                _previous_attempts=tuple(history),
+                            )
+
+                        response._async_retry = retry
                     return response
                 await response.aclose()
             await asyncio.sleep(_retry_delay(policy, attempt, response))
         raise RuntimeError("unreachable retry loop")
 
-    async def request(self, request: ApiRequest) -> ApiResponse:
+    async def request(self, request: AsyncApiRequest) -> ApiResponse:
         return await self._send(
             request.method,
             request.url
@@ -3077,7 +3253,7 @@ class _SymbolAsync:
 
     async def create(
         self,
-        body: Source,
+        body: AsyncSource,
         options: PublishOptions = PublishOptions(),
     ) -> MutationReceipt:
         key = options.idempotency_key or secrets.token_hex(16)
@@ -3295,7 +3471,7 @@ class AsyncFolderClient:
 
     async def create(
         self,
-        body: Source,
+        body: AsyncSource,
         options: CreateFileOptions = CreateFileOptions(),
     ) -> AllocationReceipt:
         options = replace(options, token=options.token or self.site.token)
@@ -3328,7 +3504,7 @@ class AsyncFolderClient:
 
     async def _custom(
         self,
-        body: Source,
+        body: AsyncSource,
         options: CreateFileOptions,
         naming: Callable[[ProposedFileName], str | Awaitable[str]],
     ) -> AllocationReceipt:
@@ -3409,7 +3585,7 @@ class AsyncFolderClient:
 
     async def bytes(
         self,
-        body: ByteSource,
+        body: AsyncByteSource,
         options: CreateFileOptions = CreateFileOptions(),
     ) -> AllocationReceipt:
         return await self.create(body, options)
@@ -3466,7 +3642,7 @@ class AsyncFileClient:
 
     async def put(
         self,
-        body: Source,
+        body: AsyncSource,
         media_type: MediaType | str = MediaTypes.BINARY,
         options: MutationOptions = MutationOptions(),
     ) -> MutationReceipt:
@@ -3500,7 +3676,7 @@ class AsyncFileClient:
 
     async def replace(
         self,
-        body: Source,
+        body: AsyncSource,
         *,
         base_hash: Blake3,
         media_type: MediaType | str = MediaTypes.BINARY,
@@ -3792,15 +3968,19 @@ __all__ = (
     "ApiRequest",
     "ApiResponse",
     "ApiVersion",
+    "AsyncApiRequest",
+    "AsyncByteSource",
     "AsyncHttpClient",
     "AsyncFileClient",
     "AsyncFolderClient",
     "AsyncManagementClient",
     "AsyncResponseStream",
     "AsyncSiteClient",
+    "AsyncSource",
     "Blake3",
     "BodyNotReplayableError",
     "ByteSplice",
+    "CacheStats",
     "Charset",
     "ContentFormat",
     "ContentFormats",
@@ -3838,9 +4018,11 @@ __all__ = (
     "NeverExpiry",
     "NetworkRequestError",
     "OwnedExpiryPolicy",
+    "OperationStateError",
     "PreconditionFailedError",
     "PublishOptions",
     "RangeNotSatisfiableError",
+    "ReaderStats",
     "RelativeExpiry",
     "RelativeExpiryPolicy",
     "RequestOptions",
@@ -3848,6 +4030,8 @@ __all__ = (
     "RetryPolicies",
     "RetryPolicy",
     "RetryJitter",
+    "ServingStats",
+    "SizeDistribution",
     "Symbol",
     "SymbolApiError",
     "SymbolStats",

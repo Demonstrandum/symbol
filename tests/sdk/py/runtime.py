@@ -8,6 +8,7 @@ import json
 import os
 import pathlib
 import sys
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
@@ -44,6 +45,40 @@ IDENTITY = (
     ("Symbol-API-Revision", str(api.API_REVISION)),
     ("Symbol-API-Source-Hash", api.SOURCE_HASH),
 )
+
+
+def stats_payload(*, sites: int = 0, files: object = 0) -> dict[str, object]:
+    distribution = {
+        "min": None,
+        "p25": None,
+        "median": None,
+        "mean": None,
+        "p75": None,
+        "max": None,
+        "iqr": None,
+        "stddev": None,
+    }
+    return {
+        "sites": sites,
+        "files": files,
+        "aliases": 0,
+        "blobs": 0,
+        "bytes": 0,
+        "logical_bytes": 0,
+        "saved_bytes": 0,
+        "saved_fraction": 0.0,
+        "file_sizes": distribution,
+        "blob_sizes": distribution,
+        "serving": {
+            "cache": {"hits": 0, "misses": 0, "evictions": 0},
+            "readers": {
+                "operations": 0,
+                "waits": 0,
+                "wait_micros": 0,
+                "query_micros": 0,
+            },
+        },
+    }
 
 
 @dataclass
@@ -92,7 +127,7 @@ class AsyncBackend:
         self.requests: list[api.ApiRequest] = []
         self.closed = 0
 
-    async def request(self, request: api.ApiRequest) -> api.ApiResponse:
+    async def request(self, request: api.AsyncApiRequest) -> api.ApiResponse:
         self.requests.append(request)
         return self.response
 
@@ -117,7 +152,7 @@ class FlakyAsyncBackend(AsyncBackend):
         super().__init__(response)
         self.failures = failures
 
-    async def request(self, request: api.ApiRequest) -> api.ApiResponse:
+    async def request(self, request: api.AsyncApiRequest) -> api.ApiResponse:
         if self.failures:
             self.failures -= 1
             raise OSError("network unavailable")
@@ -162,19 +197,13 @@ def test_sync_client_mapping() -> None:
 
     backend.queue(
         200,
-        {
-            "sites": 1,
-            "files": 2,
-            "aliases": 0,
-            "blobs": 2,
-            "bytes": 3,
-            "logical_bytes": 3,
-            "saved_bytes": 0,
-            "saved_fraction": 0.0,
-        },
+        stats_payload(sites=1, files=2),
         (("Content-Type", "application/json"),),
     )
-    assert symbol.stats().files == 2
+    stats = symbol.stats()
+    assert stats.files == 2
+    assert isinstance(stats.file_sizes, api.SizeDistribution)
+    assert isinstance(stats.serving.cache, api.CacheStats)
 
     backend.queue(200, b"export {}", (("Content-Type", "text/typescript"),))
     assert symbol.api_client(api.ApiClientAsset.TYPESCRIPT).status == 200
@@ -230,16 +259,7 @@ def test_sync_client_mapping() -> None:
     context_backend = Backend()
     context_backend.queue(
         200,
-        {
-            "sites": 0,
-            "files": 0,
-            "aliases": 0,
-            "blobs": 0,
-            "bytes": 0,
-            "logical_bytes": 0,
-            "saved_bytes": 0,
-            "saved_fraction": 0.0,
-        },
+        stats_payload(),
         (("Content-Type", "application/json"),),
     )
     with api.Symbol(api.HttpClient.wrap(context_backend)) as context_symbol:
@@ -302,16 +322,7 @@ def test_malformed_responses_and_typed_errors() -> None:
 
     backend.queue(
         200,
-        {
-            "sites": 0,
-            "files": "wrong",
-            "aliases": 0,
-            "blobs": 0,
-            "bytes": 0,
-            "logical_bytes": 0,
-            "saved_bytes": 0,
-            "saved_fraction": 0.0,
-        },
+        stats_payload(files="wrong"),
         (("Content-Type", "application/json"),),
     )
     try:
@@ -408,10 +419,28 @@ def test_malformed_responses_and_typed_errors() -> None:
 
 
 def test_retry_policy_applies_to_sync_and_async_transports() -> None:
+    class ProgrammingErrorBackend:
+        def request(self, request: api.ApiRequest) -> api.ApiResponse:
+            raise ValueError("programming error")
+
+        def close(self) -> None:
+            pass
+
+    try:
+        api.HttpClient.wrap(ProgrammingErrorBackend()).request(
+            api.ApiRequest(api.HttpMethod.GET, "http://symbol/STATS")
+        )
+    except ValueError as error:
+        assert str(error) == "programming error"
+    else:
+        raise AssertionError(
+            "backend programming error was normalized as network failure"
+        )
+
     response = api.ApiResponse(
         200,
         IDENTITY + (("Content-Type", "application/json"),),
-        b'{"sites":0,"files":0,"aliases":0,"blobs":0,"bytes":0,"logical_bytes":0,"saved_bytes":0,"saved_fraction":0}',
+        json.dumps(stats_payload(), separators=(",", ":")).encode(),
     )
     sync_backend = FlakyBackend(1)
     sync_backend.responses.append(response)
@@ -421,10 +450,57 @@ def test_retry_policy_applies_to_sync_and_async_transports() -> None:
         maximum_delay=0,
         retry_network_errors=True,
     )
+    retry_after = api.ApiResponse(
+        503,
+        IDENTITY + (("Retry-After", "999"),),
+        b"retry",
+    )
+    assert (
+        api._retry_delay(
+            api.RetryPolicy(maximum_delay=2.0),
+            0,
+            retry_after,
+        )
+        == 2.0
+    )
     assert (
         api.Symbol(api.HttpClient.wrap(sync_backend), retry_policy=policy).stats().sites
         == 0
     )
+
+    successful_backend = Backend()
+    successful_backend.queue(200, b"ok")
+    successful = api.Symbol(api.HttpClient.wrap(successful_backend)).request(
+        api.ApiRequest(api.HttpMethod.GET, "/success")
+    )
+    try:
+        successful.retry()
+    except api.OperationStateError:
+        pass
+    else:
+        raise AssertionError("successful response was manually retryable")
+
+    terminal_backend = FlakyBackend(1)
+    terminal_backend.responses.append(response)
+    terminal_symbol = api.Symbol(
+        api.HttpClient.wrap(terminal_backend),
+        retry_policy=api.RetryPolicy(
+            max_attempts=1,
+            initial_delay=0,
+            maximum_delay=0,
+            retry_network_errors=True,
+        ),
+    )
+    try:
+        terminal_symbol.stats()
+    except api.NetworkRequestError as error:
+        assert error.replayable
+        assert len(error.attempts) == 1
+        retried = error.retry(api.RetryPolicy(max_attempts=1))
+        assert retried.status == 200
+        assert len(retried.attempts) == 2
+    else:
+        raise AssertionError("terminal network failure did not fail")
 
     manual_backend = Backend()
     manual_backend.queue(503, b"retry")
@@ -467,6 +543,37 @@ def test_retry_policy_applies_to_sync_and_async_transports() -> None:
         )
         assert (await symbol.stats()).sites == 0
 
+        successful_backend = AsyncBackend(api.ApiResponse(200, IDENTITY, b"ok"))
+        successful_symbol = api.Symbol(api.AsyncHttpClient.wrap(successful_backend))
+        successful = await successful_symbol.request(
+            api.AsyncApiRequest(api.HttpMethod.GET, "/success")
+        )
+        try:
+            await successful.aretry()
+        except api.OperationStateError:
+            pass
+        else:
+            raise AssertionError("successful async response was manually retryable")
+
+        terminal_backend = FlakyAsyncBackend(response, 1)
+        terminal_symbol = api.Symbol(
+            api.AsyncHttpClient.wrap(terminal_backend),
+            retry_policy=api.RetryPolicy(
+                max_attempts=1,
+                initial_delay=0,
+                maximum_delay=0,
+                retry_network_errors=True,
+            ),
+        )
+        try:
+            await terminal_symbol.stats()
+        except api.NetworkRequestError as error:
+            retried = await error.aretry(api.RetryPolicy(max_attempts=1))
+            assert retried.status == 200
+            assert len(retried.attempts) == 2
+        else:
+            raise AssertionError("async terminal network failure did not fail")
+
         manual_backend = AsyncBackend(api.ApiResponse(503, IDENTITY, b"retry"))
         manual_symbol = api.Symbol(api.AsyncHttpClient.wrap(manual_backend))
         try:
@@ -483,6 +590,13 @@ def test_retry_policy_applies_to_sync_and_async_transports() -> None:
 
 
 def test_streaming_bodies_are_lazy_and_closeable() -> None:
+    try:
+        api._async_body(pathlib.Path("/sync-path-is-not-an-async-source"))
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("async transport accepted a synchronous Path source")
+
     reads = 0
     closes = 0
 
@@ -530,8 +644,8 @@ def test_streaming_bodies_are_lazy_and_closeable() -> None:
         async_closes = 0
 
         class StreamingAsyncBackend:
-            async def request(self, request: api.ApiRequest) -> api.ApiResponse:
-                assert isinstance(request.body, pathlib.Path)
+            async def request(self, request: api.AsyncApiRequest) -> api.ApiResponse:
+                assert hasattr(request.body, "__aiter__")
                 source = io.BytesIO(b"ghijkl")
 
                 async def read() -> bytes:
@@ -563,11 +677,15 @@ def test_streaming_bodies_are_lazy_and_closeable() -> None:
             api.AsyncHttpClient.wrap(StreamingAsyncBackend()),
             origin="http://symbol",
         )
+
+        async def upload() -> AsyncIterator[bytes]:
+            yield b"upload"
+
         response = await symbol.request(
-            api.ApiRequest(
+            api.AsyncApiRequest(
                 api.HttpMethod.GET,
                 "/stream",
-                body=pathlib.Path("/unused"),
+                body=upload(),
             )
         )
         assert async_reads == 0
@@ -585,7 +703,7 @@ async def test_async_factory() -> None:
     response = api.ApiResponse(
         200,
         IDENTITY + (("Content-Type", "application/json"),),
-        b'{"sites":0,"files":0,"aliases":0,"blobs":0,"bytes":0,"logical_bytes":0,"saved_bytes":0,"saved_fraction":0}',
+        json.dumps(stats_payload(), separators=(",", ":")).encode(),
     )
     backend = AsyncBackend(response)
     client = api.AsyncHttpClient.wrap(backend)

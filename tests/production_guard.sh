@@ -79,12 +79,14 @@ set -e
 DEPLOY_MARKER="${TMP}/deploy-reached"
 BACKUP_MARKER="${TMP}/backup-reached"
 RESTORE_MARKER="${TMP}/restore-reached"
+CURL_FAILURE_MARKER="${TMP}/curl-failure-reached"
 JOURNAL_ALL="${TMP}/journal-all"
 JOURNAL_RECENT="${TMP}/journal-recent"
 SLEEP_MARKER="${TMP}/sleep-reached"
 PAUSE_MARKER="${TMP}/pause-reached"
 RESUME_MARKER="${TMP}/resume-reached"
 RUNNING_EXE="${TMP}/running-symbol"
+RUNNING_EXE_TARGET="${TMP}/running-symbol-target"
 DEPLOY_BINARY="${TMP}/deployed-symbol"
 DATA_ROOT="${TMP}/data"
 BACKUP_ROOT="${TMP}/backups"
@@ -92,6 +94,7 @@ INSTALLED_UNIT="${TMP}/installed-symbol.service"
 export \
   BACKUP_MARKER \
   BACKUP_ROOT \
+  CURL_FAILURE_MARKER \
   DATA_ROOT \
   DEPLOY_BINARY \
   DEPLOY_MARKER \
@@ -102,7 +105,8 @@ export \
   RESTORE_MARKER \
   RESUME_MARKER
 mkdir -p "${DATA_ROOT}/blobs"
-printf 'old binary\n' >"${RUNNING_EXE}"
+printf 'old binary\n' >"${RUNNING_EXE_TARGET}"
+ln -s "${RUNNING_EXE_TARGET}" "${RUNNING_EXE}"
 printf 'new binary\n' >"${DEPLOY_BINARY}"
 python3 - "${DATA_ROOT}/symbol.db" <<'PY'
 import sqlite3
@@ -191,7 +195,15 @@ esac
 EOF
 cat >"${TMP}/curl" <<'EOF'
 #!/bin/sh
-[ "${CURL_FAILURE:-0}" != 1 ] || exit 22
+case "${CURL_FAILURE:-0}" in
+  once)
+    if [ ! -e "${CURL_FAILURE_MARKER}" ]; then
+      : >"${CURL_FAILURE_MARKER}"
+      exit 22
+    fi
+    ;;
+  always) exit 22 ;;
+esac
 case "$*" in
   *"/STATS"*) printf '{}\n' ;;
 esac
@@ -237,6 +249,7 @@ chmod +x \
 run_restart_guard() {
   rm -f \
     "${BACKUP_MARKER}" \
+    "${CURL_FAILURE_MARKER}" \
     "${DEPLOY_MARKER}" \
     "${SLEEP_MARKER}" \
     "${SLEEP_MARKER}.finished" \
@@ -297,7 +310,11 @@ run_restart_guard 0
     exit 1
   }
 set -- "${BACKUP_ROOT}"/*
-[ -f "$1/blobs/aa" ] && [ -f "$1/symbol.service" ] ||
+[ -f "$1/blobs/aa" ] &&
+  [ -f "$1/symbol.service" ] &&
+  [ -f "$1/symbol" ] &&
+  [ ! -L "$1/symbol" ] &&
+  [ "$(/bin/cat "$1/symbol")" = 'old binary' ] ||
   {
     printf 'successful restart backup omitted blobs or service unit\n' >&2
     exit 1
@@ -320,6 +337,24 @@ unset RESTART_FAILURE
     printf 'failed restart did not restore its backup:\n%s\n' "${GUARD_OUTPUT}" >&2
     exit 1
   }
+
+write_journal_all \
+  'symbol_mutation_start mutation_id=10 method=PUT' \
+  'symbol_mutation_finish mutation_id=10 method=PUT status=200'
+: >"${JOURNAL_RECENT}"
+rm -f "${INSTALLED_UNIT}"
+printf 'new binary\n' >"${DEPLOY_BINARY}"
+RESTART_FAILURE=1
+export RESTART_FAILURE
+run_restart_guard 0
+unset RESTART_FAILURE
+[ "${GUARD_STATUS}" -eq 1 ] && [ ! -e "${INSTALLED_UNIT}" ] ||
+  {
+    printf 'first-install rollback left the new service unit behind:\n%s\n' \
+      "${GUARD_OUTPUT}" >&2
+    exit 1
+  }
+printf 'old unit\n' >"${INSTALLED_UNIT}"
 [ "$(/bin/cat "${DEPLOY_BINARY}")" = 'old binary' ] &&
   [ "$(/bin/cat "${DATA_ROOT}/blobs/aa")" = 'blob' ] &&
   [ "$(/bin/cat "${INSTALLED_UNIT}")" = 'old unit' ] ||
@@ -334,7 +369,7 @@ write_journal_all \
 : >"${JOURNAL_RECENT}"
 printf 'new binary\n' >"${DEPLOY_BINARY}"
 printf 'old unit\n' >"${INSTALLED_UNIT}"
-CURL_FAILURE=1
+CURL_FAILURE=once
 export CURL_FAILURE
 SYMBOL_STARTUP_ATTEMPTS=1
 export SYMBOL_STARTUP_ATTEMPTS
@@ -347,6 +382,33 @@ unset CURL_FAILURE SYMBOL_STARTUP_ATTEMPTS
     printf 'readiness failure did not restore its backup:\n%s\n' "${GUARD_OUTPUT}" >&2
     exit 1
   }
+
+write_journal_all \
+  'symbol_mutation_start mutation_id=11 method=PUT' \
+  'symbol_mutation_finish mutation_id=11 method=PUT status=200'
+: >"${JOURNAL_RECENT}"
+printf 'new binary\n' >"${DEPLOY_BINARY}"
+CURL_FAILURE=always
+export CURL_FAILURE
+SYMBOL_STARTUP_ATTEMPTS=1
+export SYMBOL_STARTUP_ATTEMPTS
+run_restart_guard 0
+unset CURL_FAILURE SYMBOL_STARTUP_ATTEMPTS
+[ "${GUARD_STATUS}" -eq 2 ] &&
+  [ -e "${RESTORE_MARKER}" ] ||
+  {
+    printf 'failed restored-service readiness was not diagnosed:\n%s\n' \
+      "${GUARD_OUTPUT}" >&2
+    exit 1
+  }
+case "${GUARD_OUTPUT}" in
+  *"restored Symbol service failed readiness checks"*) ;;
+  *)
+    printf 'restored-service readiness failure lacked diagnosis:\n%s\n' \
+      "${GUARD_OUTPUT}" >&2
+    exit 1
+    ;;
+esac
 
 printf '%s\n' \
   'symbol_mutation_start mutation_id=6 method=PUT' \
