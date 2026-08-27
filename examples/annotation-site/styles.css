@@ -269,11 +269,13 @@ textarea {
 
 .annotations {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 1rem;
 }
 
 .annotation-card {
   position: relative;
+  min-width: 0;
   border: 1px solid var(--ink);
   padding: 1rem;
   background: var(--sheet);
@@ -301,7 +303,7 @@ textarea {
 
 .annotation-target {
   display: grid;
-  grid-template-columns: auto 1fr;
+  grid-template-columns: auto minmax(0, 1fr);
   gap: 0.6rem;
   width: 100%;
   border: 0;
@@ -346,6 +348,8 @@ textarea {
 }
 
 .annotation-path {
+  min-width: 0;
+  flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
