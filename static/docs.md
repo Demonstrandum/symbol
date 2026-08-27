@@ -56,12 +56,29 @@ symbol ls                    # list sites
 
 run `symbol COMMAND --help` for focused usage.
 
+publish a built app, clone it elsewhere, then preview and safely sync edits
+
 ```
-symbol put -u hello site.tar.gz # unpack an archive
-symbol get hello hello.zip      # download as zip
-symbol clone hello              # make a checkout
-symbol sync --check             # preview a safe sync
-symbol sync                     # publish if upstream is unchanged
+symbol put my-app ./dist
+symbol clone my-app my-app-work
+cd my-app-work
+symbol sync --check
+symbol sync
+```
+
+turn a release archive into a site, then fetch the same site as a zip
+
+```
+symbol put -u release release.tar.gz
+symbol get release release.zip
+```
+
+make a branch-like copy to edit without touching the original
+
+```
+symbol remix demo demo-next
+cd demo-next
+symbol put
 ```
 
 ## API manuals
