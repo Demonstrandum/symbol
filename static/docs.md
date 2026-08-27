@@ -59,9 +59,12 @@ run `symbol COMMAND --help` for focused usage.
 publish a built app, clone it elsewhere, then preview and safely sync edits
 
 ```
+mkdir -p dist
+printf '%s\n' '<h1>first version</h1>' > dist/index.html
 symbol put my-app ./dist
 symbol clone my-app my-app-work
 cd my-app-work
+printf '%s\n' '<h1>second version</h1>' > index.html
 symbol sync --check
 symbol sync
 ```
@@ -69,8 +72,12 @@ symbol sync
 turn a release archive into a site, then fetch the same site as a zip
 
 ```
+mkdir -p release-files
+printf '%s\n' '<h1>release notes</h1>' > release-files/index.html
+tar -czf release.tar.gz -C release-files .
 symbol put -u release release.tar.gz
 symbol get release release.zip
+unzip -l release.zip
 ```
 
 make a branch-like copy to edit without touching the original
