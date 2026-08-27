@@ -78,7 +78,9 @@ make a branch-like copy to edit without touching the original
 ```
 symbol remix demo demo-next
 cd demo-next
-symbol put
+printf '%s\n' '<h1>next version</h1>' > index.html
+symbol sync --check
+symbol sync
 ```
 
 ## API manuals
