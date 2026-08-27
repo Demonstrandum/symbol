@@ -34,46 +34,61 @@ impl BlobFiles {
         })
     }
 
-    pub fn remove(&self, hash: &str) -> io::Result<()> {
-        match fs::remove_file(self.path(hash)) {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(err),
+    pub fn quarantine(&self, hash: &str) -> io::Result<()> {
+        let source = self.path(hash);
+        if !source.is_file() {
+            return Ok(());
         }
+        let target = self.quarantine_path(hash);
+        if target.is_file() {
+            return Ok(());
+        }
+        let parent = target.parent().expect("quarantine blob path has parent");
+        fs::create_dir_all(parent)?;
+        fs::rename(source, &target)?;
+        File::open(parent)?.sync_all()
     }
 
-    pub fn retain(&self, live: &HashSet<String>) -> io::Result<()> {
-        for directory in fs::read_dir(&self.root)? {
-            let directory = directory?;
-            if !directory.file_type()?.is_dir() {
+    pub fn restore(&self, live: &HashSet<String>) -> io::Result<()> {
+        for hash in live {
+            let target = self.path(hash);
+            if target.is_file() {
                 continue;
             }
-            let prefix = directory.file_name().to_string_lossy().into_owned();
-            for entry in fs::read_dir(directory.path())? {
-                let entry = entry?;
-                if !entry.file_type()?.is_file() {
-                    continue;
-                }
-                let name = entry.file_name().to_string_lossy().into_owned();
-                let hash = format!("{prefix}{name}");
-                if name.starts_with('.') || !live.contains(&hash) {
-                    fs::remove_file(entry.path())?;
-                }
+            let source = self.quarantine_path(hash);
+            if !source.is_file() {
+                continue;
             }
-            if fs::read_dir(directory.path())?.next().is_none() {
-                fs::remove_dir(directory.path())?;
-            }
+            let parent = target.parent().expect("blob path has parent");
+            fs::create_dir_all(parent)?;
+            fs::rename(source, &target)?;
+            File::open(parent)?.sync_all()?;
         }
         Ok(())
     }
 
+    fn quarantine_path(&self, hash: &str) -> PathBuf {
+        self.root
+            .join(".quarantine")
+            .join(&hash[..2])
+            .join(&hash[2..])
+    }
+
     fn put(&self, hash: &str, write: impl FnOnce(&mut File) -> io::Result<()>) -> io::Result<()> {
         let target = self.path(hash);
+        if !target.is_file() {
+            let quarantined = self.quarantine_path(hash);
+            if quarantined.is_file() {
+                let parent = target.parent().expect("blob path has parent");
+                fs::create_dir_all(parent)?;
+                fs::rename(quarantined, &target)?;
+            }
+        }
         if target.is_file() {
             if file_hash(&target)? == hash {
                 return Ok(());
             }
-            fs::remove_file(&target)?;
+            self.quarantine_corrupt(hash, &target)?;
         }
         let parent = target.parent().expect("blob path has parent");
         fs::create_dir_all(parent)?;
@@ -96,6 +111,21 @@ impl BlobFiles {
         }
         result
     }
+
+    fn quarantine_corrupt(&self, hash: &str, source: &Path) -> io::Result<()> {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        let target = self
+            .root
+            .join(".quarantine")
+            .join("corrupt")
+            .join(format!("{hash}-{nonce}"));
+        let parent = target.parent().expect("corrupt quarantine path has parent");
+        fs::create_dir_all(parent)?;
+        fs::rename(source, &target)?;
+        File::open(parent)?.sync_all()
+    }
 }
 
 fn file_hash(path: &Path) -> io::Result<String> {
@@ -110,4 +140,30 @@ fn file_hash(path: &Path) -> io::Result<String> {
         hasher.update(&buffer[..read]);
     }
     Ok(hasher.finalize().to_hex().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replacing_a_corrupt_canonical_blob_preserves_the_old_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let blobs = BlobFiles::new(root.path().join("blobs")).unwrap();
+        let expected = b"expected";
+        let hash = blake3::hash(expected).to_hex().to_string();
+        let target = blobs.path(&hash);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, b"corrupt").unwrap();
+
+        blobs.put_bytes(&hash, expected).unwrap();
+
+        assert_eq!(fs::read(target).unwrap(), expected);
+        let corrupt = root.path().join("blobs/.quarantine/corrupt");
+        let preserved = fs::read_dir(corrupt)
+            .unwrap()
+            .map(|entry| fs::read(entry.unwrap().path()).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(preserved, vec![b"corrupt".to_vec()]);
+    }
 }

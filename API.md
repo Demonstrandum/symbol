@@ -68,9 +68,18 @@ Complete method inventory:
 - `Operation`: promise-compatible `then`, `retry`, `abort`, status/history
   accessors, and async disposal.
 
+Typed value/resource APIs additionally expose `apiIdentity`, `origin`,
+`attempts`, `canRetry`, `replayable`, `parse`, `application`, `from`, `text`,
+`image`, `audio`, `video`, `font`, `utf8`, `essence`, `structuredSuffix`,
+`charset`, `parameter`, `withParameter`, `withCharset`, `withoutParameter`,
+`equals`, and `toString`.
+
 `apiClient` accepts only `api.ts`, `api.js`, `api.global.js`, `api.d.ts`, and
 `api.py`. `apiManual` accepts only `index`, `javascript`, `typescript`,
 `python`, `shell`, and `protocol`.
+Metadata parses semantic versions into readonly `[major, minor, patch]`
+`ApiVersion` tuples and validates branded `Blake3` and `GitCommit` values;
+`API_VERSION` remains the canonical wire-format string.
 
 ## Allocated content-addressed files
 
@@ -192,6 +201,20 @@ provide `create`, `bytes`, `text`, and `json`; file clients provide `get`,
 `bytes`, `text`, `json`, `put`, `remove`, `hash`, `replace`, and `splice`.
 Use `ApiClientAsset` and `ApiManual` enums rather than unvalidated strings for
 the built-in resources.
+`ApiVersion` is a parsed immutable value object, while `Blake3` and
+`GitCommit` validate in their constructors; wire-format string constants are
+derived from those values.
+
+Transport and typed-value APIs additionally expose `stdlib`, `requests`,
+`urllib3`, `httpx`, `aiohttp`, `wrap`, `close`, `header`, `parse`,
+`application`, `image`, `essence`, `charset`, `parameter`, `with_parameter`,
+and response-body `body`, `read`, `iter_bytes`, `aread`, `atext`, `ajson`,
+`aiter_bytes`, `retry`, `aretry`, `abort`, `aabort`, and `aclose` operations.
+Responses and typed HTTP errors retain an immutable `attempts` tuple and a
+`replayable` flag; manual retry preserves the prior attempt history.
+Site resources also expose `url`, `undo_stack`, `set_expiry`, `expiry`, and
+`management`; management clients expose `action`, `status`, `claim`, `rotate`,
+and `release`; file clients expose `patch`.
 <!-- API:PYTHON:END -->
 
 <!-- API:SHELL:START -->
@@ -318,6 +341,11 @@ strong ETag and `Cache-Control: no-cache`.
   `error: path is reserved by symbol\n`. Authentication failure takes
   precedence and returns `401`.
 - Plain responses are UTF-8 text with a trailing newline.
+- Symbol never physically deletes persisted blob bytes during startup or
+  mutation GC. Unreferenced and replaced-corrupt blobs move to the local
+  `.quarantine` tree; startup restores any quarantined hash referenced by the
+  catalog. Quarantine removal is an explicit offline operator action only
+  after a verified full backup.
 - JSON responses use `application/json`.
 - Timestamps are RFC 3339. HTTP `Expires` uses an RFC-compatible GMT date.
 - File hashes are lowercase, unprefixed 64-hex Blake3 values in blob ETags and

@@ -271,8 +271,12 @@
             ''}
             node tests/sdk/js/browser-smoke.mjs
           '';
-          sdkPy = sdkCheck "symbol-sdk-py" [ pythonSdk ] ''
+          sdkPy = sdkCheck "symbol-sdk-py" [
+            pkgs.cacert
+            pythonSdk
+          ] ''
             export SYMBOL_BIN="${package}/bin/symbol"
+            export SSL_CERT_FILE="${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
             basedpyright --project tooling/pyproject.toml "${generatedSources}/api.py"
             ruff check --no-cache --config tooling/pyproject.toml static/api.py tests/sdk/py
             ruff format --check --no-cache --config tooling/pyproject.toml static/api.py tests/sdk/py

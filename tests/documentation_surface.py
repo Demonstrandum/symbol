@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import ast
 import json
 import os
 import pathlib
+import re
 import subprocess
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -12,120 +14,80 @@ HOMEPAGE = (ROOT / "static/docs.md").read_text()
 SYMBOL = pathlib.Path(os.environ.get("SYMBOL_BIN", ROOT / "target/debug/symbol"))
 
 SECTIONS = ("INDEX", "JS", "PYTHON", "SHELL", "PROTOCOL")
-JS_METHODS = (
-    "request",
-    "docs",
-    "docsHash",
-    "installer",
-    "installerHash",
-    "shellClient",
-    "shellClientHash",
-    "apiClient",
-    "apiClientHash",
-    "apiManual",
-    "apiVersion",
-    "stats",
-    "sites",
-    "create",
-    "site",
-    "blob",
-    "assertExactApi",
-    "file",
-    "folder",
-    "redirect",
-    "get",
-    "put",
-    "remove",
-    "archive",
-    "pop",
-    "files",
-    "alias",
-    "aliases",
-    "copy",
-    "move",
-    "undo",
-    "undoStack",
-    "setExpiry",
-    "expiry",
-    "management",
-    "bytes",
-    "text",
-    "json",
-    "html",
-    "replace",
-    "splice",
-    "patch",
-    "hash",
-    "status",
-    "claim",
-    "rotate",
-    "release",
-    "retry",
-    "abort",
-)
-PYTHON_METHODS = (
-    "stats",
-    "sites",
-    "site",
-    "api_client",
-    "api_client_hash",
-    "api_manual",
-    "api_version",
-    "request",
-    "file",
-    "folder",
-    "files",
-    "alias",
-    "aliases",
-    "copy",
-    "move",
-    "archive",
-    "pop",
-    "undo",
-    "create",
-    "bytes",
-    "text",
-    "json",
-    "get",
-    "put",
-    "remove",
-    "hash",
-    "replace",
-    "splice",
-)
-SHELL_COMMANDS = (
-    "put",
-    "clone",
-    "get",
-    "pop",
-    "copy",
-    "remix",
-    "move",
-    "alias",
-    "sync",
-    "undo",
-    "expire",
-    "manage",
-    "recover",
-    "ls",
-    "rm",
-    "url",
-    "stats",
-    "update",
-    "help",
-)
-SHELL_ALIASES = (
-    ("push", "put"),
-    ("pull", "clone"),
-    ("rename", "move"),
-    ("add", "put"),
-    ("x", "remix"),
-    ("list", "ls"),
-    ("download", "get"),
-    ("delete", "rm"),
-    ("upgrade", "update"),
-)
 SDK_ASSETS = ("api.ts", "api.js", "api.global.js", "api.d.ts", "api.py", "symbol.sh")
+
+
+def generated_file(name: str) -> pathlib.Path:
+    generated = os.environ.get("SYMBOL_GENERATED_DIR")
+    if generated is not None:
+        return pathlib.Path(generated) / name
+    candidates = sorted(
+        ROOT.glob(f"target/debug/build/symbol-*/out/{name}"),
+        key=lambda path: path.stat().st_mtime_ns,
+    )
+    assert candidates, f"generated {name} is missing"
+    return candidates[-1]
+
+
+def typescript_methods() -> tuple[str, ...]:
+    declarations = generated_file("api.d.ts").read_text()
+    methods: set[str] = set()
+    for matched in re.finditer(r"export declare class \w+[^{]*\{", declarations):
+        start = matched.end()
+        depth = 1
+        at = start
+        while depth:
+            match declarations[at]:
+                case "{":
+                    depth += 1
+                case "}":
+                    depth -= 1
+            at += 1
+        body = declarations[start : at - 1]
+        methods.update(
+            method
+            for method in re.findall(
+                r"^\s+(?:static\s+)?(?:get\s+)?([A-Za-z]\w*)\s*\(",
+                body,
+                re.MULTILINE,
+            )
+            if method != "constructor"
+        )
+    return tuple(sorted(methods))
+
+
+def python_methods() -> tuple[str, ...]:
+    tree = ast.parse((ROOT / "static/api.py").read_text())
+    methods: set[str] = set()
+    for statement in tree.body:
+        if not isinstance(statement, ast.ClassDef):
+            continue
+        methods.update(
+            member.name
+            for member in statement.body
+            if isinstance(member, ast.FunctionDef | ast.AsyncFunctionDef)
+            and not member.name.startswith("_")
+        )
+    return tuple(sorted(methods))
+
+
+def shell_surface() -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
+    output = subprocess.check_output(
+        [ROOT / "static/symbol.sh"],
+        env={**os.environ, "SYMBOL_TEST_COMMAND_REGISTRY": "1"},
+        text=True,
+    )
+    commands: list[str] = []
+    aliases: list[tuple[str, str]] = []
+    for line in output.splitlines():
+        canonical, *spellings = line.split()
+        commands.append(canonical)
+        aliases.extend(
+            (spelling, canonical)
+            for spelling in spellings
+            if spelling != canonical and not spelling.startswith("-")
+        )
+    return tuple(commands), tuple(aliases)
 
 
 def marked_section(name: str) -> str:
@@ -138,14 +100,19 @@ def marked_section(name: str) -> str:
 
 sections = tuple(marked_section(name) for name in SECTIONS)
 index, javascript, python, shell, protocol = sections
+js_methods = typescript_methods()
+py_methods = python_methods()
+shell_commands, shell_aliases = shell_surface()
 
-for method in JS_METHODS:
-    assert f"`{method}`" in javascript, f"undocumented JavaScript method: {method}"
-for method in PYTHON_METHODS:
-    assert f"`{method}`" in python, f"undocumented Python method: {method}"
-for command in SHELL_COMMANDS:
+missing_js = tuple(method for method in js_methods if f"`{method}`" not in javascript)
+missing_python = tuple(method for method in py_methods if f"`{method}`" not in python)
+assert not missing_js and not missing_python, (
+    f"undocumented JavaScript methods: {missing_js}; "
+    f"undocumented Python methods: {missing_python}"
+)
+for command in shell_commands:
     assert f"`{command}`" in shell, f"undocumented shell command: {command}"
-for alias, command in SHELL_ALIASES:
+for alias, command in shell_aliases:
     assert f"`{alias}` → `{command}`" in shell, f"undocumented shell alias: {alias}"
 for asset in SDK_ASSETS:
     assert f"`/{asset}`" in index or f"`{asset}`" in index, asset
@@ -162,6 +129,6 @@ assert "<!-- contract:" not in HOMEPAGE
 
 print(
     f"documentation surface: {len(contract)} endpoints, "
-    f"{len(JS_METHODS)} JavaScript methods, {len(PYTHON_METHODS)} Python methods, "
-    f"{len(SHELL_COMMANDS)} shell commands"
+    f"{len(js_methods)} JavaScript methods, {len(py_methods)} Python methods, "
+    f"{len(shell_commands)} shell commands"
 )

@@ -557,6 +557,39 @@ mod tests {
     }
 
     #[test]
+    fn deployed_legacy_v6_catalog_upgrades_without_weakening_other_dimensions() {
+        let (_root, mut db) = connection();
+        let legacy_schema = schema::schema_v6_sql().replace(
+            "\"bytes\" blob NOT NULL DEFAULT x''",
+            "\"bytes\" blob NOT NULL",
+        );
+        execute_v6_sql(&mut db, &legacy_schema);
+        db.batch_execute(
+            "CREATE TABLE __diesel_schema_migrations (
+                version VARCHAR(50) PRIMARY KEY NOT NULL,
+                run_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT INTO __diesel_schema_migrations (version)
+            VALUES ('00000000000000');",
+        )
+        .unwrap();
+
+        migrate(&mut db).unwrap();
+
+        assert_eq!(
+            schema_version(&mut db).unwrap(),
+            schema::LATEST_SCHEMA_VERSION
+        );
+        assert_eq!(
+            diesel::sql_query("SELECT COUNT(*) AS count FROM __diesel_schema_migrations")
+                .get_result::<ObjectCount>(&mut db)
+                .unwrap()
+                .count,
+            1
+        );
+    }
+
+    #[test]
     fn untrusted_v6_catalog_drift_is_rejected_without_changes() {
         for drift in V6CatalogDrift::ALL {
             let (_root, mut db) = connection();

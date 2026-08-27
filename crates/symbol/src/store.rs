@@ -33,7 +33,7 @@ use crate::expiry::{
     remaining_seconds,
 };
 use crate::name::{NameError, generate_id, parse_site_name};
-use crate::pathutil::{PathError, is_junk, is_noise_path, looks_like_apple_fork, safe_rel_path};
+use crate::pathutil::{PathError, is_junk, is_noise_path, safe_rel_path};
 use crate::sanitize::{self, TokenCounts};
 use crate::schema::{
     aliases, allocated_entries, blobs, expiry_policies, files, idempotency_records,
@@ -1011,6 +1011,20 @@ pub enum StoreError {
     Random(#[from] getrandom::Error),
     #[error("error: {0}")]
     Io(#[from] io::Error),
+    #[error("error: startup phase {phase}: {source}")]
+    Startup {
+        phase: &'static str,
+        source: Box<Self>,
+    },
+}
+
+impl StoreError {
+    fn startup(phase: &'static str, source: Self) -> Self {
+        Self::Startup {
+            phase,
+            source: Box::new(source),
+        }
+    }
 }
 
 impl ReaderPool {
@@ -1320,13 +1334,18 @@ impl Store {
                 before_content_commit: Mutex::new(None),
             }),
         };
-        store.migrate_sqlite_blobs()?;
-        store.migrate_legacy()?;
-        store.gc_junk()?;
-        store.backfill_manifests()?;
-        store.sweep_expired()?;
-        store.prune_undo_and_gc()?;
-        store.gc_blob_files()?;
+        store
+            .migrate_sqlite_blobs()
+            .map_err(|error| StoreError::startup("migrate SQLite blobs", error))?;
+        store
+            .restore_quarantined_blob_files()
+            .map_err(|error| StoreError::startup("restore quarantined blobs", error))?;
+        store
+            .migrate_legacy()
+            .map_err(|error| StoreError::startup("migrate legacy sites", error))?;
+        store
+            .backfill_manifests()
+            .map_err(|error| StoreError::startup("backfill manifests", error))?;
         Ok(store)
     }
 
@@ -4497,10 +4516,22 @@ impl Store {
     fn remove_blob_files(&self, hashes: &[String]) {
         self.inner.blobs.remove(hashes);
         for hash in hashes {
-            if let Err(err) = self.inner.blob_files.remove(hash) {
-                tracing::warn!(%hash, %err, "failed to remove unreferenced blob file");
+            if let Err(err) = self.inner.blob_files.quarantine(hash) {
+                tracing::warn!(%hash, %err, "failed to quarantine unreferenced blob file");
             }
         }
+    }
+
+    fn restore_quarantined_blob_files(&self) -> Result<(), StoreError> {
+        let mut db = self.inner.readers.get();
+        let live = blobs::table
+            .select(blobs::hash)
+            .load::<String>(&mut *db)?
+            .into_iter()
+            .collect::<HashSet<_>>();
+        drop(db);
+        self.inner.blob_files.restore(&live)?;
+        Ok(())
     }
 
     fn migrate_sqlite_blobs(&self) -> Result<(), StoreError> {
@@ -4622,73 +4653,6 @@ impl Store {
             let staged = stage_dir(&entry.path())?;
             self.commit_site(&name, &staged)?;
         }
-        Ok(())
-    }
-
-    fn gc_junk(&self) -> Result<(), StoreError> {
-        let mut db = self.inner.writer.lock().unwrap();
-        let mut tx = DbTransaction::begin(&mut db)?;
-        let mut apple = HashSet::new();
-        {
-            let rows = blobs::table
-                .filter(blobs::size.le(65_536_i64))
-                .select(blobs::hash)
-                .load::<String>(&mut *tx)?;
-            for hash in rows {
-                let mut prefix = [0_u8; 4];
-                let read = fs::File::open(self.inner.blob_files.path(&hash))?.read(&mut prefix)?;
-                if looks_like_apple_fork(&prefix[..read]) {
-                    apple.insert(hash);
-                }
-            }
-        }
-        let mut junk = Vec::new();
-        {
-            let rows = files::table
-                .select((files::site_id, files::path, files::hash))
-                .load::<(i64, String, String)>(&mut *tx)?;
-            for (site_id, path, hash) in rows {
-                if is_junk(Path::new(&path), None) || apple.contains(&hash) {
-                    junk.push((site_id, path));
-                }
-            }
-        }
-        let mut sites = HashSet::new();
-        for (site_id, path) in &junk {
-            diesel::delete(site_entries::table.find((*site_id, path.as_str())))
-                .execute(&mut *tx)?;
-            sites.insert(*site_id);
-        }
-        for site_id in sites {
-            let remaining = site_entries::table
-                .filter(site_entries::site_id.eq(site_id))
-                .filter(site_entries::path.ne(MANIFEST_PATH))
-                .select(count_star())
-                .first::<i64>(&mut *tx)?;
-            if remaining == 0 {
-                diesel::delete(sites::table.find(site_id)).execute(&mut *tx)?;
-            } else {
-                rebuild_aggregates_locked(&mut tx, site_id)?;
-                refresh_all_aliases_locked(&mut tx, site_id)?;
-                regenerate_site(&mut tx, &self.inner.blob_files, site_id, self.now_millis())?;
-            }
-        }
-        let removed = gc_blobs(&mut tx, self.now_millis())?;
-        tx.commit()?;
-        drop(db);
-        self.remove_blob_files(&removed);
-        Ok(())
-    }
-
-    fn gc_blob_files(&self) -> Result<(), StoreError> {
-        let mut db = self.inner.readers.get();
-        let live = blobs::table
-            .select(blobs::hash)
-            .load::<String>(&mut *db)?
-            .into_iter()
-            .collect::<HashSet<_>>();
-        drop(db);
-        self.inner.blob_files.retain(&live)?;
         Ok(())
     }
 
@@ -12244,17 +12208,9 @@ mod tests {
     }
 
     #[test]
-    fn startup_removes_orphaned_blob_files() {
+    fn startup_never_deletes_unreferenced_blob_files() {
         let dir = tempfile::tempdir().unwrap();
-        let live_hash;
-        {
-            let store = Store::new(dir.path().to_path_buf()).unwrap();
-            store.put_file("hello", "live.bin", b"live").unwrap();
-            let Node::File { hash, .. } = store.lookup("hello", "live.bin").unwrap() else {
-                panic!("expected file");
-            };
-            live_hash = hash;
-        }
+        drop(Store::new(dir.path().to_path_buf()).unwrap());
         let orphan_hash = "aa00000000000000000000000000000000000000000000000000000000000000";
         let orphan = dir
             .path()
@@ -12264,9 +12220,40 @@ mod tests {
         fs::create_dir_all(orphan.parent().unwrap()).unwrap();
         fs::write(&orphan, b"orphan").unwrap();
 
+        drop(Store::new(dir.path().to_path_buf()).unwrap());
+        assert_eq!(fs::read(orphan).unwrap(), b"orphan");
+    }
+
+    #[test]
+    fn startup_restores_catalog_references_from_blob_quarantine() {
+        let dir = tempfile::tempdir().unwrap();
+        let hash;
+        {
+            let store = Store::new(dir.path().to_path_buf()).unwrap();
+            store.put_file("hello", "live.bin", b"live").unwrap();
+            let Node::File {
+                hash: stored_hash, ..
+            } = store.lookup("hello", "live.bin").unwrap()
+            else {
+                panic!("expected file");
+            };
+            hash = stored_hash;
+        }
+        let live = dir.path().join("blobs").join(&hash[..2]).join(&hash[2..]);
+        let quarantined = dir
+            .path()
+            .join("blobs")
+            .join(".quarantine")
+            .join(&hash[..2])
+            .join(&hash[2..]);
+        fs::create_dir_all(quarantined.parent().unwrap()).unwrap();
+        fs::rename(&live, &quarantined).unwrap();
+
         let store = Store::new(dir.path().to_path_buf()).unwrap();
-        assert!(!orphan.exists());
-        assert_eq!(fs::read(store.blob_path(&live_hash)).unwrap(), b"live");
+
+        assert_eq!(store.read_blob(&hash).unwrap().as_ref(), b"live");
+        assert!(live.exists());
+        assert!(!quarantined.exists());
     }
 
     #[test]
@@ -12287,7 +12274,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_sweeps_junk() {
+    fn startup_does_not_delete_preexisting_junk_content() {
         let dir = tempfile::tempdir().unwrap();
         {
             let store = Store::new(dir.path().to_path_buf()).unwrap();
@@ -12328,22 +12315,12 @@ mod tests {
         let store = Store::new(dir.path().to_path_buf()).unwrap();
         assert_eq!(
             store.list_files("hello").unwrap(),
-            vec!["index.html".to_string(), "symbol.toml".to_string()]
-        );
-        assert!(matches!(
-            store.lookup("hello", "._index.html").unwrap_err(),
-            StoreError::NotFound
-        ));
-        let names: Vec<_> = store
-            .list_dir("hello", "")
-            .unwrap()
-            .entries
-            .into_iter()
-            .map(|e| e.name)
-            .collect();
-        assert_eq!(
-            names,
-            vec!["index.html".to_string(), "symbol.toml".to_string()]
+            vec![
+                "._index.html".to_string(),
+                "index.html".to_string(),
+                "keep.bin".to_string(),
+                "symbol.toml".to_string(),
+            ]
         );
     }
 
@@ -13067,6 +13044,13 @@ mod tests {
         clock.advance(u64::try_from(PENDING_RETENTION_MILLIS).unwrap() + 1);
         assert_eq!(store.prune_pending_allocations().unwrap(), 1);
         assert!(!store.blob_path(&abandoned.hash).exists());
+        assert!(
+            dir.path()
+                .join("blobs/.quarantine")
+                .join(&abandoned.hash[..2])
+                .join(&abandoned.hash[2..])
+                .is_file()
+        );
 
         let cancelled = store
             .propose_allocation(
@@ -13080,6 +13064,13 @@ mod tests {
             .cancel_allocation("pending", &cancelled.token, None)
             .unwrap();
         assert!(!store.blob_path(&cancelled.hash).exists());
+        assert!(
+            dir.path()
+                .join("blobs/.quarantine")
+                .join(&cancelled.hash[..2])
+                .join(&cancelled.hash[2..])
+                .is_file()
+        );
     }
 
     #[test]

@@ -1,17 +1,28 @@
+export type ApiVersion = readonly [major: number, minor: number, patch: number];
+export type Blake3 = string & { readonly __brand: "Blake3" };
+export type GitCommit = string & { readonly __brand: "GitCommit" };
+export type TreeHash = string;
+export type EntityTag = string;
+export type IdempotencyKey = string;
+export type UndoToken = string;
+export type ManagementToken = string;
+export type CreatorClaim = string;
+export type ApiArtifact = "api.ts" | "api.js" | "api.global.js" | "api.d.ts";
+
 export interface SymbolApiMetadata {
-  readonly artifact: string;
-  readonly apiVersion: string;
+  readonly artifact: ApiArtifact;
+  readonly apiVersion: ApiVersion;
   readonly absoluteRevision: number;
-  readonly sourceHash: string;
-  readonly generatorVersion: string;
-  readonly commit: string;
+  readonly sourceHash: Blake3;
+  readonly generatorVersion: ApiVersion;
+  readonly commit: GitCommit;
   readonly dirty: boolean;
 }
 
 export interface SymbolApiIdentity {
-  readonly apiVersion: string;
+  readonly apiVersion: ApiVersion;
   readonly absoluteRevision: number;
-  readonly sourceHash: string;
+  readonly sourceHash: Blake3;
 }
 
 export const METADATA_JSON: string = "{METADATA_JSON}";
@@ -31,23 +42,25 @@ function parseMetadata(source: string): Readonly<SymbolApiMetadata> {
     throw new TypeError("generated API metadata does not match its schema");
   }
   return Object.freeze({
-    artifact: value.artifact,
-    apiVersion: value.apiVersion,
+    artifact: apiArtifact(value.artifact),
+    apiVersion: apiVersion(value.apiVersion),
     absoluteRevision: value.absoluteRevision,
-    sourceHash: value.sourceHash,
-    generatorVersion: value.generatorVersion,
-    commit: value.commit,
+    sourceHash: blake3(value.sourceHash),
+    generatorVersion: apiVersion(value.generatorVersion),
+    commit: gitCommit(value.commit),
     dirty: value.dirty,
   });
 }
 
 export const metadata: Readonly<SymbolApiMetadata> = parseMetadata(METADATA_JSON);
 
-export const API_VERSION: string = metadata.apiVersion;
+export const API_VERSION_PARTS: ApiVersion = metadata.apiVersion;
+export const API_VERSION: string = formatApiVersion(API_VERSION_PARTS);
 export const API_REVISION: number = metadata.absoluteRevision;
-export const SOURCE_HASH: string = metadata.sourceHash;
-export const GENERATOR_VERSION: string = metadata.generatorVersion;
-export const BUILD_COMMIT: string = metadata.commit;
+export const SOURCE_HASH: Blake3 = metadata.sourceHash;
+export const GENERATOR_VERSION_PARTS: ApiVersion = metadata.generatorVersion;
+export const GENERATOR_VERSION: string = formatApiVersion(GENERATOR_VERSION_PARTS);
+export const BUILD_COMMIT: GitCommit = metadata.commit;
 export const BUILD_DIRTY: boolean = metadata.dirty;
 
 export type EndpointName =
@@ -635,7 +648,7 @@ export function allocatedFileName(hash: string, parts: GeneratedNameParts = {}):
 export interface ProposedFileName {
   readonly folder: string;
   readonly defaultName: string;
-  readonly hash: string;
+  readonly hash: TreeHash;
   readonly size: number;
   readonly mediaType: string;
   readonly inferredExtension: string | null;
@@ -677,7 +690,7 @@ export interface ByteSplice {
 
 export interface FileEntry {
   readonly path: string;
-  readonly hash: string;
+  readonly hash: TreeHash;
   readonly size: number;
 }
 
@@ -686,15 +699,15 @@ export interface AliasInventoryEntry {
   readonly target: string;
   readonly targetKind: "file" | "directory" | null;
   readonly dangling: boolean;
-  readonly resolvedHash: string | null;
+  readonly resolvedHash: TreeHash | null;
   readonly size: number | null;
 }
 
 export interface FileInventory {
   readonly site: string;
   readonly contentRevision: number;
-  readonly treeHash: string;
-  readonly etag: string;
+  readonly treeHash: TreeHash;
+  readonly etag: EntityTag;
   readonly files: readonly FileEntry[];
   readonly aliases: readonly AliasInventoryEntry[];
 }
@@ -729,7 +742,7 @@ export interface DirectoryListing {
 
 export interface NotModified {
   readonly status: 304;
-  readonly etag: string;
+  readonly etag: EntityTag;
   readonly cacheControl: string;
   readonly response: Response;
 }
@@ -743,7 +756,7 @@ export interface ListingRedirect {
 export type CachedDirectoryListing =
   | (DirectoryListing & {
       readonly status: 200;
-      readonly etag: string;
+      readonly etag: EntityTag;
       readonly cacheControl: string;
       readonly response: Response;
     })
@@ -813,7 +826,7 @@ export type UndoKind =
   | "alias";
 
 export interface UndoEntry {
-  readonly token: string;
+  readonly token: UndoToken;
   readonly kind: UndoKind;
   readonly description: string;
   readonly createdAt: Date;
@@ -891,7 +904,7 @@ export interface ManagementStatus {
 }
 
 export interface UndoReceipt {
-  readonly token: string;
+  readonly token: UndoToken;
   readonly expiresAt: Date;
 }
 
@@ -901,10 +914,10 @@ export interface AliasDefinition {
 }
 
 export interface MutationBase {
-  readonly idempotencyKey: string | null;
+  readonly idempotencyKey: IdempotencyKey | null;
   readonly replayed: boolean;
   readonly location: URL;
-  readonly etag: string;
+  readonly etag: EntityTag;
   readonly contentRevision: number;
   readonly sanitizedManagementTokens: number;
   readonly sanitizedCreatorClaims: number;
@@ -925,30 +938,30 @@ export type SiteCreationReceipt = {
   readonly status: 201;
   readonly site: string;
   readonly files: number;
-  readonly creatorClaim: string | null;
-  readonly managementToken: string | null;
+  readonly creatorClaim: CreatorClaim | null;
+  readonly managementToken: ManagementToken | null;
 } & ChangedMutation;
 
 export type SitePutReceipt = {
   readonly status: 200 | 201;
   readonly site: string;
   readonly files: number;
-  readonly creatorClaim: string | null;
-  readonly managementToken: string | null;
+  readonly creatorClaim: CreatorClaim | null;
+  readonly managementToken: ManagementToken | null;
 } & (ChangedMutation | UnchangedMutation);
 
 export type FilePutReceipt = {
   readonly status: 200 | 201;
-  readonly creatorClaim: string | null;
-  readonly managementToken: string | null;
+  readonly creatorClaim: CreatorClaim | null;
+  readonly managementToken: ManagementToken | null;
 } & (ChangedMutation | UnchangedMutation);
 
 export type CopyReceipt = {
   readonly status: 201;
   readonly site: string;
   readonly files: number;
-  readonly creatorClaim: string | null;
-  readonly managementToken: string | null;
+  readonly creatorClaim: CreatorClaim | null;
+  readonly managementToken: ManagementToken | null;
 } & ChangedMutation;
 
 export type MoveReceipt = { readonly status: 200 } & ChangedMutation;
@@ -996,7 +1009,7 @@ export type AllocationReceipt = {
   readonly path: string;
   readonly name: string;
   readonly url: URL;
-  readonly hash: string;
+  readonly hash: TreeHash;
   readonly size: number;
   readonly blobUrl: URL;
   readonly naming:
@@ -1013,8 +1026,8 @@ type FileReplaceReceiptBase = {
   readonly status: 200;
   readonly oldPath: string;
   readonly newPath: string;
-  readonly oldHash: string;
-  readonly newHash: string;
+  readonly oldHash: TreeHash;
+  readonly newHash: TreeHash;
   readonly size: number;
 };
 
@@ -1039,8 +1052,8 @@ export type SpliceReceipt = {
   readonly oldPath: string;
   readonly newPath: string;
   readonly relocated: boolean;
-  readonly oldHash: string;
-  readonly newHash: string;
+  readonly oldHash: TreeHash;
+  readonly newHash: TreeHash;
   readonly oldSize: number;
   readonly newSize: number;
   readonly splices: number;
@@ -1052,7 +1065,7 @@ export type ManagementClaimReceipt =
       readonly status: 200;
       readonly managed: true;
       readonly replayed: false;
-      readonly managementToken: string;
+      readonly managementToken: ManagementToken;
       readonly response: Response;
     }
   | {
@@ -1070,7 +1083,7 @@ export type ManagementRotateReceipt =
       readonly status: 200;
       readonly managed: true;
       readonly replayed: false;
-      readonly managementToken: string;
+      readonly managementToken: ManagementToken;
       readonly response: Response;
     }
   | {
@@ -1401,6 +1414,7 @@ interface InternalOperationConfiguration<T> {
   readonly executor: InternalAttemptExecutor<T>;
   readonly idempotencyKey: string | null;
   readonly replayable: () => boolean;
+  readonly retryBlocked?: () => boolean;
   readonly retrySafe: boolean;
   readonly retryPolicy: RetryPolicy;
   readonly signal: AbortSignal | null;
@@ -1413,6 +1427,7 @@ export class Operation<T> implements PromiseLike<T>, AsyncDisposable {
   private readonly controller: AbortController;
   private readonly executor: InternalAttemptExecutor<T>;
   private readonly replayableState: () => boolean;
+  private readonly retryBlocked: () => boolean;
   private readonly retrySafe: boolean;
   private readonly retryPolicy: RetryPolicy;
   private readonly disposeCallback: (() => Promise<void>) | null;
@@ -1426,6 +1441,7 @@ export class Operation<T> implements PromiseLike<T>, AsyncDisposable {
   constructor(configuration: InternalOperationConfiguration<T>) {
     this.idempotencyKey = configuration.idempotencyKey;
     this.replayableState = configuration.replayable;
+    this.retryBlocked = configuration.retryBlocked ?? (() => false);
     this.controller = new AbortController();
     this.signal = this.controller.signal;
     this.executor = configuration.executor;
@@ -1449,7 +1465,13 @@ export class Operation<T> implements PromiseLike<T>, AsyncDisposable {
   }
 
   get canRetry(): boolean {
-    return this.state === "failed" && this.retrySafe && this.replayable && !this.signal.aborted;
+    return (
+      this.state === "failed" &&
+      this.retrySafe &&
+      this.replayable &&
+      !this.retryBlocked() &&
+      !this.signal.aborted
+    );
   }
 
   then<TResult1 = T, TResult2 = never>(
@@ -1468,6 +1490,9 @@ export class Operation<T> implements PromiseLike<T>, AsyncDisposable {
     }
     if (this.state === "disposed" || this.signal.aborted) {
       throw new OperationStateError("disposed or aborted operation cannot be retried");
+    }
+    if (this.retryBlocked()) {
+      throw new OperationStateError("operation failure cannot be retried safely");
     }
     if (!this.replayable) {
       throw new BodyNotReplayableError();
@@ -1590,7 +1615,6 @@ interface ClientState {
   readonly token: string | null;
   readonly creatorClaim: string | null;
   readonly fetch: typeof globalThis.fetch;
-  readonly nativeFetch: boolean;
   readonly retryPolicy: RetryPolicy;
   observed: SymbolApiIdentity | null;
 }
@@ -1636,7 +1660,6 @@ export class SymbolClient {
       token: options.token === undefined ? null : options.token,
       creatorClaim: options.creatorClaim === undefined ? null : options.creatorClaim,
       fetch: fetchImplementation.bind(globalThis),
-      nativeFetch: options.fetch === undefined,
       retryPolicy,
       observed: null,
     });
@@ -1657,13 +1680,13 @@ export class SymbolClient {
       throw new OperationStateError("no Symbol response has been observed");
     }
     if (
-      observed.apiVersion !== API_VERSION ||
+      compareVersion(observed.apiVersion, API_VERSION_PARTS) !== 0 ||
       observed.absoluteRevision !== API_REVISION ||
       observed.sourceHash !== SOURCE_HASH
     ) {
       throw new Error(
         `expected Symbol API ${API_VERSION} revision ${API_REVISION} ${SOURCE_HASH}, ` +
-          `observed ${observed.apiVersion} revision ${observed.absoluteRevision} ` +
+          `observed ${formatApiVersion(observed.apiVersion)} revision ${observed.absoluteRevision} ` +
           observed.sourceHash,
       );
     }
@@ -1693,10 +1716,7 @@ export class SymbolClient {
           if (signal.aborted) {
             throw signal.reason;
           }
-          if (state.nativeFetch) {
-            throw new InternalNetworkRequestError(error);
-          }
-          throw error;
+          throw new InternalNetworkRequestError(error);
         }
         reportStatus(response.status);
         observeApiIdentity(this, "raw request", response);
@@ -2728,6 +2748,7 @@ interface CustomAllocationState {
   chosenName: string | null;
   finalized: boolean;
   cancelled: boolean;
+  callbackFailed: boolean;
 }
 
 function customAllocation(
@@ -2752,6 +2773,7 @@ function customAllocation(
     chosenName: null,
     finalized: false,
     cancelled: false,
+    callbackFailed: false,
   };
   const cancel = async (): Promise<void> => {
     const proposal = state.proposal;
@@ -2795,6 +2817,7 @@ function customAllocation(
   return new Operation({
     idempotencyKey: logicalKey,
     replayable: () => state.proposal !== null || preparedBody.replayable,
+    retryBlocked: () => state.callbackFailed,
     retrySafe: true,
     retryPolicy: clientState.retryPolicy,
     signal: options.signal === undefined ? null : options.signal,
@@ -2835,6 +2858,7 @@ function customAllocation(
         try {
           state.chosenName = validateBasename(await chooseName(state.proposedResource));
         } catch (error) {
+          state.callbackFailed = true;
           try {
             await cancel();
           } catch {
@@ -2943,10 +2967,7 @@ async function executeRequest<T>(
     if (signal.aborted) {
       throw signal.reason;
     }
-    if (state.nativeFetch) {
-      throw new InternalNetworkRequestError(error);
-    }
-    throw error;
+    throw new InternalNetworkRequestError(error);
   }
   if (reportStatus !== null) {
     reportStatus(response.status);
@@ -3124,9 +3145,9 @@ async function decodeCachedApiVersion(response: Response): Promise<CachedApiIden
     throw new TypeError("API version.source_hash must be 64 lowercase hexadecimal characters");
   }
   const identity = Object.freeze({
-    apiVersion: stringValue(value.api_version, "API version.api_version"),
+    apiVersion: apiVersion(stringValue(value.api_version, "API version.api_version")),
     absoluteRevision: unsigned(value.absolute_revision, "API version.absolute_revision"),
-    sourceHash,
+    sourceHash: blake3(sourceHash),
   });
   return Object.freeze({
     status: 200,
@@ -3300,9 +3321,20 @@ function observeApiIdentity(
       response.clone(),
     );
   }
-  const serverVersion = parseVersion(version);
-  const clientVersion = parseVersion(API_VERSION);
-  if (serverVersion.major !== clientVersion.major) {
+  let serverVersion: ApiVersion;
+  try {
+    serverVersion = apiVersion(version);
+  } catch (error) {
+    throw new MissingApiIdentityError(
+      "MissingApiIdentityError",
+      endpoint,
+      response.status,
+      error instanceof Error ? error.message : "invalid Symbol API version",
+      null,
+      response.clone(),
+    );
+  }
+  if (serverVersion[0] !== API_VERSION_PARTS[0]) {
     throw new IncompatibleApiVersionError(
       "IncompatibleApiVersionError",
       endpoint,
@@ -3313,7 +3345,7 @@ function observeApiIdentity(
     );
   }
   if (endpoint !== "raw request") {
-    const introduced = parseVersion(contractOperation(endpoint).introduced);
+    const introduced = apiVersion(contractOperation(endpoint).introduced);
     if (compareVersion(serverVersion, introduced) < 0) {
       throw new OperationUnavailableError(
         "OperationUnavailableError",
@@ -3337,52 +3369,77 @@ function observeApiIdentity(
   }
   const state = stateFor(client);
   const identity = Object.freeze({
-    apiVersion: version,
+    apiVersion: serverVersion,
     absoluteRevision: revision,
-    sourceHash,
+    sourceHash: blake3(sourceHash),
   });
-  if (
-    state.observed !== null &&
-    (state.observed.apiVersion !== identity.apiVersion ||
-      state.observed.absoluteRevision !== identity.absoluteRevision ||
-      state.observed.sourceHash !== identity.sourceHash)
-  ) {
-    throw new ApiIntegrityError(
-      "ApiIntegrityError",
-      endpoint,
-      response.status,
-      "Symbol API identity changed during one client run",
-      null,
-      response.clone(),
-    );
+  if (state.observed !== null) {
+    const versionOrder = compareVersion(identity.apiVersion, state.observed.apiVersion);
+    const revisionOrder = identity.absoluteRevision - state.observed.absoluteRevision;
+    const identicalIdentity = versionOrder === 0 && revisionOrder === 0;
+    if (
+      versionOrder < 0 ||
+      revisionOrder < 0 ||
+      (versionOrder > 0 && revisionOrder <= 0) ||
+      (identicalIdentity && state.observed.sourceHash !== identity.sourceHash)
+    ) {
+      throw new ApiIntegrityError(
+        "ApiIntegrityError",
+        endpoint,
+        response.status,
+        "Symbol API identity rolled back or changed inconsistently during one client run",
+        null,
+        response.clone(),
+      );
+    }
   }
   state.observed = identity;
 }
 
-interface ParsedVersion {
-  readonly major: number;
-  readonly minor: number;
-  readonly patch: number;
+function apiArtifact(value: string): ApiArtifact {
+  switch (value) {
+    case "api.ts":
+    case "api.js":
+    case "api.global.js":
+    case "api.d.ts":
+      return value;
+    default:
+      throw new TypeError(`invalid generated API artifact: ${value}`);
+  }
 }
 
-function parseVersion(value: string): ParsedVersion {
+function apiVersion(value: string): ApiVersion {
   const match = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/.exec(value);
   if (match === null) {
     throw new TypeError(`invalid Symbol API version: ${value}`);
   }
-  const version = {
-    major: Number(match[1]),
-    minor: Number(match[2]),
-    patch: Number(match[3]),
-  };
-  if (!Object.values(version).every(Number.isSafeInteger)) {
+  const version = [Number(match[1]), Number(match[2]), Number(match[3])] as const;
+  if (!version.every(Number.isSafeInteger)) {
     throw new TypeError(`Symbol API version is outside JavaScript's safe integer range: ${value}`);
   }
-  return version;
+  return Object.freeze(version);
 }
 
-function compareVersion(left: ParsedVersion, right: ParsedVersion): number {
-  return left.major - right.major || left.minor - right.minor || left.patch - right.patch;
+function formatApiVersion(version: ApiVersion): string {
+  return version.join(".");
+}
+
+function compareVersion(left: ApiVersion, right: ApiVersion): number {
+  return left[0] - right[0] || left[1] - right[1] || left[2] - right[2];
+}
+
+function blake3(value: string): Blake3 {
+  if (!/^[0-9a-f]{64}$/.test(value)) {
+    throw new TypeError(`invalid Blake3 hash: ${value}`);
+  }
+  return value as Blake3;
+}
+
+function gitCommit(value: string): GitCommit {
+  if (value !== "unknown" && !/^[0-9a-fA-F]{7,64}$/.test(value)) {
+    throw new TypeError(`invalid Git commit: ${value}`);
+  }
+  return value as GitCommit;
 }
 
 function contractOperation(name: EndpointName): EmbeddedOperation {
@@ -3534,12 +3591,12 @@ function validatedNameFragment(value: string, label: string): string {
   return value;
 }
 
-function validateHash(hash: string): string {
+function validateHash(hash: string): Blake3 {
   const normalized = hash.startsWith("blake3:") ? hash.slice(7) : hash;
   if (!/^[0-9a-f]{64}$/.test(normalized)) {
     throw new TypeError("expected a lowercase Blake3 hash");
   }
-  return normalized;
+  return normalized as Blake3;
 }
 
 function isSourceHash(hash: string): boolean {
@@ -3608,7 +3665,7 @@ class InternalNetworkRequestError extends Error {
   readonly cause: unknown;
 
   constructor(cause: unknown) {
-    super("network request failed");
+    super(cause instanceof Error ? cause.message : "network request failed");
     this.name = "NetworkRequestError";
     this.cause = cause;
   }
@@ -4217,22 +4274,22 @@ function validateHostedResponse(response: Response): void {
   }
 }
 
-function quotedHashHeader(response: Response, name: string): string {
+function quotedHashHeader(response: Response, name: string): EntityTag {
   const value = requiredHeader(response, name);
   const match = /^"([0-9a-f]{64})"$/.exec(value);
   if (match === null) {
     throw malformed(response, `${name} must be a quoted blake3 hash`);
   }
-  return match[1];
+  return match[1] as EntityTag;
 }
 
-function quotedTreeHashHeader(response: Response, name: string): string {
+function quotedTreeHashHeader(response: Response, name: string): TreeHash {
   const value = requiredHeader(response, name);
   const match = /^"(blake3:[0-9a-f]{64})"$/.exec(value);
   if (match === null) {
     throw malformed(response, `${name} must be a quoted tree hash`);
   }
-  return match[1];
+  return match[1] as TreeHash;
 }
 
 function requireCacheControl(response: Response): void {
@@ -5418,12 +5475,12 @@ function stringValue(value: unknown, label: string): string {
   return value;
 }
 
-function hashValue(value: unknown, label: string): string {
+function hashValue(value: unknown, label: string): TreeHash {
   const hash = stringValue(value, label);
   if (!/^blake3:[0-9a-f]{64}$/.test(hash)) {
     throw new TypeError(`${label} must be a strict blake3 hash`);
   }
-  return hash;
+  return hash as TreeHash;
 }
 
 function treeHashValue(value: unknown, label: string): string {

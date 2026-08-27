@@ -1,6 +1,7 @@
 import {
   type AliasReceipt,
   type AllocationReceipt,
+  type ApiVersion,
   type ArchiveDownload,
   BodyNotReplayableError,
   type CachedApiIdentity,
@@ -31,6 +32,7 @@ type OptionalKeys<Value extends object> = {
 type NoOptional<Value extends object> = Equal<OptionalKeys<Value>, never>;
 
 const client = new SymbolClient({ origin: "http://127.0.0.1:4340" });
+const version: ApiVersion = [1, 2, 3];
 const site = client.site("hello");
 const inventory: Operation<CachedFileInventory> = site.files();
 const listing = site.files("assets");
@@ -69,7 +71,7 @@ async function narrowing(): Promise<void> {
   }
   const identity = await apiIdentity;
   if (identity.status === 200) {
-    identity.identity.apiVersion.toUpperCase();
+    identity.identity.apiVersion.join(".");
   } else {
     const absent: null = identity.identity;
     void absent;
@@ -146,6 +148,7 @@ client.apiClient("api.rb");
 client.apiManual("ruby");
 
 void inventory;
+void version;
 void listing;
 void stats;
 void creation;

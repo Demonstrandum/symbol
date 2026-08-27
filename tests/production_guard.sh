@@ -88,6 +88,7 @@ RUNNING_EXE="${TMP}/running-symbol"
 DEPLOY_BINARY="${TMP}/deployed-symbol"
 DATA_ROOT="${TMP}/data"
 BACKUP_ROOT="${TMP}/backups"
+INSTALLED_UNIT="${TMP}/installed-symbol.service"
 export \
   BACKUP_MARKER \
   BACKUP_ROOT \
@@ -103,8 +104,18 @@ export \
 mkdir -p "${DATA_ROOT}/blobs"
 printf 'old binary\n' >"${RUNNING_EXE}"
 printf 'new binary\n' >"${DEPLOY_BINARY}"
-printf 'database\n' >"${DATA_ROOT}/symbol.db"
+python3 - "${DATA_ROOT}/symbol.db" <<'PY'
+import sqlite3
+import sys
+
+database = sqlite3.connect(sys.argv[1])
+database.execute("CREATE TABLE fixture (value TEXT NOT NULL)")
+database.execute("INSERT INTO fixture VALUES ('database')")
+database.commit()
+database.close()
+PY
 printf 'blob\n' >"${DATA_ROOT}/blobs/aa"
+printf 'old unit\n' >"${INSTALLED_UNIT}"
 
 cat >"${TMP}/cargo" <<'EOF'
 #!/bin/sh
@@ -166,6 +177,8 @@ cat >"${TMP}/install" <<'EOF'
   printf 'deployment reached before backup\n' >&2
   exit 92
 }
+for destination do :; done
+printf 'new unit\n' >"${destination}"
 : >"${DEPLOY_MARKER}"
 EOF
 cat >"${TMP}/cp" <<'EOF'
@@ -174,6 +187,13 @@ cat >"${TMP}/cp" <<'EOF'
 case "$*" in
   *"${DEPLOY_BINARY}") : >"${RESTORE_MARKER}" ;;
   *) : >"${BACKUP_MARKER}" ;;
+esac
+EOF
+cat >"${TMP}/curl" <<'EOF'
+#!/bin/sh
+[ "${CURL_FAILURE:-0}" != 1 ] || exit 22
+case "$*" in
+  *"/STATS"*) printf '{}\n' ;;
 esac
 EOF
 cat >"${TMP}/journalctl" <<'EOF'
@@ -210,6 +230,7 @@ chmod +x \
   "${TMP}/systemctl" \
   "${TMP}/install" \
   "${TMP}/cp" \
+  "${TMP}/curl" \
   "${TMP}/journalctl" \
   "${TMP}/sleep"
 
@@ -228,11 +249,13 @@ run_restart_guard() {
       SYMBOL_BACKUP_ROOT="${BACKUP_ROOT}" \
       SYMBOL_DATA_ROOT="${DATA_ROOT}" \
       SYMBOL_DEPLOY_BINARY="${DEPLOY_BINARY}" \
+      SYMBOL_INSTALLED_UNIT="${INSTALLED_UNIT}" \
       SYMBOL_PRODUCTION_PHASE=10 \
       SYMBOL_RESTART_QUIET_SECONDS=30 \
       SYMBOL_RESTART_WAIT_SECONDS="${1}" \
       SYMBOL_RUNNING_EXE="${RUNNING_EXE}" \
       JOURNAL_FAILURE="${JOURNAL_FAILURE:-0}" \
+      CURL_FAILURE="${CURL_FAILURE:-0}" \
       PAUSE_ACTION="${PAUSE_ACTION:-}" \
       RESTART_FAILURE="${RESTART_FAILURE:-0}" \
       SLEEP_ACTION="${SLEEP_ACTION:-}" \
@@ -273,11 +296,19 @@ run_restart_guard 0
     printf 'quiet journal did not permit restart:\n%s\n' "${GUARD_OUTPUT}" >&2
     exit 1
   }
+set -- "${BACKUP_ROOT}"/*
+[ -f "$1/blobs/aa" ] && [ -f "$1/symbol.service" ] ||
+  {
+    printf 'successful restart backup omitted blobs or service unit\n' >&2
+    exit 1
+  }
 
 write_journal_all \
   'symbol_mutation_start mutation_id=8 method=PUT' \
   'symbol_mutation_finish mutation_id=8 method=PUT status=200'
 : >"${JOURNAL_RECENT}"
+printf 'new binary\n' >"${DEPLOY_BINARY}"
+printf 'old unit\n' >"${INSTALLED_UNIT}"
 RESTART_FAILURE=1
 export RESTART_FAILURE
 run_restart_guard 0
@@ -287,6 +318,33 @@ unset RESTART_FAILURE
   [ -e "${RESTORE_MARKER}" ] ||
   {
     printf 'failed restart did not restore its backup:\n%s\n' "${GUARD_OUTPUT}" >&2
+    exit 1
+  }
+[ "$(/bin/cat "${DEPLOY_BINARY}")" = 'old binary' ] &&
+  [ "$(/bin/cat "${DATA_ROOT}/blobs/aa")" = 'blob' ] &&
+  [ "$(/bin/cat "${INSTALLED_UNIT}")" = 'old unit' ] ||
+  {
+    printf 'rollback did not restore binary, blobs, and service unit\n' >&2
+    exit 1
+  }
+
+write_journal_all \
+  'symbol_mutation_start mutation_id=9 method=PUT' \
+  'symbol_mutation_finish mutation_id=9 method=PUT status=200'
+: >"${JOURNAL_RECENT}"
+printf 'new binary\n' >"${DEPLOY_BINARY}"
+printf 'old unit\n' >"${INSTALLED_UNIT}"
+CURL_FAILURE=1
+export CURL_FAILURE
+SYMBOL_STARTUP_ATTEMPTS=1
+export SYMBOL_STARTUP_ATTEMPTS
+run_restart_guard 0
+unset CURL_FAILURE SYMBOL_STARTUP_ATTEMPTS
+[ "${GUARD_STATUS}" -eq 1 ] &&
+  [ -e "${BACKUP_MARKER}" ] &&
+  [ -e "${RESTORE_MARKER}" ] ||
+  {
+    printf 'readiness failure did not restore its backup:\n%s\n' "${GUARD_OUTPUT}" >&2
     exit 1
   }
 

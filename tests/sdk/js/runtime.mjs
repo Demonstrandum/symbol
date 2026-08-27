@@ -207,7 +207,7 @@ test("all 40 installed endpoint mappings execute exact decoders", async () => {
     assert.equal((await client.apiClient("api.ts")).status, 200);
     assert.equal((await client.apiClientHash("api.ts")).length, 64);
     assert.equal((await client.apiManual("typescript")).status, 200);
-    assert.equal((await client.apiVersion()).identity.apiVersion, esm.API_VERSION);
+    assert.deepEqual((await client.apiVersion()).identity.apiVersion, esm.API_VERSION_PARTS);
     assert.equal((await client.sites()).entries[0].kind, "builtin");
     assert.equal((await site.redirect()).status, 307);
     const index = await site.get();
@@ -273,7 +273,7 @@ test("all 40 installed endpoint mappings execute exact decoders", async () => {
         1,
     );
     assert.deepEqual(client.assertExactApi(), {
-        apiVersion: esm.API_VERSION,
+        apiVersion: esm.API_VERSION_PARTS,
         absoluteRevision: esm.API_REVISION,
         sourceHash: esm.SOURCE_HASH,
     });
@@ -398,6 +398,8 @@ test("custom allocation callback failure cancels its proposal", async () => {
         /callback failed/,
     );
     assert.equal(callbacks, 1);
+    assert.equal(operation.canRetry, false);
+    assert.throws(() => operation.retry(), esm.OperationStateError);
     await server.stop();
     assert.equal(server.requests.length, 3);
     assert.equal(server.requests[1].headers["idempotency-key"], `${logicalKey}:cancel`);
@@ -589,6 +591,31 @@ test("automatic and manual retries retain one idempotency key and attempt histor
         server.requests[0].headers["idempotency-key"],
         server.requests[1].headers["idempotency-key"],
     );
+
+    const wrappedServer = await startMockServer(artifacts.fixture);
+    wrappedServer.expect({ operation: "stats", path: "/STATS" });
+    let wrappedCalls = 0;
+    const wrappedFetch = async (...arguments_) => {
+        wrappedCalls += 1;
+        if (wrappedCalls === 1) {
+            throw new TypeError("injected fetch network failure");
+        }
+        return globalThis.fetch(...arguments_);
+    };
+    const wrappedClient = new esm.SymbolClient({
+        origin: wrappedServer.origin,
+        fetch: wrappedFetch,
+        retryPolicy: {
+            ...esm.RetryPolicies.Default,
+            maxAttempts: 2,
+            initialDelayMs: 0,
+            maximumDelayMs: 0,
+            jitter: "none",
+        },
+    });
+    assert.equal((await wrappedClient.stats()).sites, 1);
+    assert.equal(wrappedCalls, 2);
+    await wrappedServer.stop();
 });
 
 test("Retry-After accepts only integer seconds or RFC HTTP dates", async () => {
@@ -974,6 +1001,23 @@ test("typed HTTP errors preserve response details and malformed DTOs fail closed
     });
     await assert.rejects(Promise.resolve(malformedClient.stats()), esm.MalformedResponseError);
     assert.equal(malformedCalls, 1);
+
+    const malformedVersion = new esm.SymbolClient({
+        origin: "https://malformed-version.invalid",
+        fetch: async () => new Response("{}", {
+            status: 200,
+            headers: {
+                "Content-Type": "application/json",
+                "Symbol-API-Version": "1.invalid.0",
+                "Symbol-API-Revision": String(esm.API_REVISION),
+                "Symbol-API-Source-Hash": esm.SOURCE_HASH,
+            },
+        }),
+    });
+    await assert.rejects(
+        Promise.resolve(malformedVersion.stats()),
+        esm.MissingApiIdentityError,
+    );
 });
 
 test("version compatibility accepts newer peers and rejects impossible identities", async () => {
@@ -1032,6 +1076,45 @@ test("version compatibility accepts newer peers and rejects impossible identitie
     assert.equal((await client.stats()).sites, 1);
     assert.throws(() => client.assertExactApi());
     await newer.stop();
+
+    const sessionServer = await startMockServer(current);
+    sessionServer.expect(
+        { operation: "stats", path: "/STATS" },
+        { operation: "stats", path: "/STATS" },
+        { operation: "stats", path: "/STATS" },
+    );
+    const [sessionMajor, sessionMinor, sessionPatch] = current.api_version.split(".").map(Number);
+    const upgradedVersion = `${sessionMajor}.${sessionMinor}.${sessionPatch + 1}`;
+    let sessionCalls = 0;
+    const sessionFetch = async (...arguments_) => {
+        sessionCalls += 1;
+        const response = await globalThis.fetch(...arguments_);
+        if (sessionCalls !== 2) {
+            return response;
+        }
+        const headers = new Headers(response.headers);
+        headers.set("Symbol-API-Version", upgradedVersion);
+        headers.set("Symbol-API-Revision", String(current.absolute_revision + 1));
+        headers.set("Symbol-API-Source-Hash", "5".repeat(64));
+        return new Response(response.body, {
+            status: response.status,
+            statusText: response.statusText,
+            headers,
+        });
+    };
+    const sessionClient = new esm.SymbolClient({
+        origin: sessionServer.origin,
+        fetch: sessionFetch,
+    });
+    await sessionClient.stats();
+    await sessionClient.stats();
+    assert.deepEqual(sessionClient.apiIdentity.apiVersion, [
+        sessionMajor,
+        sessionMinor,
+        sessionPatch + 1,
+    ]);
+    await assert.rejects(Promise.resolve(sessionClient.stats()), esm.ApiIntegrityError);
+    await sessionServer.stop();
 });
 
 test("UMD client executes independently without replacing Symbol", async () => {

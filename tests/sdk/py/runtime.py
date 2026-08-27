@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import io
 import json
 import os
 import pathlib
@@ -99,24 +100,59 @@ class AsyncBackend:
         self.closed += 1
 
 
+class FlakyBackend(Backend):
+    def __init__(self, failures: int) -> None:
+        super().__init__()
+        self.failures = failures
+
+    def request(self, request: api.ApiRequest) -> api.ApiResponse:
+        if self.failures:
+            self.failures -= 1
+            raise OSError("network unavailable")
+        return super().request(request)
+
+
+class FlakyAsyncBackend(AsyncBackend):
+    def __init__(self, response: api.ApiResponse, failures: int) -> None:
+        super().__init__(response)
+        self.failures = failures
+
+    async def request(self, request: api.ApiRequest) -> api.ApiResponse:
+        if self.failures:
+            self.failures -= 1
+            raise OSError("network unavailable")
+        return await super().request(request)
+
+
 def mutation_headers(path: str = "x.txt") -> tuple[tuple[str, str], ...]:
     return (
         ("Location", f"http://symbol/demo/{path}"),
-        ("ETag", '"tree"'),
+        ("ETag", '"blake3:' + "c" * 64 + '"'),
         ("Content-Revision", "2"),
-        ("Undo-Token", "undo"),
+        ("Undo-Token", "a" * 32),
         ("Undo-Expires", "2026-08-27T00:00:00Z"),
     )
 
 
 def test_metadata_and_media_types() -> None:
+    assert api.METADATA.artifact is api.ApiArtifact.PYTHON
     assert api.API_VERSION.count(".") == 2
+    assert str(api.API_VERSION_PARTS) == api.API_VERSION
+    assert api.ApiVersion.parse(api.API_VERSION) == api.API_VERSION_PARTS
+    assert isinstance(api.SOURCE_HASH, api.Blake3)
     assert api.API_REVISION > 0
     assert len(api.SOURCE_HASH) == 64
     assert str(api.MediaTypes.JSON) == "application/json"
     assert str(api.MediaType.text("plain")) == "text/plain; charset=utf-8"
     assert api.ContentFormats.HTML.extensions == ("html", "htm")
     assert api.MediaType.parse('text/plain; charset="utf-8"') == api.MediaTypes.TEXT
+    for invalid in ("1.02.3", "1.2", "1.2.x"):
+        try:
+            api.ApiVersion.parse(invalid)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"accepted invalid semantic version {invalid!r}")
 
 
 def test_sync_client_mapping() -> None:
@@ -165,7 +201,7 @@ def test_sync_client_mapping() -> None:
     assert symbol.site("demo").file("space name.txt").text() == "hello"
     assert backend.requests[-1].url.endswith("/demo/space%20name.txt")
 
-    backend.queue(200, b"ok", mutation_headers())
+    backend.queue(200, b"ok (changed: true)", mutation_headers())
     receipt = symbol.site("demo").file("x.txt").put("value", api.MediaTypes.TEXT)
     assert receipt.changed and receipt.undo is not None
     assert not any(
@@ -175,12 +211,13 @@ def test_sync_client_mapping() -> None:
     backend.queue(
         201,
         {
+            "changed": True,
             "path": "note/hash.anno",
             "target": "target",
             "target_kind": "file",
             "dangling": False,
         },
-        mutation_headers("note/hash.anno"),
+        (("Content-Type", "application/json"), *mutation_headers("note/hash.anno")),
     )
     symbol.site("demo").alias("note/hash.anno", "target")
     request = backend.requests[-1]
@@ -190,6 +227,25 @@ def test_sync_client_mapping() -> None:
     client.close()
     assert backend.closed == 0  # wrapped backends are borrowed
 
+    context_backend = Backend()
+    context_backend.queue(
+        200,
+        {
+            "sites": 0,
+            "files": 0,
+            "aliases": 0,
+            "blobs": 0,
+            "bytes": 0,
+            "logical_bytes": 0,
+            "saved_bytes": 0,
+            "saved_fraction": 0.0,
+        },
+        (("Content-Type", "application/json"),),
+    )
+    with api.Symbol(api.HttpClient.wrap(context_backend)) as context_symbol:
+        assert context_symbol.stats().sites == 0
+    assert context_backend.closed == 0
+
 
 def test_allocation_naming() -> None:
     backend = Backend()
@@ -197,12 +253,16 @@ def test_allocation_naming() -> None:
     backend.queue(
         201,
         {
+            "changed": True,
             "site": "demo",
             "path": "notes/pre-hash-final.anno",
-            "hash": "hash",
-            "blob_url": "/.blob/demo/hash",
+            "hash": "blake3:" + "b" * 64,
+            "blob_url": "/.blob/demo/" + "b" * 64,
         },
-        mutation_headers("notes/pre-hash-final.anno"),
+        (
+            ("Content-Type", "application/json"),
+            *mutation_headers("notes/pre-hash-final.anno"),
+        ),
     )
     options = api.CreateFileOptions(
         name=api.GeneratedName(prefix="pre-", suffix="-final", extension=".anno"),
@@ -215,6 +275,312 @@ def test_allocation_naming() -> None:
     assert headers["File-Extension"] == "anno"
 
 
+def test_sync_async_public_method_parity() -> None:
+    def methods(client_type: type[object]) -> set[str]:
+        return {
+            name
+            for name in dir(client_type)
+            if not name.startswith("_") and callable(getattr(client_type, name))
+        }
+
+    for sync_type, async_type in (
+        (api._SymbolSync, api._SymbolAsync),
+        (api.SiteClient, api.AsyncSiteClient),
+        (api.FolderClient, api.AsyncFolderClient),
+        (api.FileClient, api.AsyncFileClient),
+        (api.ManagementClient, api.AsyncManagementClient),
+    ):
+        assert methods(sync_type) == methods(async_type), (
+            sync_type.__name__,
+            methods(sync_type) ^ methods(async_type),
+        )
+
+
+def test_malformed_responses_and_typed_errors() -> None:
+    backend = Backend()
+    symbol = api.Symbol(api.HttpClient.wrap(backend), origin="http://symbol")
+
+    backend.queue(
+        200,
+        {
+            "sites": 0,
+            "files": "wrong",
+            "aliases": 0,
+            "blobs": 0,
+            "bytes": 0,
+            "logical_bytes": 0,
+            "saved_bytes": 0,
+            "saved_fraction": 0.0,
+        },
+        (("Content-Type", "application/json"),),
+    )
+    try:
+        symbol.stats()
+    except api.MalformedResponseError:
+        pass
+    else:
+        raise AssertionError("malformed stats response was accepted")
+
+    backend.queue(
+        412,
+        b"stale",
+        (("ETag", '"blake3:current"'), ("Content-Revision", "7")),
+    )
+    try:
+        symbol.site("demo").file("x").put(b"x")
+    except api.PreconditionFailedError as error:
+        assert error.etag == '"blake3:current"'
+        assert error.content_revision == 7
+    else:
+        raise AssertionError("precondition failure was not typed")
+
+    backend.queue(
+        401,
+        b"token required",
+        (("WWW-Authenticate", 'Bearer realm="symbol"'),),
+    )
+    try:
+        symbol.site("demo").file("x").put(b"x")
+    except api.UnauthorizedError as error:
+        assert error.challenge == 'Bearer realm="symbol"'
+    else:
+        raise AssertionError("unauthorized response was not typed")
+
+    backend.queue(
+        416,
+        b"range",
+        (("Content-Range", "bytes */10"),),
+    )
+    try:
+        symbol.site("demo").file("x").replace(b"x", base_hash="a" * 64)
+    except api.RangeNotSatisfiableError as error:
+        assert error.content_range == "bytes */10"
+    else:
+        raise AssertionError("range failure was not typed")
+
+    claim_backend = Backend()
+    claim_symbol = api.Symbol(
+        api.HttpClient.wrap(claim_backend),
+        origin="http://symbol",
+        creator_claim="sym_claim_" + "1" * 64,
+    )
+    claim_backend.queue(
+        200,
+        {"managed": True},
+        (
+            ("Content-Type", "application/json"),
+            ("Management-Token", "sym_mgmt_" + "2" * 64),
+        ),
+    )
+    claim_symbol.site("demo").management().claim()
+    assert dict(claim_backend.requests[-1].headers)["Creator-Claim"] == (
+        "sym_claim_" + "1" * 64
+    )
+
+    expiry_backend = Backend()
+    expiry_symbol = api.Symbol(api.HttpClient.wrap(expiry_backend))
+    expiry_backend.queue(
+        200,
+        {
+            "target": {"site": "demo", "path": "x", "kind": "file"},
+            "size": 10,
+            "refreshed_at": None,
+            "own_policy": {
+                "mode": "decay",
+                "min_age_seconds": 60,
+                "max_age_seconds": 3600,
+                "max_size_bytes": 100,
+                "power": 2.0,
+                "retention_seconds": 600,
+                "expires_at": "2026-08-27T12:00:00Z",
+            },
+            "inherited_caps": [],
+            "effective_expires_at": "2026-08-27T12:00:00Z",
+            "remaining_seconds": 600,
+            "limited_by": {"kind": "site", "path": None},
+        },
+        (("Content-Type", "application/json"),),
+    )
+    report = expiry_symbol.site("demo").expiry("x")
+    assert isinstance(report, api.ExpiryReport)
+    assert isinstance(report.own_policy, api.DecayExpiryPolicy)
+    assert isinstance(report.limited_by, api.ExpiryLimit)
+
+
+def test_retry_policy_applies_to_sync_and_async_transports() -> None:
+    response = api.ApiResponse(
+        200,
+        IDENTITY + (("Content-Type", "application/json"),),
+        b'{"sites":0,"files":0,"aliases":0,"blobs":0,"bytes":0,"logical_bytes":0,"saved_bytes":0,"saved_fraction":0}',
+    )
+    sync_backend = FlakyBackend(1)
+    sync_backend.responses.append(response)
+    policy = api.RetryPolicy(
+        max_attempts=2,
+        initial_delay=0,
+        maximum_delay=0,
+        retry_network_errors=True,
+    )
+    assert (
+        api.Symbol(api.HttpClient.wrap(sync_backend), retry_policy=policy).stats().sites
+        == 0
+    )
+
+    manual_backend = Backend()
+    manual_backend.queue(503, b"retry")
+    manual_backend.responses.append(response)
+    manual_symbol = api.Symbol(api.HttpClient.wrap(manual_backend))
+    try:
+        manual_symbol.stats()
+    except api.ServerError as error:
+        assert len(error.attempts) == 1
+        retried = error.retry(api.RetryPolicy(max_attempts=1))
+        assert len(retried.attempts) == 2
+        assert retried.status == 200
+    else:
+        raise AssertionError("manual retry fixture did not fail")
+
+    non_replayable_backend = Backend()
+    non_replayable_backend.queue(503, b"retry")
+    non_replayable_symbol = api.Symbol(
+        api.HttpClient.wrap(non_replayable_backend),
+        retry_policy=api.RetryPolicies.DEFAULT,
+    )
+    try:
+        non_replayable_symbol.site("demo").file("x").put(io.BytesIO(b"once"))
+    except api.ServerError as error:
+        assert not error.replayable
+        try:
+            error.retry()
+        except api.BodyNotReplayableError:
+            pass
+        else:
+            raise AssertionError("non-replayable request allowed manual retry")
+    else:
+        raise AssertionError("non-replayable retry fixture did not fail")
+
+    async def check_async() -> None:
+        async_backend = FlakyAsyncBackend(response, 1)
+        symbol = api.Symbol(
+            api.AsyncHttpClient.wrap(async_backend),
+            retry_policy=policy,
+        )
+        assert (await symbol.stats()).sites == 0
+
+        manual_backend = AsyncBackend(api.ApiResponse(503, IDENTITY, b"retry"))
+        manual_symbol = api.Symbol(api.AsyncHttpClient.wrap(manual_backend))
+        try:
+            await manual_symbol.stats()
+        except api.ServerError as error:
+            manual_backend.response = response
+            retried = await error.aretry(api.RetryPolicy(max_attempts=1))
+            assert len(retried.attempts) == 2
+            assert retried.status == 200
+        else:
+            raise AssertionError("async manual retry fixture did not fail")
+
+    asyncio.run(check_async())
+
+
+def test_streaming_bodies_are_lazy_and_closeable() -> None:
+    reads = 0
+    closes = 0
+
+    class StreamingBackend:
+        def request(self, request: api.ApiRequest) -> api.ApiResponse:
+            nonlocal reads, closes
+            assert isinstance(request.body, pathlib.Path)
+            source = io.BytesIO(b"abcdef")
+
+            def read(size: int) -> bytes:
+                nonlocal reads
+                reads += 1
+                return source.read(size)
+
+            def iterate(chunk_size: int):
+                while chunk := read(chunk_size):
+                    yield chunk
+
+            def close() -> None:
+                nonlocal closes
+                closes += 1
+                source.close()
+
+            return api.ApiResponse(
+                200,
+                IDENTITY + (("Content-Type", "application/octet-stream"),),
+                stream=api.SyncResponseStream(read, iterate, close),
+            )
+
+        def close(self) -> None:
+            pass
+
+    response = api.Symbol(api.HttpClient.wrap(StreamingBackend())).request(
+        api.ApiRequest(api.HttpMethod.PUT, "/stream", body=pathlib.Path("/unused"))
+    )
+    assert reads == 0
+    assert b"".join(response.iter_bytes(2)) == b"abcdef"
+    assert reads == 4
+    assert closes == 1
+    response.close()
+    assert closes == 1
+
+    async def check_async() -> None:
+        async_reads = 0
+        async_closes = 0
+
+        class StreamingAsyncBackend:
+            async def request(self, request: api.ApiRequest) -> api.ApiResponse:
+                assert isinstance(request.body, pathlib.Path)
+                source = io.BytesIO(b"ghijkl")
+
+                async def read() -> bytes:
+                    nonlocal async_reads
+                    async_reads += 1
+                    return source.read()
+
+                async def iterate(chunk_size: int):
+                    nonlocal async_reads
+                    while chunk := source.read(chunk_size):
+                        async_reads += 1
+                        yield chunk
+
+                async def close() -> None:
+                    nonlocal async_closes
+                    async_closes += 1
+                    source.close()
+
+                return api.ApiResponse(
+                    200,
+                    IDENTITY + (("Content-Type", "application/octet-stream"),),
+                    async_stream=api.AsyncResponseStream(read, iterate, close),
+                )
+
+            async def close(self) -> None:
+                pass
+
+        symbol = api.Symbol(
+            api.AsyncHttpClient.wrap(StreamingAsyncBackend()),
+            origin="http://symbol",
+        )
+        response = await symbol.request(
+            api.ApiRequest(
+                api.HttpMethod.GET,
+                "/stream",
+                body=pathlib.Path("/unused"),
+            )
+        )
+        assert async_reads == 0
+        observed = bytearray()
+        async for chunk in response.aiter_bytes(2):
+            observed.extend(chunk)
+        assert observed == b"ghijkl"
+        assert async_reads == 3
+        assert async_closes == 1
+
+    asyncio.run(check_async())
+
+
 async def test_async_factory() -> None:
     response = api.ApiResponse(
         200,
@@ -224,14 +590,14 @@ async def test_async_factory() -> None:
     backend = AsyncBackend(response)
     client = api.AsyncHttpClient.wrap(backend)
     symbol = api.Symbol(client, origin="http://symbol")
-    assert (await symbol.stats()).sites == 0
-    backend.response = api.ApiResponse(
-        200,
-        IDENTITY + (("Content-Type", "text/plain"),),
-        b"async",
-    )
-    assert await symbol.site("demo").file("x.txt").text() == "async"
-    await client.close()
+    async with symbol:
+        assert (await symbol.stats()).sites == 0
+        backend.response = api.ApiResponse(
+            200,
+            IDENTITY + (("Content-Type", "text/plain"),),
+            b"async",
+        )
+        assert await symbol.site("demo").file("x.txt").text() == "async"
     assert backend.closed == 0
 
 
@@ -239,8 +605,12 @@ def main() -> None:
     test_metadata_and_media_types()
     test_sync_client_mapping()
     test_allocation_naming()
+    test_sync_async_public_method_parity()
+    test_malformed_responses_and_typed_errors()
+    test_retry_policy_applies_to_sync_and_async_transports()
+    test_streaming_bodies_are_lazy_and_closeable()
     asyncio.run(test_async_factory())
-    print("SDK Python runtime: 4 tests")
+    print("SDK Python runtime: 8 tests")
 
 
 if __name__ == "__main__":

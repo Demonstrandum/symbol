@@ -137,6 +137,7 @@ impl SchemaCatalog {
                ON schema.name = tables.name AND schema.type = 'table'
              WHERE tables.schema = 'main'
                AND tables.name NOT LIKE 'sqlite_%'
+               AND tables.name != '__diesel_schema_migrations'
              ORDER BY tables.name",
         )
         .load::<TableRow>(db)?;
@@ -263,12 +264,28 @@ fn load_columns(db: &mut SqliteConnection, table: &str) -> QueryResult<Vec<Colum
                 name: normalize_identifier(&row.name),
                 declared_type: normalize_type(&row.declared_type),
                 not_null: row.not_null != 0,
-                default_value: row.default_value.as_deref().map(normalize_sql_fragment),
+                default_value: normalized_column_default(
+                    table,
+                    &row.name,
+                    row.default_value.as_deref(),
+                ),
                 primary_key_position: row.primary_key_position,
                 hidden: row.hidden,
             })
             .collect()
     })
+}
+
+fn normalized_column_default(table: &str, column: &str, value: Option<&str>) -> Option<String> {
+    let normalized = value.map(normalize_sql_fragment);
+    if table.eq_ignore_ascii_case("blobs")
+        && column.eq_ignore_ascii_case("bytes")
+        && normalized.as_deref().is_none_or(|value| value == "x''")
+    {
+        None
+    } else {
+        normalized
+    }
 }
 
 fn load_foreign_keys(

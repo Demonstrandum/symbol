@@ -98,7 +98,7 @@ try {
     assert.equal(restoredInventory.site, "sdk-real");
 
     assert.deepEqual(symbol.assertExactApi(), {
-        apiVersion: sdk.API_VERSION,
+        apiVersion: sdk.API_VERSION_PARTS,
         absoluteRevision: sdk.API_REVISION,
         sourceHash: sdk.SOURCE_HASH,
     });

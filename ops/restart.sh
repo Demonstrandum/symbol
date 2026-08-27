@@ -183,53 +183,94 @@ do
 done
 
 data_root=${SYMBOL_DATA_ROOT:-/var/lib/symbol}
-backup_root=${SYMBOL_BACKUP_ROOT:-${data_root}/backups}
+backup_root=${SYMBOL_BACKUP_ROOT:-/var/backups/symbol}
 running_exe=${SYMBOL_RUNNING_EXE:-/proc/${main_pid}/exe}
 deploy_binary=${SYMBOL_DEPLOY_BINARY:-target/release/symbol}
+installed_unit=${SYMBOL_INSTALLED_UNIT:-/etc/systemd/system/symbol.service}
 backup_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 backup_dir=${backup_root}/${backup_id}
 sudo mkdir -m 0700 -p "${backup_dir}"
-sudo cp --reflink=auto --preserve=mode,timestamps \
+sudo cp --archive --reflink=auto \
   "${running_exe}" "${backup_dir}/symbol"
-for database_file in \
-  "${data_root}/symbol.db" \
-  "${data_root}/symbol.db-wal" \
-  "${data_root}/symbol.db-shm"
-do
-  [ ! -e "${database_file}" ] ||
-    sudo cp --reflink=auto --preserve=mode,timestamps \
-      "${database_file}" "${backup_dir}/"
-done
+if [ -e "${data_root}/symbol.db" ]; then
+  sudo python3 - "${data_root}/symbol.db" "${backup_dir}/symbol.db" <<'PY'
+import os
+import sqlite3
+import sys
+
+source_path, destination_path = sys.argv[1:]
+metadata = os.stat(source_path)
+source = sqlite3.connect(f"file:{source_path}?mode=ro", uri=True)
+destination = sqlite3.connect(destination_path)
+with destination:
+    source.backup(destination)
+integrity = destination.execute("PRAGMA integrity_check").fetchone()
+if integrity != ("ok",):
+    raise SystemExit(f"backup integrity check failed: {integrity!r}")
+destination.close()
+source.close()
+os.chown(destination_path, metadata.st_uid, metadata.st_gid)
+os.chmod(destination_path, metadata.st_mode & 0o7777)
+os.utime(destination_path, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+PY
+fi
 if [ -d "${data_root}/blobs" ]; then
+  sudo cp --archive --reflink=auto "${data_root}/blobs" "${backup_dir}/blobs"
   find "${data_root}/blobs" -type f -printf '%P\t%s\n' |
     LC_ALL=C sort >"${backup_inventory}"
 fi
 sudo cp "${backup_inventory}" "${backup_dir}/blob-files.tsv"
+if sudo test -e "${installed_unit}"; then
+  sudo cp --archive "${installed_unit}" "${backup_dir}/symbol.service"
+fi
 printf 'symbol backup: %s\n' "${backup_dir}"
 
-sudo install -m 0644 ops/symbol.service /etc/systemd/system/symbol.service
+rollback() {
+  printf 'new Symbol failed readiness; restoring backup\n' >&2
+  sudo systemctl stop symbol >/dev/null 2>&1 || :
+  sudo cp --archive "${backup_dir}/symbol" "${deploy_binary}"
+  sudo rm -f \
+    "${data_root}/symbol.db" \
+    "${data_root}/symbol.db-wal" \
+    "${data_root}/symbol.db-shm"
+  if sudo test -e "${backup_dir}/symbol.db"; then
+    sudo cp --archive "${backup_dir}/symbol.db" "${data_root}/symbol.db"
+  fi
+  if sudo test -d "${backup_dir}/blobs"; then
+    sudo rm -rf "${data_root}/blobs"
+    sudo cp --archive "${backup_dir}/blobs" "${data_root}/blobs"
+  fi
+  if sudo test -e "${backup_dir}/symbol.service"; then
+    sudo cp --archive "${backup_dir}/symbol.service" "${installed_unit}"
+    sudo systemctl daemon-reload
+  fi
+  sudo systemctl start symbol
+  paused=0
+  exit 1
+}
+
+sudo install -m 0644 ops/symbol.service "${installed_unit}"
 sudo systemctl daemon-reload
 if sudo systemctl restart symbol &&
   sudo systemctl is-active --quiet symbol; then
   paused=0
 else
-  printf 'new Symbol failed to start; restoring backup\n' >&2
-  sudo systemctl stop symbol >/dev/null 2>&1 || :
-  sudo cp "${backup_dir}/symbol" "${deploy_binary}"
-  sudo rm -f \
-    "${data_root}/symbol.db" \
-    "${data_root}/symbol.db-wal" \
-    "${data_root}/symbol.db-shm"
-  for database_file in \
-    "${backup_dir}/symbol.db" \
-    "${backup_dir}/symbol.db-wal" \
-    "${backup_dir}/symbol.db-shm"
-  do
-    [ ! -e "${database_file}" ] ||
-      sudo cp "${database_file}" "${data_root}/"
-  done
-  sudo systemctl start symbol
-  paused=0
-  exit 1
+  rollback
 fi
+attempts=${SYMBOL_STARTUP_ATTEMPTS:-180}
+attempt=1
+while ! stats=$(curl -fsS http://127.0.0.1:4340/STATS 2>/dev/null)
+do
+  if [ "${attempt}" -ge "${attempts}" ]; then
+    printf 'symbol did not become ready after %s seconds\n' "${attempts}" >&2
+    rollback
+  fi
+  attempt=$((attempt + 1))
+  sleep 1
+done
+printf '%s' "${stats}" |
+  python3 -c 'import json,sys; assert isinstance(json.load(sys.stdin), dict)' ||
+  rollback
+curl -fsS -o /dev/null http://127.0.0.1:4340/ || rollback
+curl -fsS -o /dev/null http://127.0.0.1:4340/API/ || rollback
 echo "symbol rebuilt and restarted"
