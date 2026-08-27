@@ -216,14 +216,14 @@ impl GeneratedArtifacts {
             path: out_dir.to_path_buf(),
             source,
         })?;
-        write_if_changed(&out_dir.join("api.ts"), self.api_ts.as_bytes())?;
-        write_if_changed(&out_dir.join("api.js"), self.api_js.as_bytes())?;
+        write_if_changed(&out_dir.join("symbol.ts"), self.api_ts.as_bytes())?;
+        write_if_changed(&out_dir.join("symbol.js"), self.api_js.as_bytes())?;
         write_if_changed(
-            &out_dir.join("api.global.js"),
+            &out_dir.join("symbol.global.js"),
             self.api_global_js.as_bytes(),
         )?;
-        write_if_changed(&out_dir.join("api.d.ts"), self.api_d_ts.as_bytes())?;
-        write_if_changed(&out_dir.join("api.py"), self.api_py.as_bytes())?;
+        write_if_changed(&out_dir.join("symbol.d.ts"), self.api_d_ts.as_bytes())?;
+        write_if_changed(&out_dir.join("symbol.py"), self.api_py.as_bytes())?;
         write_if_changed(
             &out_dir.join("symbol-contract.json"),
             self.contract_fixture_json.as_bytes(),
@@ -490,36 +490,42 @@ pub fn generate_artifacts(
         source,
     })?;
 
-    emit_typescript(&ts_template, "api.ts")?;
+    emit_typescript(&ts_template, "symbol.ts")?;
 
-    let typescript_source = render_typescript_template(&ts_template, "api.ts", metadata, &ts_path)?;
-    let module_source = render_typescript_template(&ts_template, "api.js", metadata, &ts_path)?;
+    let typescript_source =
+        render_typescript_template(&ts_template, "symbol.ts", metadata, &ts_path)?;
+    let module_source = render_typescript_template(&ts_template, "symbol.js", metadata, &ts_path)?;
     let global_source =
-        render_typescript_template(&ts_template, "api.global.js", metadata, &ts_path)?;
+        render_typescript_template(&ts_template, "symbol.global.js", metadata, &ts_path)?;
     let declarations_source =
-        render_typescript_template(&ts_template, "api.d.ts", metadata, &ts_path)?;
-    let python_source = render_python_template(&py_template, "api.py", metadata, &py_path)?;
+        render_typescript_template(&ts_template, "symbol.d.ts", metadata, &ts_path)?;
+    let python_source = render_python_template(&py_template, "symbol.py", metadata, &py_path)?;
 
     let typescript_artifact = with_header(
         "//",
-        "api.ts",
+        "symbol.ts",
         metadata,
-        &emit_typescript(&typescript_source, "api.ts")?,
+        &emit_typescript(&typescript_source, "symbol.ts")?,
     );
     let module_artifact = with_header(
         "//",
-        "api.js",
+        "symbol.js",
         metadata,
-        &emit_javascript_module(&module_source, "api.js")?,
+        &emit_javascript_module(&module_source, "symbol.js")?,
     );
-    let global_artifact = with_header("//", "api.global.js", metadata, &emit_umd(&global_source)?);
+    let global_artifact = with_header(
+        "//",
+        "symbol.global.js",
+        metadata,
+        &emit_umd(&global_source)?,
+    );
     let declarations_artifact = with_header(
         "//",
-        "api.d.ts",
+        "symbol.d.ts",
         metadata,
-        &emit_declarations(&declarations_source, "api.d.ts")?,
+        &emit_declarations(&declarations_source, "symbol.d.ts")?,
     );
-    let python_artifact = with_header("#", "api.py", metadata, &python_source);
+    let python_artifact = with_header("#", "symbol.py", metadata, &python_source);
 
     Ok(GeneratedArtifacts {
         api_ts: typescript_artifact,

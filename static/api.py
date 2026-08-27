@@ -88,11 +88,11 @@ class GitCommit(str):
 
 
 class ApiArtifact(StrEnum):
-    TYPESCRIPT = "api.ts"
-    JAVASCRIPT = "api.js"
-    GLOBAL_JAVASCRIPT = "api.global.js"
-    DECLARATIONS = "api.d.ts"
-    PYTHON = "api.py"
+    TYPESCRIPT = "symbol.ts"
+    JAVASCRIPT = "symbol.js"
+    GLOBAL_JAVASCRIPT = "symbol.global.js"
+    DECLARATIONS = "symbol.d.ts"
+    PYTHON = "symbol.py"
 
 
 class TreeHash(str):
@@ -307,11 +307,11 @@ class HttpMethod(StrEnum):
 
 
 class ApiClientAsset(StrEnum):
-    TYPESCRIPT = "api.ts"
-    JAVASCRIPT = "api.js"
-    GLOBAL_JAVASCRIPT = "api.global.js"
-    DECLARATIONS = "api.d.ts"
-    PYTHON = "api.py"
+    TYPESCRIPT = "symbol.ts"
+    JAVASCRIPT = "symbol.js"
+    GLOBAL_JAVASCRIPT = "symbol.global.js"
+    DECLARATIONS = "symbol.d.ts"
+    PYTHON = "symbol.py"
 
 
 class ApiManual(StrEnum):

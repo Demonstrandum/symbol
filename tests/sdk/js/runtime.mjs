@@ -90,8 +90,8 @@ test("all 40 installed endpoint mappings execute exact decoders", async () => {
         { operation: "installer hash", path: "/install.sh/HASH" },
         { operation: "client", path: "/symbol.sh" },
         { operation: "client hash", path: "/symbol.sh/HASH" },
-        { operation: "api client asset", path: "/api.ts" },
-        { operation: "api client hash", path: "/api.ts/HASH" },
+        { operation: "api client asset", path: "/symbol.ts" },
+        { operation: "api client hash", path: "/symbol.ts/HASH" },
         { operation: "api documentation", path: "/API/TS" },
         {
             operation: "api version",
@@ -204,8 +204,8 @@ test("all 40 installed endpoint mappings execute exact decoders", async () => {
     assert.equal((await client.installerHash()).length, 64);
     assert.equal((await client.shellClient()).status, 200);
     assert.equal((await client.shellClientHash()).length, 64);
-    assert.equal((await client.apiClient("api.ts")).status, 200);
-    assert.equal((await client.apiClientHash("api.ts")).length, 64);
+    assert.equal((await client.apiClient("symbol.ts")).status, 200);
+    assert.equal((await client.apiClientHash("symbol.ts")).length, 64);
     assert.equal((await client.apiManual("typescript")).status, 200);
     assert.deepEqual((await client.apiVersion()).identity.apiVersion, esm.API_VERSION_PARTS);
     assert.equal((await client.sites()).entries[0].kind, "builtin");

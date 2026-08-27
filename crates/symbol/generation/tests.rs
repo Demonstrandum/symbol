@@ -50,11 +50,11 @@ fn generated_metadata_and_artifact_headers_are_identical() {
     let metadata = test_metadata(&root);
     let artifacts = generate_artifacts(&root, &metadata).unwrap();
     let sources = [
-        ("//", "api.ts", &artifacts.api_ts),
-        ("//", "api.js", &artifacts.api_js),
-        ("//", "api.global.js", &artifacts.api_global_js),
-        ("//", "api.d.ts", &artifacts.api_d_ts),
-        ("#", "api.py", &artifacts.api_py),
+        ("//", "symbol.ts", &artifacts.api_ts),
+        ("//", "symbol.js", &artifacts.api_js),
+        ("//", "symbol.global.js", &artifacts.api_global_js),
+        ("//", "symbol.d.ts", &artifacts.api_d_ts),
+        ("#", "symbol.py", &artifacts.api_py),
     ];
     let expected_identity = header_identity(&artifacts.api_ts);
     for (comment, artifact, source) in sources {
@@ -71,14 +71,22 @@ fn generated_metadata_and_artifact_headers_are_identical() {
         assert_eq!(header_identity(source), expected_identity, "{artifact}");
     }
 
-    assert!(artifacts.api_ts.contains("\\\"artifact\\\":\\\"api.ts\\\""));
-    assert!(artifacts.api_js.contains("\\\"artifact\\\":\\\"api.js\\\""));
+    assert!(
+        artifacts
+            .api_ts
+            .contains("\\\"artifact\\\":\\\"symbol.ts\\\"")
+    );
+    assert!(
+        artifacts
+            .api_js
+            .contains("\\\"artifact\\\":\\\"symbol.js\\\"")
+    );
     assert!(
         artifacts
             .api_global_js
-            .contains("\\\"artifact\\\":\\\"api.global.js\\\"")
+            .contains("\\\"artifact\\\":\\\"symbol.global.js\\\"")
     );
-    assert!(artifacts.api_py.contains("\"artifact\":\"api.py\""));
+    assert!(artifacts.api_py.contains("\"artifact\":\"symbol.py\""));
 }
 
 #[test]
@@ -479,7 +487,7 @@ fn typecheck_declarations_if_available(declarations: &str) {
     };
     assert!(version.status.success());
     let directory = tempfile::tempdir().unwrap();
-    let declaration_path = directory.path().join("api.d.ts");
+    let declaration_path = directory.path().join("symbol.d.ts");
     fs::write(&declaration_path, declarations).unwrap();
     let output = Command::new("tsc")
         .args(["--noEmit", "--strict", "--skipLibCheck", "false"])

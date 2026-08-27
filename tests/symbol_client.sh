@@ -841,5 +841,22 @@ sync_status=0
   ! contains "$(cat "${LOG}")" 'METHOD=PUT' &&
   ok 'sync drift aborts without writing' || not_ok 'sync drift aborts without writing'
 
+help_ok=1
+for command in $(
+  SYMBOL_TEST_COMMAND_REGISTRY=1 "${CLIENT}" |
+    awk '{ print $1 }'
+)
+do
+  output=$(SYMBOL_HOST=http://mock "${CLIENT}" "${command}" --help) ||
+    help_ok=0
+  contains "${output}" "symbol ${command}" || help_ok=0
+  alternate=$(SYMBOL_HOST=http://mock "${CLIENT}" help "${command}") ||
+    help_ok=0
+  [ "${alternate}" = "${output}" ] || help_ok=0
+done
+[ "${help_ok}" -eq 1 ] &&
+  ok 'every command provides direct and help-subcommand usage' ||
+  not_ok 'every command provides direct and help-subcommand usage'
+
 printf '1..%d\n' "${tests}"
 [ "${failures}" -eq 0 ]

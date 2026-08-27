@@ -36,16 +36,16 @@ pub const INSTALL: &str = "/install.sh";
 pub const INSTALL_HASH: &str = "/install.sh/HASH";
 pub const CLIENT: &str = "/symbol.sh";
 pub const CLIENT_HASH: &str = "/symbol.sh/HASH";
-pub const API_TS: &str = "/api.ts";
-pub const API_TS_HASH: &str = "/api.ts/HASH";
-pub const API_JS: &str = "/api.js";
-pub const API_JS_HASH: &str = "/api.js/HASH";
-pub const API_GLOBAL_JS: &str = "/api.global.js";
-pub const API_GLOBAL_JS_HASH: &str = "/api.global.js/HASH";
-pub const API_D_TS: &str = "/api.d.ts";
-pub const API_D_TS_HASH: &str = "/api.d.ts/HASH";
-pub const API_PY: &str = "/api.py";
-pub const API_PY_HASH: &str = "/api.py/HASH";
+pub const API_TS: &str = "/symbol.ts";
+pub const API_TS_HASH: &str = "/symbol.ts/HASH";
+pub const API_JS: &str = "/symbol.js";
+pub const API_JS_HASH: &str = "/symbol.js/HASH";
+pub const API_GLOBAL_JS: &str = "/symbol.global.js";
+pub const API_GLOBAL_JS_HASH: &str = "/symbol.global.js/HASH";
+pub const API_D_TS: &str = "/symbol.d.ts";
+pub const API_D_TS_HASH: &str = "/symbol.d.ts/HASH";
+pub const API_PY: &str = "/symbol.py";
+pub const API_PY_HASH: &str = "/symbol.py/HASH";
 pub const API: &str = "/API";
 pub const API_INDEX: &str = "/API/";
 pub const API_JS_MANUAL: &str = "/API/JS";
@@ -205,7 +205,7 @@ pub static ENDPOINTS: &[EndpointContract] = &[
         "api client asset",
         "GET",
         true,
-        "/{api.ts|api.js|api.global.js|api.d.ts|api.py}",
+        "/{symbol.ts|symbol.js|symbol.global.js|symbol.d.ts|symbol.py|api.ts|api.js|api.global.js|api.d.ts|api.py}",
         &[200, 304],
         &[304],
         &["If-None-Match"],
@@ -215,7 +215,7 @@ pub static ENDPOINTS: &[EndpointContract] = &[
         "api client hash",
         "GET",
         true,
-        "/{api.ts|api.js|api.global.js|api.d.ts|api.py}/HASH",
+        "/{symbol.ts|symbol.js|symbol.global.js|symbol.d.ts|symbol.py|api.ts|api.js|api.global.js|api.d.ts|api.py}/HASH",
         &[200],
         &[404],
         &[],

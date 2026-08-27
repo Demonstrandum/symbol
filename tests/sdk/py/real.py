@@ -18,10 +18,10 @@ ROOT = pathlib.Path(__file__).resolve().parents[3]
 def load_api():
     generated_dir = os.environ.get("SYMBOL_GENERATED_DIR")
     if generated_dir:
-        candidates = [pathlib.Path(generated_dir) / "api.py"]
+        candidates = [pathlib.Path(generated_dir) / "symbol.py"]
     else:
         candidates = sorted(
-            ROOT.glob("target/debug/build/symbol-*/out/api.py"),
+            ROOT.glob("target/debug/build/symbol-*/out/symbol.py"),
             key=lambda path: path.stat().st_mtime_ns,
         )
     path = candidates[-1]

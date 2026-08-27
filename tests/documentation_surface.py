@@ -14,7 +14,14 @@ HOMEPAGE = (ROOT / "static/docs.md").read_text()
 SYMBOL = pathlib.Path(os.environ.get("SYMBOL_BIN", ROOT / "target/debug/symbol"))
 
 SECTIONS = ("INDEX", "JS", "PYTHON", "SHELL", "PROTOCOL")
-SDK_ASSETS = ("api.ts", "api.js", "api.global.js", "api.d.ts", "api.py", "symbol.sh")
+SDK_ASSETS = (
+    "symbol.ts",
+    "symbol.js",
+    "symbol.global.js",
+    "symbol.d.ts",
+    "symbol.py",
+    "symbol.sh",
+)
 
 
 def generated_file(name: str) -> pathlib.Path:
@@ -30,7 +37,7 @@ def generated_file(name: str) -> pathlib.Path:
 
 
 def typescript_methods() -> tuple[str, ...]:
-    declarations = generated_file("api.d.ts").read_text()
+    declarations = generated_file("symbol.d.ts").read_text()
     methods: set[str] = set()
     for matched in re.finditer(r"export declare class \w+[^{]*\{", declarations):
         start = matched.end()
@@ -103,6 +110,48 @@ index, javascript, python, shell, protocol = sections
 js_methods = typescript_methods()
 py_methods = python_methods()
 shell_commands, shell_aliases = shell_surface()
+
+for manual, minimum_lines, headings in (
+    (
+        javascript,
+        300,
+        (
+            "## Installation and module formats",
+            "## SymbolClient reference",
+            "## SiteClient reference",
+            "## FolderClient reference",
+            "## FileClient reference",
+            "## Receipts and errors",
+            "## Complete workflow",
+        ),
+    ),
+    (
+        python,
+        300,
+        (
+            "## Installation and imports",
+            "## Synchronous client reference",
+            "## Asynchronous client reference",
+            "## Transport backends",
+            "## Models and errors",
+            "## Complete workflow",
+        ),
+    ),
+    (
+        shell,
+        250,
+        (
+            "## Installation and configuration",
+            "## Command reference",
+            "## Checkout and sync workflow",
+            "## Management and recovery",
+            "## Complete workflow",
+        ),
+    ),
+):
+    assert len(manual.splitlines()) >= minimum_lines, "API manual is only a summary"
+    for heading in headings:
+        assert heading in manual, f"API manual omitted {heading}"
 
 missing_js = tuple(method for method in js_methods if f"`{method}`" not in javascript)
 missing_python = tuple(method for method in py_methods if f"`{method}`" not in python)

@@ -7,7 +7,7 @@ export type IdempotencyKey = string;
 export type UndoToken = string;
 export type ManagementToken = string;
 export type CreatorClaim = string;
-export type ApiArtifact = "api.ts" | "api.js" | "api.global.js" | "api.d.ts";
+export type ApiArtifact = "symbol.ts" | "symbol.js" | "symbol.global.js" | "symbol.d.ts";
 
 export interface SymbolApiMetadata {
   readonly artifact: ApiArtifact;
@@ -1641,7 +1641,12 @@ interface RequestPlan<T> {
   readonly dispose: (() => Promise<void>) | null;
 }
 
-export type ApiClientAsset = "api.ts" | "api.js" | "api.global.js" | "api.d.ts" | "api.py";
+export type ApiClientAsset =
+  | "symbol.ts"
+  | "symbol.js"
+  | "symbol.global.js"
+  | "symbol.d.ts"
+  | "symbol.py";
 export type ApiManual = "index" | "javascript" | "typescript" | "python" | "shell" | "protocol";
 
 export class SymbolClient {
@@ -3398,10 +3403,10 @@ function observeApiIdentity(
 
 function apiArtifact(value: string): ApiArtifact {
   switch (value) {
-    case "api.ts":
-    case "api.js":
-    case "api.global.js":
-    case "api.d.ts":
+    case "symbol.ts":
+    case "symbol.js":
+    case "symbol.global.js":
+    case "symbol.d.ts":
       return value;
     default:
       throw new TypeError(`invalid generated API artifact: ${value}`);

@@ -136,6 +136,41 @@ env: SYMBOL_HOST (default ${HOST}); SYMBOL_TOKEN
 EOF
 }
 
+command_help() {
+  case "$1" in
+    put) cat <<'EOF'
+symbol put: publish or merge files into a site
+usage: symbol put [-u|--unpack] [--managed] [NAME [FILE [DEST]]]
+       command | symbol put [NAME] -
+EOF
+      ;;
+    clone) printf '%s\n' 'symbol clone: create a local checkout' 'usage: symbol clone NAME [DIR]' ;;
+    get) printf '%s\n' 'symbol get: download a site without deleting it' 'usage: symbol get NAME [ARCHIVE|-]' ;;
+    pop) printf '%s\n' 'symbol pop: download and remove a site' 'usage: symbol pop NAME [ARCHIVE|-]' ;;
+    copy) printf '%s\n' 'symbol copy: duplicate a site on the server' 'usage: symbol copy [--managed] SRC [DST]' ;;
+    remix) printf '%s\n' 'symbol remix: duplicate a site and clone the copy locally' 'usage: symbol remix [--managed] SRC [DST]' ;;
+    move) printf '%s\n' 'symbol move: rename a site without transferring files' 'usage: symbol move SRC DST' ;;
+    alias) printf '%s\n' 'symbol alias: create live path aliases atomically' 'usage: symbol alias SITE PATH TARGET [PATH TARGET ...]' ;;
+    stats) printf '%s\n' 'symbol stats: show storage, deduplication, cache, and reader totals' 'usage: symbol stats' ;;
+    sync) printf '%s\n' 'symbol sync: publish only when the remote baseline has not changed' 'usage: symbol sync [--check]' ;;
+    undo) printf '%s\n' 'symbol undo: reverse a retained mutation or inspect the undo stack' 'usage: symbol undo [--stack] [NAME [TOKEN]]' ;;
+    expire) expire_help ;;
+    manage) cat <<'EOF'
+symbol manage: enable or inspect write protection
+usage: symbol manage NAME --status|--claim|--rotate|--release
+       symbol put --managed NAME SOURCE
+EOF
+      ;;
+    recover) printf '%s\n' 'symbol recover: resume interrupted idempotent creations and copies' 'usage: symbol recover' ;;
+    ls) printf '%s\n' 'symbol ls: list sites or one site tree' 'usage: symbol ls [-l] [NAME]' ;;
+    rm) printf '%s\n' 'symbol rm: delete a path or site without saving an archive' 'usage: symbol rm NAME [PATH]' ;;
+    url) printf '%s\n' 'symbol url: print the public URL for a site' 'usage: symbol url NAME' ;;
+    update) printf '%s\n' 'symbol update: reinstall the client from the configured server' 'usage: symbol update' ;;
+    help) printf '%s\n' 'symbol help: show general or command-specific help' 'usage: symbol help [COMMAND]' ;;
+    *) usage_error "unknown command for help: $1" ;;
+  esac
+}
+
 need() {
   if [ "$#" -lt "$1" ]; then
     usage >&2
@@ -770,10 +805,6 @@ if [ "${SYMBOL_TEST_RESOLVE_ONLY:-0}" = 1 ]; then
   printf '%s\n' "${cmd}"
   exit 0
 fi
-select_token
-start_update_check "${cmd}"
-trap join_update_check EXIT
-
 archive_suffix() {
   case "$1" in
     -|'') printf '%s\n' .tar.gz ;;
@@ -2879,6 +2910,21 @@ if [ "${cmd}" != recover ]; then
     break
   done
 fi
+
+if [ "${cmd}" = help ] && [ "$#" -gt 0 ]; then
+  help_command=$(resolve_command "$1") || exit $?
+  command_help "${help_command}"
+  exit 0
+fi
+case "${1:-}" in
+  -h|--help)
+    command_help "${cmd}"
+    exit 0
+    ;;
+esac
+select_token
+start_update_check "${cmd}"
+trap join_update_check EXIT
 
 case "${cmd}" in
   put)

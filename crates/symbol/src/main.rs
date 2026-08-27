@@ -65,11 +65,11 @@ const DEFAULT_MAX_FILE_SIZE: u64 = 4 * 1024 * 1024 * 1024;
 const STREAM_THRESHOLD: u64 = 1024 * 1024;
 const INSTALL_SH: &str = static_asset!("install.sh");
 const SYMBOL_SH: &str = static_asset!("symbol.sh");
-const API_TS: &str = generated_asset!("api.ts");
-const API_JS: &str = generated_asset!("api.js");
-const API_GLOBAL_JS: &str = generated_asset!("api.global.js");
-const API_D_TS: &str = generated_asset!("api.d.ts");
-const API_PY: &str = generated_asset!("api.py");
+const API_TS: &str = generated_asset!("symbol.ts");
+const API_JS: &str = generated_asset!("symbol.js");
+const API_GLOBAL_JS: &str = generated_asset!("symbol.global.js");
+const API_D_TS: &str = generated_asset!("symbol.d.ts");
+const API_PY: &str = generated_asset!("symbol.py");
 const API_DOC_INDEX_MD: &str = generated_asset!("api-doc-index.md");
 const API_DOC_INDEX_HTML: &str = generated_asset!("api-doc-index.html");
 const API_DOC_JS_MD: &str = generated_asset!("api-doc-js.md");
@@ -573,14 +573,24 @@ fn api_router() -> Router<App> {
     Router::new()
         .route(contract::API_TS, get(api_ts))
         .route(contract::API_TS_HASH, get(api_ts_hash))
+        .route("/api.ts", get(api_ts))
+        .route("/api.ts/HASH", get(api_ts_hash))
         .route(contract::API_JS, get(api_js))
         .route(contract::API_JS_HASH, get(api_js_hash))
+        .route("/api.js", get(api_js))
+        .route("/api.js/HASH", get(api_js_hash))
         .route(contract::API_GLOBAL_JS, get(api_global_js))
         .route(contract::API_GLOBAL_JS_HASH, get(api_global_js_hash))
+        .route("/api.global.js", get(api_global_js))
+        .route("/api.global.js/HASH", get(api_global_js_hash))
         .route(contract::API_D_TS, get(api_d_ts))
         .route(contract::API_D_TS_HASH, get(api_d_ts_hash))
+        .route("/api.d.ts", get(api_d_ts))
+        .route("/api.d.ts/HASH", get(api_d_ts_hash))
         .route(contract::API_PY, get(api_py))
         .route(contract::API_PY_HASH, get(api_py_hash))
+        .route("/api.py", get(api_py))
+        .route("/api.py/HASH", get(api_py_hash))
         .route(contract::API, api_manual_methods(get(api_redirect)))
         .route(contract::API_INDEX, api_manual_methods(get(api_index)))
         .route(
@@ -1009,35 +1019,35 @@ generated_asset_handlers!(
     api_ts_hash,
     API_TS,
     "text/typescript; charset=utf-8",
-    "api.ts"
+    "symbol.ts"
 );
 generated_asset_handlers!(
     api_js,
     api_js_hash,
     API_JS,
     "text/javascript; charset=utf-8",
-    "api.js"
+    "symbol.js"
 );
 generated_asset_handlers!(
     api_global_js,
     api_global_js_hash,
     API_GLOBAL_JS,
     "text/javascript; charset=utf-8",
-    "api.global.js"
+    "symbol.global.js"
 );
 generated_asset_handlers!(
     api_d_ts,
     api_d_ts_hash,
     API_D_TS,
     "text/typescript; charset=utf-8",
-    "api.d.ts"
+    "symbol.d.ts"
 );
 generated_asset_handlers!(
     api_py,
     api_py_hash,
     API_PY,
     "text/x-python; charset=utf-8",
-    "api.py"
+    "symbol.py"
 );
 
 async fn install_sh(State(app): State<App>, headers: HeaderMap) -> Response {
@@ -3179,8 +3189,8 @@ mod tests {
                 "client" => "/symbol.sh",
                 "client hash" => "/symbol.sh/HASH",
                 "api documentation" => "/API/JS",
-                "api client asset" => "/api.js",
-                "api client hash" => "/api.js/HASH",
+                "api client asset" => "/symbol.js",
+                "api client hash" => "/symbol.js/HASH",
                 "api version" => "/API/VERSION",
                 "site listing" => "/FILES",
                 "site redirect" | "site put" | "site pop" | "site copy" | "site move"
@@ -4933,11 +4943,11 @@ mod tests {
         let app = router(test_app(Store::new(root.path().to_path_buf()).unwrap()));
 
         for (path, content_type) in [
-            ("/api.ts", "text/typescript; charset=utf-8"),
-            ("/api.js", "text/javascript; charset=utf-8"),
-            ("/api.global.js", "text/javascript; charset=utf-8"),
-            ("/api.d.ts", "text/typescript; charset=utf-8"),
-            ("/api.py", "text/x-python; charset=utf-8"),
+            ("/symbol.ts", "text/typescript; charset=utf-8"),
+            ("/symbol.js", "text/javascript; charset=utf-8"),
+            ("/symbol.global.js", "text/javascript; charset=utf-8"),
+            ("/symbol.d.ts", "text/typescript; charset=utf-8"),
+            ("/symbol.py", "text/x-python; charset=utf-8"),
         ] {
             let response = app
                 .clone()
@@ -4962,6 +4972,38 @@ mod tests {
             assert_eq!(
                 to_bytes(hash.into_body(), usize::MAX).await.unwrap().len(),
                 65
+            );
+        }
+
+        for (canonical, legacy) in [
+            ("/symbol.ts", "/api.ts"),
+            ("/symbol.js", "/api.js"),
+            ("/symbol.global.js", "/api.global.js"),
+            ("/symbol.d.ts", "/api.d.ts"),
+            ("/symbol.py", "/api.py"),
+        ] {
+            let canonical = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(canonical)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let legacy = app
+                .clone()
+                .oneshot(Request::builder().uri(legacy).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                canonical.headers()[header::ETAG],
+                legacy.headers()[header::ETAG]
+            );
+            assert_eq!(
+                to_bytes(canonical.into_body(), usize::MAX).await.unwrap(),
+                to_bytes(legacy.into_body(), usize::MAX).await.unwrap()
             );
         }
 

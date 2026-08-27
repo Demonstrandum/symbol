@@ -20,9 +20,9 @@ if (chromium === undefined) {
 <meta charset="utf-8">
 <pre id="result">pending</pre>
 <script>window.__symbolBuiltin = window.Symbol;</script>
-<script src="/api.global.js"></script>
+<script src="/symbol.global.js"></script>
 <script type="module">
-import * as API from "/api.js";
+import * as API from "/symbol.js";
 const result = document.querySelector("#result");
 try {
   if (window.Symbol !== window.__symbolBuiltin) throw new Error("built-in Symbol overwritten");
@@ -67,10 +67,10 @@ try {
         "Symbol-API-Source-Hash": artifacts.fixture.source_hash,
     };
     const server = createServer((request, response) => {
-        if (request.url === "/api.js") {
+        if (request.url === "/symbol.js") {
             response.writeHead(200, { "Content-Type": "text/javascript; charset=utf-8" });
             response.end(api);
-        } else if (request.url === "/api.global.js") {
+        } else if (request.url === "/symbol.global.js") {
             response.writeHead(200, { "Content-Type": "text/javascript; charset=utf-8" });
             response.end(globalApi);
         } else if (request.url === "/") {

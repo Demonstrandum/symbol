@@ -17,22 +17,22 @@ ROOT = pathlib.Path(__file__).resolve().parents[3]
 def generated_api() -> pathlib.Path:
     generated_dir = os.environ.get("SYMBOL_GENERATED_DIR")
     if generated_dir:
-        path = pathlib.Path(generated_dir) / "api.py"
+        path = pathlib.Path(generated_dir) / "symbol.py"
         if path.is_file():
             return path
     candidates = sorted(
-        ROOT.glob("target/debug/build/symbol-*/out/api.py"),
+        ROOT.glob("target/debug/build/symbol-*/out/symbol.py"),
         key=lambda path: path.stat().st_mtime_ns,
     )
     if not candidates:
-        raise AssertionError("generated api.py is missing; build symbol first")
+        raise AssertionError("generated symbol.py is missing; build symbol first")
     return candidates[-1]
 
 
 def load_api():
     spec = importlib.util.spec_from_file_location("symbol_api", generated_api())
     if spec is None or spec.loader is None:
-        raise AssertionError("cannot load generated api.py")
+        raise AssertionError("cannot load generated symbol.py")
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -207,7 +207,7 @@ def test_sync_client_mapping() -> None:
 
     backend.queue(200, b"export {}", (("Content-Type", "text/typescript"),))
     assert symbol.api_client(api.ApiClientAsset.TYPESCRIPT).status == 200
-    assert backend.requests[-1].url == "http://symbol/api.ts"
+    assert backend.requests[-1].url == "http://symbol/symbol.ts"
 
     backend.queue(200, ("a" * 64 + "\n").encode())
     assert symbol.api_client_hash(api.ApiClientAsset.TYPESCRIPT) == "a" * 64

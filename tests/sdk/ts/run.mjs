@@ -37,18 +37,18 @@ try {
         ...compilerOptions,
         artifacts.apiTs,
     ], root);
-    console.log("ok 1 - generated api.ts compiles strictly");
+    console.log("ok 1 - generated symbol.ts compiles strictly");
 
     await run(compiler, [
         "--noEmit",
         ...compilerOptions,
         artifacts.apiDeclarations,
     ], root);
-    console.log("ok 2 - generated api.d.ts compiles strictly");
+    console.log("ok 2 - generated symbol.d.ts compiles strictly");
 
     const typeDirectory = join(temporary, "types");
     await mkdir(typeDirectory);
-    await copyFile(artifacts.apiDeclarations, join(typeDirectory, "api.d.ts"));
+    await copyFile(artifacts.apiDeclarations, join(typeDirectory, "symbol.d.ts"));
     await copyFile(join(here, "types.ts"), join(typeDirectory, "types.ts"));
     await writeFile(join(typeDirectory, "package.json"), "{\"type\":\"module\"}\n");
     await run(compiler, [
@@ -61,7 +61,7 @@ try {
     const workflowDirectory = join(temporary, "workflow");
     const outputDirectory = join(workflowDirectory, "dist");
     await mkdir(workflowDirectory);
-    await copyFile(artifacts.apiDeclarations, join(workflowDirectory, "api.d.ts"));
+    await copyFile(artifacts.apiDeclarations, join(workflowDirectory, "symbol.d.ts"));
     await copyFile(join(here, "workflow.ts"), join(workflowDirectory, "workflow.ts"));
     await writeFile(join(workflowDirectory, "package.json"), "{\"type\":\"module\"}\n");
     await run(compiler, [
@@ -69,7 +69,7 @@ try {
         "--outDir", outputDirectory,
         join(workflowDirectory, "workflow.ts"),
     ], workflowDirectory);
-    await copyFile(artifacts.apiJs, join(outputDirectory, "api.js"));
+    await copyFile(artifacts.apiJs, join(outputDirectory, "symbol.js"));
     await writeFile(join(outputDirectory, "package.json"), "{\"type\":\"module\"}\n");
     const workflow = join(outputDirectory, "workflow.js");
     const bootstrap = join(outputDirectory, "bootstrap.mjs");

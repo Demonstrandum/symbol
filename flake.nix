@@ -185,16 +185,16 @@
             ];
             installPhase = ''
               runHook preInstall
-              generated_api=$(find target -type f -path '*/build/symbol-*/out/api.ts' -print -quit)
+              generated_api=$(find target -type f -path '*/build/symbol-*/out/symbol.ts' -print -quit)
               test -n "$generated_api"
               generated_dir=$(dirname "$generated_api")
               mkdir -p "$out"
               cp \
-                "$generated_dir/api.ts" \
-                "$generated_dir/api.js" \
-                "$generated_dir/api.global.js" \
-                "$generated_dir/api.d.ts" \
-                "$generated_dir/api.py" \
+                "$generated_dir/symbol.ts" \
+                "$generated_dir/symbol.js" \
+                "$generated_dir/symbol.global.js" \
+                "$generated_dir/symbol.d.ts" \
+                "$generated_dir/symbol.py" \
                 "$generated_dir/schema.sql" \
                 "$generated_dir/symbol-contract.json" \
                 "$out/"
@@ -277,7 +277,7 @@
           ] ''
             export SYMBOL_BIN="${package}/bin/symbol"
             export SSL_CERT_FILE="${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
-            basedpyright --project tooling/pyproject.toml "${generatedSources}/api.py"
+            basedpyright --project tooling/pyproject.toml "${generatedSources}/symbol.py"
             ruff check --no-cache --config tooling/pyproject.toml static/api.py tests/sdk/py
             ruff format --check --no-cache --config tooling/pyproject.toml static/api.py tests/sdk/py
             python3 tests/sdk/py/runtime.py

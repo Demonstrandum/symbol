@@ -19,7 +19,7 @@ import {
   type SpliceReceipt,
   SymbolClient,
   type SymbolStats,
-} from "./api.js";
+} from "./symbol.js";
 
 type Equal<Left, Right> =
   (<Value>() => Value extends Left ? 1 : 2) extends <Value>() => Value extends Right ? 1 : 2
@@ -38,7 +38,7 @@ const inventory: Operation<CachedFileInventory> = site.files();
 const listing = site.files("assets");
 const stats: Operation<SymbolStats> = client.stats();
 const creation: Operation<SiteCreationReceipt> = client.create("hello");
-const apiAsset: Operation<CachedTextAsset> = client.apiClient("api.ts");
+const apiAsset: Operation<CachedTextAsset> = client.apiClient("symbol.ts");
 const apiManual: Operation<CachedTextAsset> = client.apiManual("typescript");
 const apiIdentity: Operation<CachedApiIdentity> = client.apiVersion();
 const allocation: Operation<AllocationReceipt> = site.folder("generated").json({ value: 1 });

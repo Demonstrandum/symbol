@@ -11,9 +11,9 @@ JavaScript, Python 3.14, POSIX shell, and raw HTTP.
 
 Downloadable clients:
 
-- [`/api.ts`](/api.ts), [`/api.js`](/api.js),
-  [`/api.global.js`](/api.global.js), and [`/api.d.ts`](/api.d.ts)
-- [`/api.py`](/api.py)
+- [`/symbol.ts`](/symbol.ts), [`/symbol.js`](/symbol.js),
+  [`/symbol.global.js`](/symbol.global.js), and [`/symbol.d.ts`](/symbol.d.ts)
+- [`/symbol.py`](/symbol.py)
 - [`/symbol.sh`](/symbol.sh)
 
 Every client preserves the server's existing authorization rule: unmanaged
@@ -24,6 +24,8 @@ retries do not weaken optimistic concurrency or idempotency.
 <!-- API:JS:START -->
 # JavaScript and TypeScript
 
+## Installation and module formats
+
 Use the ES module directly:
 
 ```js
@@ -31,7 +33,7 @@ import {
   MediaTypes,
   RetryPolicies,
   SymbolClient,
-} from "https://symbol.example/api.js";
+} from "https://symbol.example/symbol.js";
 
 await using symbol = new SymbolClient({
   origin: "https://symbol.example",
@@ -42,9 +44,9 @@ const site = symbol.site("notes");
 const text = await site.file("index.html").text();
 ```
 
-Browsers without modules may load `/api.global.js`; its identical exports are
+Browsers without modules may load `/symbol.global.js`; its identical exports are
 available synchronously from `globalThis.SymbolAPI`. TypeScript may import
-`/api.ts` directly or pair `/api.js` with `/api.d.ts`.
+`/symbol.ts` directly or pair `/symbol.js` with `/symbol.d.ts`.
 
 The hierarchy is `SymbolClient → SiteClient → FolderClient/FileClient`.
 Root methods cover stats, listing, unnamed creation, and the raw request escape
@@ -74,12 +76,186 @@ Typed value/resource APIs additionally expose `apiIdentity`, `origin`,
 `charset`, `parameter`, `withParameter`, `withCharset`, `withoutParameter`,
 `equals`, and `toString`.
 
-`apiClient` accepts only `api.ts`, `api.js`, `api.global.js`, `api.d.ts`, and
-`api.py`. `apiManual` accepts only `index`, `javascript`, `typescript`,
+`apiClient` accepts only `symbol.ts`, `symbol.js`, `symbol.global.js`,
+`symbol.d.ts`, and `symbol.py`. `apiManual` accepts only `index`, `javascript`, `typescript`,
 `python`, `shell`, and `protocol`.
 Metadata parses semantic versions into readonly `[major, minor, patch]`
 `ApiVersion` tuples and validates branded `Blake3` and `GitCommit` values;
 `API_VERSION` remains the canonical wire-format string.
+
+## SymbolClient reference
+
+### `new SymbolClient(options)`
+
+`origin` defaults to the current origin. `token` supplies a management token,
+`creatorClaim` supplies a recovery identity, `fetch` replaces the transport,
+and `retryPolicy` selects automatic retry behavior. Values remain in memory;
+the client never writes credentials.
+
+### `request(path, init)`
+
+Performs a raw request while preserving API identity checks, cancellation,
+attempt history, response ownership, and typed compatibility failures. Use it
+only when an operation has no higher-level method.
+
+```ts
+await using response = await symbol.request("/demo/custom", {
+  method: "GET",
+  headers: { Accept: "application/octet-stream" },
+});
+```
+
+### `stats()` and `sites()`
+
+`stats()` returns exact storage distributions and serving metrics. `sites()`
+returns a cache-aware discriminated directory listing; status `304` has no
+invented listing body.
+
+```ts
+const totals = await symbol.stats();
+console.log(totals.sites, totals.savedBytes, totals.serving.cache.hits);
+
+const listing = await symbol.sites();
+if (listing.status === 200) {
+  for (const entry of listing.entries) console.log(entry.kind, entry.name);
+}
+```
+
+### `create(body, options)`
+
+Creates a random site. The SDK generates one idempotency key per logical
+operation unless supplied. `managed: true` requests write protection at
+creation. `mediaType`, `filename`, and `unpack` describe the body.
+
+### `site(name)` and `blob(site, hash)`
+
+`site(name)` returns a hierarchy without making a request. `blob` reads a
+site-scoped immutable content-addressed resource and supports ranges and
+streaming.
+
+### Built-in resources
+
+`docs`, `installer`, `shellClient`, `apiClient`, and `apiManual` return
+cache-aware text assets. Their matching `*Hash` methods return raw Blake3
+digests. `apiVersion` returns the server version tuple, absolute revision, and
+source hash.
+
+### `apiIdentity` and `assertExactApi()`
+
+`apiIdentity` is null before the first response. Compatible monotonic
+minor/patch upgrades are accepted during a client session; major mismatch,
+rollback, and impossible equal-version/equal-revision hash changes fail.
+`assertExactApi()` additionally requires this generated client’s exact build.
+
+## SiteClient reference
+
+### `get()` and `redirect()`
+
+`get()` reads the site index as an owned streaming response. `redirect()`
+observes the canonical slash redirect without automatically following it.
+
+### `put(body, options)`
+
+Merges an archive, directory encoding, or file into the site. It does not
+delete omitted paths. `ifMatch` provides optimistic whole-site concurrency.
+
+### `files(path?)`
+
+With no path, returns the exact inventory: files, aliases, content revision,
+tree hash, and cache metadata. With a path, returns a browsable subtree.
+
+### `archive(format?)` and `pop(format?)`
+
+`archive` downloads `tar.gz`, `tar`, or `zip` without mutation. `pop`
+atomically removes the site and returns the archive plus undo metadata.
+Dispose unread bodies explicitly.
+
+```ts
+await using archive = await symbol.site("demo").archive("zip");
+const bytes = await archive.arrayBuffer();
+```
+
+### `copy(destination?, options)` and `move(destination)`
+
+Copy refuses an occupied destination and may request a generated destination.
+Move renames without transferring blob bytes. Generated copy operations retain
+one idempotency key.
+
+### `alias(path, target)` and `aliases(definitions)`
+
+The single method creates one live path alias. The batch method validates and
+commits every definition atomically. Targets are site-relative paths, not
+external URLs.
+
+### `undo(token?)` and `undoStack()`
+
+`undoStack` returns retained tokens with typed kind, description, creation,
+expiry, and remaining duration. `undo` defaults to the newest applicable
+entry, or accepts an explicit token.
+
+### `setExpiry(expiry, path?)` and `expiry(path?)`
+
+Expiry can be relative, absolute, decay-based, or never. Reports distinguish
+owned policy, inherited caps, effective deadline, and the limiting target.
+
+### `management()`
+
+Returns `ManagementClient`. `status` is read-like; `claim`, `rotate`, and
+`release` change write ownership. Reads always remain public.
+
+## FolderClient reference
+
+### Typed allocation helpers
+
+`bytes`, `text`, `json`, `html`, and `blob` infer media type and extension.
+`create` accepts an explicit body and `CreateFileOptions`.
+
+Name constraints contain optional `prefix`, `suffix`, and `extension`.
+Identical content and constraints naturally deduplicate to one hash-derived
+path.
+
+### Custom naming callback
+
+When `name` is a callback, Symbol proposes a hash, size, media type, inferred
+extension, and default name. The callback returns a basename. Callback failure
+cancels the proposal and makes that failed operation non-retryable.
+
+```ts
+const receipt = await site.folder("reports").create(pdf, {
+  mediaType: MediaTypes.Pdf,
+  name: async (proposal) => `report-${proposal.hash.slice(-12)}.pdf`,
+});
+```
+
+## FileClient reference
+
+### `get(options)`, `bytes()`, `text()`, and `json<T>()`
+
+`get` exposes the owned response and supports `range`, `ifRange`, and
+`ifNoneMatch`. Convenience decoders require a successful response and validate
+the expected representation.
+
+### `put(body, options)` and `putJson(value, options)`
+
+PUT adds or replaces this ordinary path. It intentionally does not advertise
+idempotent replay. `putJson` serializes once and uses JSON media type.
+
+### `replace(body, options)`
+
+REPLACE requires `baseHash`, atomically replaces the whole content, and may
+relocate a content-addressed allocated filename. The typed receipt
+distinguishes replaced, relocated, and unchanged outcomes.
+
+### `splice(change, options)` and `patch(changes, options)`
+
+Splices use offsets into the original file, so arbitrary insert/delete/replace
+diffs are possible. Small operations use headers; larger operations use the
+framed binary format automatically. All ranges validate before commit.
+
+### `remove()`, `hash()`, and expiry
+
+`remove` deletes this path and returns undo metadata. `hash` returns the raw
+content Blake3. `setExpiry` and `expiry` operate on this exact target.
 
 ## Allocated content-addressed files
 
@@ -133,15 +309,83 @@ none is supplied and retains it across retries. `SymbolApiError` preserves the
 status, headers, bytes, response, and idempotency key. Owned clients,
 responses, streams, proposals, and operations support `using` or
 `await using`; borrowed transports are never closed by the SDK.
+
+## Receipts and errors
+
+Mutation receipts expose status, location, entity tag, content revision,
+sanitization counts, replay state, raw response, and either an `UndoReceipt` or
+null. Specialized receipts add exact allocation, alias, replacement, splice,
+archive, management, and creation fields.
+
+`SymbolApiError` preserves operation name, status, body, idempotency key, and a
+cloned response. Typed subclasses cover validation, authorization, forbidden
+identity, missing resources, unsupported methods, conflicts, stale
+preconditions, payload limits, ranges, server failures, malformed responses,
+unexpected responses, unavailable operations, incompatible versions, and API
+integrity failures.
+
+```ts
+try {
+  await site.file("data.bin").replace(next, { baseHash: staleHash });
+} catch (error) {
+  if (error instanceof PreconditionFailedError) {
+    console.error(error.etag, error.contentRevision);
+  }
+}
+```
+
+An `Operation` records immutable attempts with start/end time, status, and
+error. Automatic retry requires a safe endpoint and replayable body. Manual
+retry is available only after failure. Successful, disposed, aborted, callback
+failed, and non-replayable operations reject retry.
+
+## Complete workflow
+
+```ts
+import {
+  MediaTypes,
+  RetryPolicies,
+  SymbolClient,
+} from "http://127.0.0.1:4341/symbol.js";
+
+await using symbol = new SymbolClient({
+  origin: "http://127.0.0.1:4341",
+  retryPolicy: RetryPolicies.Default,
+});
+
+const created = await symbol.create("<h1>demo</h1>", {
+  mediaType: MediaTypes.Html,
+});
+const site = symbol.site(new URL(created.location).pathname.split("/")[1]);
+
+await site.file("config.json").putJson({ enabled: true });
+await site.alias("latest", "config.json");
+
+const inventory = await site.files();
+if (inventory.status === 200) {
+  console.log(inventory.treeHash, inventory.aliases);
+}
+
+const baseHash = await site.file("config.json").hash();
+await site.file("config.json").replace('{"enabled":false}', {
+  baseHash,
+  mediaType: MediaTypes.Json,
+});
+
+const stack = await site.undoStack();
+if (stack.entries.length > 0) await site.undo(stack.entries[0].token);
+```
 <!-- API:JS:END -->
 
 <!-- API:PYTHON:START -->
 # Python 3.14
 
+## Installation and imports
+
 Download the dependency-free generated module and import it directly:
 
 ```sh
-curl -fsS "${SYMBOL_BASE}/api.py" -o symbol_api.py
+curl -fsS "${SYMBOL_BASE}/symbol.py" -o symbol_api.py
 ```
 
 The stdlib client is synchronous:
@@ -158,10 +402,96 @@ with Symbol(origin="https://symbol.example") as symbol:
     print(site.file("index.html").text())
 ```
 
+## Synchronous client reference
+
+### `Symbol(...)`
+
+Without a transport, `Symbol` owns a stdlib client. Pass `HttpClient` to select
+another backend. `origin`, `token`, `creator_claim`, and `retry_policy` apply
+to the hierarchy. Leaving a `with` block closes only owned transports.
+
+### Root operations
+
+`stats` returns exact `SymbolStats`, including `SizeDistribution`,
+`ServingStats`, `CacheStats`, and `ReaderStats`. `sites` returns
+`DirectoryListing`. `create` publishes an unnamed site. `site` constructs a
+site client. `api_client`, `api_client_hash`, `api_manual`, and `api_version`
+read built-in resources. `request` is the raw escape hatch.
+
+```python
+from symbol_api import ApiClientAsset, ApiManual, Symbol
+
+with Symbol(origin=origin) as symbol:
+    print(symbol.stats().serving.readers.query_micros)
+    print(symbol.api_client_hash(ApiClientAsset.PYTHON))
+    print(symbol.api_manual(ApiManual.PROTOCOL).text())
+```
+
+### Site operations
+
+`files` returns the exact file/alias inventory. `archive` downloads without
+mutation; `pop` downloads and removes. `copy` and `move` refuse occupied
+destinations. `alias` creates one live path alias and `aliases` commits a typed
+batch atomically. `undo` applies a retained operation; `undo_stack` lists
+available entries. `set_expiry` and `expiry` manage retention.
+`management()` returns claim/status/rotate/release operations.
+
+### Folder operations
+
+`bytes`, `text`, and `json` allocate hash-derived files with inferred formats.
+`create` accepts `CreateFileOptions`, including generated naming constraints or
+a custom proposal callback.
+
+```python
+from symbol_api import CreateFileOptions, GeneratedName, MediaTypes
+
+receipt = (
+    symbol.site("notes")
+    .folder("events")
+    .create(
+        b"opaque event",
+        CreateFileOptions(
+            media_type=MediaTypes.BINARY,
+            name=GeneratedName(prefix="event-", extension="bin"),
+        ),
+    )
+)
+print(receipt.path, receipt.hash, receipt.blob_url)
+```
+
+### File operations
+
+`get` returns a closeable streaming `ApiResponse`. `bytes`, `text`, and `json`
+consume and decode it. `put` writes ordinary content. `remove` returns
+`DeleteReceipt`. `hash` returns validated `Blake3`. `replace` requires the
+current content hash. `splice` applies one edit and `patch` applies multiple
+original-offset edits atomically.
+
+```python
+from symbol_api import ByteSplice
+
+file = symbol.site("notes").file("data.bin")
+base = file.hash()
+file.patch(
+    (
+        ByteSplice(offset=4, delete_bytes=2, insert=b"XY"),
+        ByteSplice(offset=10, delete_bytes=0, insert=b"tail"),
+    ),
+    base_hash=base,
+)
+```
+
 `HttpClient.stdlib()`, `.requests()`, `.urllib3()`, and `.httpx()` normalize
 the supported synchronous transports. `AsyncHttpClient.httpx()` and
 `.aiohttp()` select asynchronous operation; the overloaded `Symbol(...)`
 factory returns the matching sync or async hierarchy.
+
+## Asynchronous client reference
+
+Passing `AsyncHttpClient` selects `_SymbolAsync`; every root, site, folder,
+file, and management operation has the same public method name and typed
+result as its synchronous counterpart. Network access, response streaming,
+retry delays, and custom naming callbacks remain asynchronous.
 
 ```python
 import asyncio
@@ -187,7 +517,79 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-Optional backends import lazily; importing `/api.py` requires only Python
+Async request bodies accept bytes, text, or `AsyncIterable[bytes]`. They reject
+`Path` and synchronous readers instead of hiding blocking work in a thread.
+
+```python
+async def chunks():
+    for part in (b"first", b"second", b"third"):
+        yield part
+
+async with Symbol(AsyncHttpClient.httpx(), origin=origin) as symbol:
+    receipt = await symbol.site("notes").file("stream.bin").put(chunks())
+    response = await symbol.site("notes").file("stream.bin").get()
+    async for chunk in response.aiter_bytes(64 * 1024):
+        consume(chunk)
+```
+
+Use `await response.aread()`, `.atext()`, `.ajson()`, or iterate incrementally.
+`aabort`, `aclose`, and async context-manager exit release owned response
+resources exactly once.
+
+## Transport backends
+
+`HttpClient.stdlib()` has no dependency. `requests`, `urllib3`, and synchronous
+`httpx` constructors import those packages lazily. Async clients support
+`httpx` and `aiohttp`. `wrap` accepts a caller-owned implementation of the
+typed backend protocol.
+
+Owned constructors close their pool/session/client. Wrapping an existing
+backend or passing an existing third-party session leaves it open.
+
+Transport normalization catches only documented network and timeout errors.
+Programming, validation, and custom backend exceptions pass through unchanged.
+
+Uploads stream file readers synchronously or native asynchronous iterables;
+downloads expose streaming response resources. Structured protocol responses
+are buffered only when decoding requires their complete body.
+
+## Models and errors
+
+Metadata uses `ApiArtifact`, parsed `ApiVersion`, validated `Blake3`,
+`TreeHash`, `EntityTag`, `GitCommit`, `ManagementToken`, `CreatorClaim`, and
+`UndoToken` values rather than anonymous structured strings.
+
+Inventory, directory, statistics, undo, expiry, mutation, allocation, alias,
+delete, management, request-attempt, and API identity responses are frozen,
+slotted dataclasses. Discriminants use enums such as `DirectoryKind`,
+`AliasTargetKind`, `ExpiryKind`, `UndoKind`, `ManagementAction`,
+`ApiClientAsset`, and `ApiManual`.
+
+`MalformedResponseError` rejects missing, extra, mistyped, non-finite, or
+inconsistent structured fields. `UnauthorizedError.challenge`,
+`PreconditionFailedError.etag/content_revision`, and
+`RangeNotSatisfiableError.content_range` expose required protocol details.
+
+### Response resource lifecycle
+
+`ApiResponse` is a context manager. `read`/`aread` buffer the remainder once;
+`iter_bytes`/`aiter_bytes` stream incrementally; `close`/`aclose` release the
+connection without consuming it. `text`, `json`, `atext`, and `ajson` are
+convenience decoders.
+
+```python
+with symbol.site("media").file("movie.mp4").get() as response:
+    for chunk in response.iter_bytes(256 * 1024):
+        write_chunk(chunk)
+```
+
+Every failed replayable response retains `attempts`, `replayable`,
+`idempotency_key`, and `retry`/`aretry`. Terminal network failures preserve the
+same logical request. Successful, aborted, disposed, and non-replayable
+operations reject manual retry. `Retry-After` never exceeds
+`RetryPolicy.maximum_delay`.
+
+Optional backends import lazily; importing `/symbol.py` requires only Python
 3.14. Models are frozen, slotted dataclasses. Request methods use exact receipt
 and error classes; raw arbitrary JSON alone remains dynamically typed.
 Management tokens remain caller-owned in-memory values. Context-manager exit
@@ -225,10 +627,69 @@ Responses and typed HTTP errors retain an immutable `attempts` tuple and a
 Site resources also expose `url`, `undo_stack`, `set_expiry`, `expiry`, and
 `management`; management clients expose `action`, `status`, `claim`, `rotate`,
 and `release`; file clients expose `patch`.
+
+## Complete workflow
+
+```python
+from symbol_api import (
+    AliasDefinition,
+    CreateFileOptions,
+    GeneratedName,
+    MediaTypes,
+    PublishOptions,
+    RetryPolicies,
+    Symbol,
+)
+
+origin = "http://127.0.0.1:4341"
+
+with Symbol(origin=origin, retry_policy=RetryPolicies.DEFAULT) as symbol:
+    created = symbol.create(
+        "<h1>Python demo</h1>",
+        PublishOptions(media_type=MediaTypes.HTML),
+    )
+    site_name = created.location.rstrip("/").rsplit("/", 1)[-1]
+    site = symbol.site(site_name)
+
+    site.file("config.json").put(
+        '{"enabled":true}',
+        media_type=MediaTypes.JSON,
+    )
+    site.aliases(
+        (
+            AliasDefinition("latest", "config.json"),
+            AliasDefinition("current", "latest"),
+        )
+    )
+
+    allocated = site.folder("events").json(
+        {"kind": "created"},
+        CreateFileOptions(
+            name=GeneratedName(prefix="event-", extension="json"),
+        ),
+    )
+    print(allocated.path)
+
+    inventory = site.files()
+    print(inventory.tree_hash, inventory.aliases)
+
+    current_hash = site.file("config.json").hash()
+    site.file("config.json").replace(
+        '{"enabled":false}',
+        base_hash=current_hash,
+        media_type=MediaTypes.JSON,
+    )
+
+    stack = site.undo_stack()
+    if stack.entries:
+        site.undo(stack.entries[0].token)
+```
 <!-- API:PYTHON:END -->
 
 <!-- API:SHELL:START -->
 # POSIX shell client
+
+## Installation and configuration
 
 Download:
 
@@ -236,6 +697,161 @@ Download:
 curl -fsS "${SYMBOL_BASE}/symbol.sh" -o symbol
 chmod +x symbol
 ```
+
+`SYMBOL_HOST` selects the server and defaults to `http://symbol`.
+`SYMBOL_TOKEN` supplies a management token. `-t/--token` takes precedence and
+may appear before or after the command, before `--`.
+
+`-` means stdin in an upload/source position and stdout in a download
+destination position. The client keeps binary stdout clean so archives can be
+piped safely.
+
+Every proper command supports focused help:
+
+```sh
+symbol remix --help
+symbol help remix
+```
+
+## Command reference
+
+### `put`
+
+```sh
+symbol put [-u|--unpack] [--managed] [NAME [FILE [DEST]]]
+command | symbol put [NAME] -
+```
+
+Without `NAME`, Symbol creates a random site. A single HTML input becomes
+`index.html`. Directories are packed and unpacked automatically. `-u` unpacks
+tar, tar.gz, zip, or gzip. Publishing to an existing site merges only the
+supplied paths.
+
+### `clone`
+
+```sh
+symbol clone NAME [DIR]
+```
+
+Downloads and extracts a site, validates its manifest, then creates aliases as
+safe relative symlinks. If symlinks are unavailable, it materializes safe
+copies while preserving enough metadata to re-upload them as aliases.
+
+### `get` and `pop`
+
+```sh
+symbol get NAME [ARCHIVE|-]
+symbol pop NAME [ARCHIVE|-]
+```
+
+Both support tar.gz, tar, and zip. `get` leaves the site untouched. `pop`
+removes it only as part of the same successful server operation and prints its
+undo command.
+
+### `copy`, `move`, and `remix`
+
+```sh
+symbol copy [--managed] SRC [DST]
+symbol move SRC DST
+symbol remix [--managed] SRC [DST]
+```
+
+Copy duplicates server metadata and reuses blob content. Move renames without
+copying files. Remix performs a copy and then clones the result locally; if the
+clone fails, it reports the retained server copy and exact cleanup command.
+
+### `alias`
+
+```sh
+symbol alias SITE PATH TARGET [PATH TARGET ...]
+```
+
+One pair creates one live alias. Multiple pairs are sent as one atomic batch.
+Targets are site-relative and follow symlink semantics. Cycles, root escapes,
+reserved namespaces, and path shadowing are rejected.
+
+### `sync`
+
+```sh
+symbol sync
+symbol sync --check
+```
+
+Sync compares local changes with the checkout baseline and current upstream
+tree. It refuses divergent upstream changes instead of overwriting them.
+`--check` prints the proposed diff without publishing.
+
+### `undo`
+
+```sh
+symbol undo [NAME [TOKEN]]
+symbol undo --stack [NAME]
+```
+
+Without a token, reverses the newest applicable retained mutation. `--stack`
+shows token, action, creation time, expiry time, and remaining duration.
+
+### `expire`
+
+```sh
+symbol expire
+symbol expire NAME [PATH] --in DURATION
+symbol expire NAME [PATH] --at RFC3339
+symbol expire NAME [PATH] --decay [LIMITS]
+symbol expire NAME [PATH] --never
+symbol expire NAME [PATH] --show
+```
+
+Bare `expire` prints the retention graph and help. Relative and absolute modes
+set direct deadlines. Decay combines minimum age, maximum age, maximum size,
+and power. Child targets inherit limiting parent caps.
+
+### `manage`
+
+```sh
+symbol manage NAME --status
+symbol manage NAME --claim
+symbol manage NAME --rotate
+symbol manage NAME --release
+```
+
+Management is optional write protection. Reads remain public. Claim and rotate
+return a token once; release makes writes open again.
+
+### `ls`, `stats`, and `url`
+
+```sh
+symbol ls
+symbol ls -l NAME
+symbol stats
+symbol url NAME
+```
+
+`ls` lists sites or a linked file tree. `stats` shows logical/physical bytes,
+deduplication, distributions, cache, and reader metrics. `url` prints one
+canonical site URL for scripting.
+
+### `rm`
+
+```sh
+symbol rm NAME [PATH]
+```
+
+Deletes without downloading an archive. A path removes only that file or
+subtree; omitting it removes the site. The server still returns retained undo
+metadata.
+
+### `recover`, `update`, and `help`
+
+```sh
+symbol recover
+symbol update
+symbol help [COMMAND]
+```
+
+Recover replays interrupted generated PUT/COPY operations with their original
+idempotency identity. Update reinstalls the client and reports whether its
+hash changed. Help prints general or focused command usage.
 
 Core workflows:
 
@@ -282,6 +898,85 @@ Managed sites read tokens from `--token`, then `SYMBOL_TOKEN`, then the
 mode-0600 checkout manifest. Generated PUT/COPY operations retain pending
 idempotency records; `symbol recover` safely replays them after a dropped
 response.
+
+## Checkout and sync workflow
+
+```sh
+symbol clone notes
+cd notes
+
+# edit files
+printf '%s\n' '<h1>updated</h1>' > index.html
+
+symbol sync --check
+symbol sync
+```
+
+Clone writes the baseline used by sync and excludes local secret sidecars from
+uploads. Sync uploads additions and changes while preserving remote paths not
+present in the partial local archive. If upstream changed, clone it separately,
+resolve locally, then publish again.
+
+Bare `symbol put` inside a checkout publishes the nearest project. It is less
+strict than sync: put merges what you provide, while sync verifies the recorded
+upstream baseline first.
+
+## Management and recovery
+
+```sh
+symbol put --managed private-demo ./dist
+symbol manage private-demo --status
+symbol manage private-demo --rotate
+```
+
+The client selects a token from explicit `--token`, `SYMBOL_TOKEN`, then the
+checkout’s protected sidecar. Recognizable Symbol credentials are redacted
+from inspectable uploads.
+
+Generated destinations use persisted idempotency state. If the server commits
+but the connection drops before the client receives the generated name or
+one-time credential, run:
+
+```sh
+symbol recover
+```
+
+Recovery replays the same logical operation; it does not create another site.
+Records older than seven days are pruned.
+
+## Complete workflow
+
+```sh
+# Publish a folder to a chosen name.
+symbol put demo ./dist
+
+# Add one file without replacing the rest.
+symbol put demo ./robots.txt
+
+# Inspect and clone.
+symbol ls -l demo
+symbol clone demo demo-work
+
+# Safely publish local edits.
+cd demo-work
+symbol sync --check
+symbol sync
+
+# Create a server-side copy and work on it.
+cd ..
+symbol remix demo demo-next
+
+# Add a live alias and optional expiry.
+symbol alias demo-next latest index.html
+symbol expire demo-next assets/demo.mp4 --in 30d
+
+# Inspect or reverse retained changes.
+symbol undo --stack demo-next
+symbol undo demo-next
+
+# Download without deleting.
+symbol get demo-next demo-next.zip
+```
 <!-- API:SHELL:END -->
 
 <!-- API:PROTOCOL:START -->
@@ -316,8 +1011,9 @@ mutation below it returns `405` with `Allow: GET, HEAD`.
 <!-- contract:api client asset -->
 ### `GET /{sdk}`
 
-The exact paths `/api.ts`, `/api.js`, `/api.global.js`, `/api.d.ts`, and
-`/api.py` serve generated artifacts embedded in the binary. They use strong
+The exact paths `/symbol.ts`, `/symbol.js`, `/symbol.global.js`,
+`/symbol.d.ts`, and `/symbol.py` serve generated artifacts embedded in the
+binary. The former `/api.*` paths remain byte-identical compatibility aliases. They use strong
 ETags, `Cache-Control: no-cache`, and conditional `304` responses.
 
 <!-- contract:api client hash -->

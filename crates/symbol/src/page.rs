@@ -32,6 +32,7 @@ pub struct Section {
 #[derive(Debug)]
 pub enum Block {
     Prose(String),
+    List(Vec<String>),
     Example { caption: String, commands: String },
 }
 
@@ -144,6 +145,15 @@ fn render_plain_template(page: &Page, tty: bool) -> String {
                     out.push('\n');
                     push_wrapped(&mut out, &inline_plain(text, tty), INDENT);
                 }
+                Block::List(items) => {
+                    out.push('\n');
+                    for item in items {
+                        out.extend(std::iter::repeat_n(' ', INDENT));
+                        out.push_str("* ");
+                        out.push_str(&inline_plain(item, tty));
+                        out.push('\n');
+                    }
+                }
                 Block::Example { caption, commands } => {
                     if !caption.is_empty() {
                         out.push('\n');
@@ -196,6 +206,16 @@ fn render_html(page: &Page) -> String {
                     @match block {
                         Block::Prose(text) => {
                             p { (inline_html(text)) }
+                        }
+                        Block::List(items) => {
+                            .ascii-list {
+                                @for item in items {
+                                    p.list-item {
+                                        span.bullet { "* " }
+                                        (inline_html(item))
+                                    }
+                                }
+                            }
                         }
                         Block::Example { caption, commands } => {
                             .row {
@@ -741,6 +761,20 @@ fn parse(src: &str) -> Result<Page, String> {
             prev_blank = true;
             continue;
         }
+        if let Some(item) = line.strip_prefix("* ") {
+            flush_pending(&mut pending, &mut lead, &mut sections);
+            let section = sections
+                .last_mut()
+                .ok_or_else(|| "list before any section".to_string())?;
+            match section.blocks.last_mut() {
+                Some(Block::List(items)) => items.push(item.to_string()),
+                Some(Block::Prose(_) | Block::Example { .. }) | None => {
+                    section.blocks.push(Block::List(vec![item.to_string()]));
+                }
+            }
+            prev_blank = false;
+            continue;
+        }
         if prev_blank {
             flush_pending(&mut pending, &mut lead, &mut sections);
         }
@@ -791,11 +825,13 @@ mod tests {
         let page = parse(SOURCE).unwrap();
         assert!(page.title.contains("symbol"));
         assert!(!page.lead.is_empty());
-        assert!(
-            page.sections
+        assert!(page.sections.iter().any(|s| s.heading == "API manuals"));
+        assert!(page.sections.iter().any(|section| {
+            section
+                .blocks
                 .iter()
-                .any(|s| s.heading == "full API manuals")
-        );
+                .any(|block| matches!(block, Block::List(items) if items.len() == 4))
+        }));
         assert!(page.sections.iter().any(|s| {
             s.blocks.iter().any(|b| matches!(b, Block::Example { commands, .. } if commands.contains("symbol put hello")))
         }));
@@ -810,7 +846,7 @@ mod tests {
                 assert_eq!(caption, "hello there");
                 assert_eq!(commands, "cmd");
             }
-            other @ Block::Prose(_) => panic!("{other:?}"),
+            other => panic!("{other:?}"),
         }
     }
 
@@ -845,7 +881,7 @@ mod tests {
         let text = render_plain("http://symbol");
         assert!(text.starts_with("SYMBOL(1)"));
         assert!(text.contains("NAME\n"));
-        assert!(text.contains("symbol - tailnet hosting of static sites on http://symbol."));
+        assert!(text.contains("symbol - tiny static web hosting on http://symbol."));
         assert!(text.contains("DESCRIPTION\n"));
         assert!(text.contains("http://symbol/API/JS"));
         assert!(text.contains("http://symbol/API/CURL"));
@@ -883,6 +919,8 @@ mod tests {
             !STYLE.contains(".row pre { margin-left:"),
             "code blocks should align with the content column"
         );
+        assert!(STYLE.contains("padding-left: 2ch"));
+        assert!(STYLE.contains("margin-left: 2ch"));
     }
 
     #[test]

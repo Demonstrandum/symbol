@@ -23,10 +23,10 @@ sys.meta_path.insert(0, finder)
 try:
     generated_dir = os.environ.get("SYMBOL_GENERATED_DIR")
     generated = (
-        pathlib.Path(generated_dir) / "api.py"
+        pathlib.Path(generated_dir) / "symbol.py"
         if generated_dir
         else sorted(
-            ROOT.glob("target/debug/build/symbol-*/out/api.py"),
+            ROOT.glob("target/debug/build/symbol-*/out/symbol.py"),
             key=lambda path: path.stat().st_mtime_ns,
         )[-1]
     )

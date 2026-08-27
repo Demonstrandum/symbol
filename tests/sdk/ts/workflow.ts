@@ -1,4 +1,4 @@
-import { SymbolClient } from "./api.js";
+import { SymbolClient } from "./symbol.js";
 
 declare const process: {
   readonly argv: readonly string[];

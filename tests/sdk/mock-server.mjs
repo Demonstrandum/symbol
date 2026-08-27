@@ -347,10 +347,10 @@ export async function locateGeneratedArtifacts(root = process.cwd()) {
         return Object.freeze({
             directory: out,
             fixture,
-            apiTs: resolve(out, "api.ts"),
-            apiJs: resolve(out, "api.js"),
-            apiGlobalJs: resolve(out, "api.global.js"),
-            apiDeclarations: resolve(out, "api.d.ts"),
+            apiTs: resolve(out, "symbol.ts"),
+            apiJs: resolve(out, "symbol.js"),
+            apiGlobalJs: resolve(out, "symbol.global.js"),
+            apiDeclarations: resolve(out, "symbol.d.ts"),
         });
     }
     const buildRoot = resolve(root, "target", "debug", "build");
@@ -371,7 +371,7 @@ export async function locateGeneratedArtifacts(root = process.cwd()) {
                 candidates.push({
                     out,
                     fixture,
-                    modified: (await stat(resolve(out, "api.js"))).mtimeMs,
+                    modified: (await stat(resolve(out, "symbol.js"))).mtimeMs,
                 });
             }
         } catch {
@@ -384,10 +384,10 @@ export async function locateGeneratedArtifacts(root = process.cwd()) {
     return Object.freeze({
         directory: selected.out,
         fixture: selected.fixture,
-        apiTs: resolve(selected.out, "api.ts"),
-        apiJs: resolve(selected.out, "api.js"),
-        apiGlobalJs: resolve(selected.out, "api.global.js"),
-        apiDeclarations: resolve(selected.out, "api.d.ts"),
+        apiTs: resolve(selected.out, "symbol.ts"),
+        apiJs: resolve(selected.out, "symbol.js"),
+        apiGlobalJs: resolve(selected.out, "symbol.global.js"),
+        apiDeclarations: resolve(selected.out, "symbol.d.ts"),
     });
 }
 

@@ -5,7 +5,7 @@ header {
 p {
   max-width: 48rem;
   margin: 0 0 1rem;
-  padding-left: 7ch;
+  padding-left: 2ch;
   color: var(--ink);
 }
 
@@ -42,7 +42,14 @@ pre .url {
   text-underline-offset: .15em;
 }
 
-.row { margin-bottom: 1.1rem; }
+.row {
+  margin-left: 2ch;
+  margin-bottom: 1.1rem;
+}
+
+.ascii-list { margin-bottom: 1rem; }
+.list-item { margin-bottom: .2rem; }
+.bullet { color: var(--mark); }
 
 .cap {
   margin: 0 0 .35rem;
