@@ -56,6 +56,13 @@ symbol ls                    # list sites
 
 run `symbol COMMAND --help` for focused usage.
 
+```
+symbol put -u hello site.tar.gz # unpack an archive
+symbol get hello hello.zip      # download as zip
+symbol clone hello              # make a checkout
+symbol sync --check             # preview a safe sync
+symbol sync                     # publish if upstream is unchanged
+```
 
 ## API manuals
 
