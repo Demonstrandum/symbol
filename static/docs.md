@@ -6,7 +6,7 @@ there are no accounts and reads are ordinary HTTP.
 
 see [{host}/FILES]({host}/FILES) for everything currently hosted.
 
-## start with curl
+## with curl
 
 upload one page to a random short URL
 
@@ -54,18 +54,8 @@ symbol manage hello --status # show write protection
 symbol ls                    # list sites
 ```
 
-run `symbol COMMAND --help` for focused usage, for example
-`symbol remix --help`.
+run `symbol COMMAND --help` for focused usage.
 
-## useful things
-
-* uploading to an existing name merges files; it never silently wipes the site
-* folders, tar, tar.gz, zip, gzip, stdin, stdout, ranges, and resume all work
-* live aliases behave like safe symbolic links and survive archive round trips
-* copy, move, remix, strict sync, undo, and optional expiry are built in
-* content is deduplicated by Blake3 while every site keeps normal file paths
-* write protection is optional; unmanaged sites stay simple and open
-* JavaScript, TypeScript, Python, shell, and raw HTTP use the same exact API
 
 ## API manuals
 

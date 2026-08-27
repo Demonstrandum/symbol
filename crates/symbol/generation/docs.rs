@@ -115,10 +115,13 @@ fn render_html(title: &str, markdown: &str) -> String {
         "<!doctype html><html><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
          <title>{title}</title><style>\
-         :root{{color-scheme:light dark}}body{{font:16px/1.55 system-ui,sans-serif;\
-         max-width:76rem;margin:0 auto;padding:2rem}}pre{{overflow:auto;padding:1rem;\
-         background:#8882}}code{{font-family:ui-monospace,monospace}}\
-         a{{color:inherit}}table{{border-collapse:collapse}}td,th{{padding:.35rem .7rem;\
+         :root{{color-scheme:dark}}body{{font:16px/1.55 system-ui,sans-serif;\
+         max-width:76rem;margin:0 auto;padding:2rem;background:#1c1916;color:#d9d0c4}}\
+         h1,h2,h3{{color:#f1e8dc}}h2{{margin-top:2.4rem;border-bottom:1px solid #3d3833;\
+         padding-bottom:.3rem}}h3{{margin-top:1.6rem}}pre{{overflow:auto;padding:1rem;\
+         border-left:3px solid #e85d04;background:#11100e;color:#c4d39d}}\
+         code{{font-family:ui-monospace,monospace}}p code,li code{{color:#e6c07b}}\
+         a{{color:#c4d39d}}table{{border-collapse:collapse}}td,th{{padding:.35rem .7rem;\
          border:1px solid #8888}}</style></head><body><main>{rendered}</main></body></html>"
     )
     .expect("writing to a String cannot fail");
@@ -150,6 +153,11 @@ mod tests {
             compiled[0]
                 .html
                 .contains("<pre><code class=\"language-sh\">")
+        );
+        assert!(
+            compiled[0]
+                .html
+                .contains("background:#1c1916;color:#d9d0c4")
         );
     }
 
