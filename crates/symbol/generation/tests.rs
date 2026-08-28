@@ -90,6 +90,20 @@ fn generated_metadata_and_artifact_headers_are_identical() {
 }
 
 #[test]
+fn complete_generation_is_byte_identical_on_repeat() {
+    let root = workspace_root();
+    let metadata = test_metadata(&root);
+    let first = generate_artifacts(&root, &metadata).unwrap();
+    let second = generate_artifacts(&root, &metadata).unwrap();
+    assert_eq!(first, second);
+
+    let api_source = fs::read_to_string(root.join("API.md")).unwrap();
+    let first_manuals = super::docs::compile(&api_source).unwrap();
+    let second_manuals = super::docs::compile(&api_source).unwrap();
+    assert_eq!(first_manuals, second_manuals);
+}
+
+#[test]
 fn swc_outputs_have_runtime_export_parity_and_declarations_only() {
     let root = workspace_root();
     let artifacts = generate_artifacts(&root, &test_metadata(&root)).unwrap();

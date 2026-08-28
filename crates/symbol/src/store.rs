@@ -9973,6 +9973,8 @@ fn map_sql(err: diesel::result::Error) -> StoreError {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
 
     fn test_connection(path: &Path) -> SqliteConnection {
@@ -11369,6 +11371,126 @@ mod tests {
                 );
             }
         }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        #[test]
+        fn generated_alias_sequences_match_the_reference_model(
+            choices in prop::collection::vec((any::<u8>(), any::<bool>()), 1..96)
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::new(dir.path().to_path_buf()).unwrap();
+            store.put_file("alias-property", "seed.txt", b"seed").unwrap();
+            let mut reference = ReferenceAliases::default();
+            reference.files.insert("seed.txt".to_string());
+
+            for (index, (choice, retarget)) in choices.into_iter().enumerate() {
+                let path = format!("alias-{index:03}");
+                let target = match choice % 3 {
+                    0 => "seed.txt".to_string(),
+                    1 if index > 0 => format!("alias-{:03}", usize::from(choice) % index),
+                    _ => format!("missing-{:03}", choice % 17),
+                };
+                store
+                    .put_alias(
+                        "alias-property",
+                        &path,
+                        &target,
+                        FileMutationOptions::default(),
+                    )
+                    .unwrap();
+                reference.aliases.insert(path.clone(), target);
+
+                if retarget && index > 0 {
+                    let changed = format!("alias-{:03}", usize::from(choice) % index);
+                    store
+                        .put_alias(
+                            "alias-property",
+                            &changed,
+                            "seed.txt",
+                            FileMutationOptions::default(),
+                        )
+                        .unwrap();
+                    reference.aliases.insert(changed, "seed.txt".to_string());
+                }
+
+                for alias in reference.aliases.keys() {
+                    prop_assert_eq!(
+                        store.lookup("alias-property", alias).is_ok(),
+                        reference.resolves_file(alias),
+                        "generated step {}, alias {}",
+                        index,
+                        alias,
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn generated_control_characters_are_rejected_from_alias_paths(
+            prefix in "[a-z]{0,12}",
+            suffix in "[a-z]{0,12}",
+            control in 0_u8..=31,
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::new(dir.path().to_path_buf()).unwrap();
+            store.put_file("alias-fuzz", "target", b"x").unwrap();
+            let invalid = format!("{prefix}{}{suffix}", char::from(control));
+            prop_assert!(store
+                .put_alias(
+                    "alias-fuzz",
+                    &invalid,
+                    "target",
+                    FileMutationOptions::default(),
+                )
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn direct_alias_read_cost_ignores_unrelated_dangling_aliases() {
+        const UNRELATED: usize = 5_000;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+        store
+            .put_file("alias-read-cost", "target", b"value")
+            .unwrap();
+        store
+            .put_alias(
+                "alias-read-cost",
+                "direct",
+                "target",
+                FileMutationOptions::default(),
+            )
+            .unwrap();
+        let paths = (0..UNRELATED)
+            .map(|index| format!("noise/{index:04}"))
+            .collect::<Vec<_>>();
+        let targets = (0..UNRELATED)
+            .map(|index| format!("../missing/{index:04}"))
+            .collect::<Vec<_>>();
+        let aliases = paths
+            .iter()
+            .zip(&targets)
+            .map(|(path, target)| AliasSpec { path, target })
+            .collect::<Vec<_>>();
+        store
+            .put_aliases("alias-read-cost", &aliases, FileMutationOptions::default())
+            .unwrap();
+
+        reset_alias_directory_row_work();
+        assert!(matches!(
+            store.lookup("alias-read-cost", "direct"),
+            Ok(Node::File { .. })
+        ));
+        let work = alias_directory_row_work();
+        assert!(
+            work.resolution <= 1,
+            "direct alias read inspected {} rows with {UNRELATED} unrelated aliases",
+            work.resolution
+        );
     }
 
     #[test]

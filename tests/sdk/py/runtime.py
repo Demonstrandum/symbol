@@ -497,8 +497,14 @@ def test_retry_policy_applies_to_sync_and_async_transports() -> None:
         assert error.replayable
         assert len(error.attempts) == 1
         retried = error.retry(api.RetryPolicy(max_attempts=1))
-        assert retried.status == 200
-        assert len(retried.attempts) == 2
+        assert isinstance(retried, api.SymbolStats)
+        assert retried.sites == 0
+        try:
+            error.retry()
+        except api.OperationStateError:
+            pass
+        else:
+            raise AssertionError("successful typed retry remained reusable")
     else:
         raise AssertionError("terminal network failure did not fail")
 
@@ -511,10 +517,56 @@ def test_retry_policy_applies_to_sync_and_async_transports() -> None:
     except api.ServerError as error:
         assert len(error.attempts) == 1
         retried = error.retry(api.RetryPolicy(max_attempts=1))
-        assert len(retried.attempts) == 2
-        assert retried.status == 200
+        assert isinstance(retried, api.SymbolStats)
+        assert retried.sites == 0
     else:
         raise AssertionError("manual retry fixture did not fail")
+
+    allocation_backend = Backend()
+    allocation_backend.queue(503, b"retry")
+    allocation_backend.queue(
+        201,
+        {
+            "changed": True,
+            "site": "demo",
+            "path": "notes/generated.bin",
+            "hash": "blake3:" + "b" * 64,
+            "blob_url": "/.blob/demo/" + "b" * 64,
+        },
+        (
+            ("Content-Type", "application/json"),
+            *mutation_headers("notes/generated.bin"),
+        ),
+    )
+    allocation_symbol = api.Symbol(api.HttpClient.wrap(allocation_backend))
+    try:
+        allocation_symbol.site("demo").folder("notes").bytes(b"value")
+    except api.ServerError as error:
+        retried = error.retry(api.RetryPolicy(max_attempts=1))
+        assert isinstance(retried, api.AllocationReceipt)
+        assert retried.path == "notes/generated.bin"
+    else:
+        raise AssertionError("allocation retry fixture did not fail")
+
+    mutation_backend = Backend()
+    mutation_backend.queue(503, b"retry")
+    mutation_backend.queue(
+        200,
+        {"changed": True},
+        (("Content-Type", "application/json"), *mutation_headers()),
+    )
+    mutation_symbol = api.Symbol(api.HttpClient.wrap(mutation_backend))
+    try:
+        mutation_symbol.site("demo").file("x.txt").replace(
+            b"next",
+            base_hash=api.Blake3("c" * 64),
+        )
+    except api.ServerError as error:
+        retried = error.retry(api.RetryPolicy(max_attempts=1))
+        assert isinstance(retried, api.MutationReceipt)
+        assert retried.changed
+    else:
+        raise AssertionError("mutation retry fixture did not fail")
 
     non_replayable_backend = Backend()
     non_replayable_backend.queue(503, b"retry")
@@ -569,8 +621,14 @@ def test_retry_policy_applies_to_sync_and_async_transports() -> None:
             await terminal_symbol.stats()
         except api.NetworkRequestError as error:
             retried = await error.aretry(api.RetryPolicy(max_attempts=1))
-            assert retried.status == 200
-            assert len(retried.attempts) == 2
+            assert isinstance(retried, api.SymbolStats)
+            assert retried.sites == 0
+            try:
+                await error.aretry()
+            except api.OperationStateError:
+                pass
+            else:
+                raise AssertionError("successful async typed retry remained reusable")
         else:
             raise AssertionError("async terminal network failure did not fail")
 
@@ -581,8 +639,8 @@ def test_retry_policy_applies_to_sync_and_async_transports() -> None:
         except api.ServerError as error:
             manual_backend.response = response
             retried = await error.aretry(api.RetryPolicy(max_attempts=1))
-            assert len(retried.attempts) == 2
-            assert retried.status == 200
+            assert isinstance(retried, api.SymbolStats)
+            assert retried.sites == 0
         else:
             raise AssertionError("async manual retry fixture did not fail")
 
@@ -699,6 +757,31 @@ def test_streaming_bodies_are_lazy_and_closeable() -> None:
     asyncio.run(check_async())
 
 
+def test_async_splice_insertions_never_read_synchronous_sources() -> None:
+    async def chunks():
+        yield b"ab"
+        yield b"cd"
+
+    async def check() -> None:
+        assert await api._async_splice_insert(b"bytes") == b"bytes"
+        assert await api._async_splice_insert(memoryview(b"view")) == b"view"
+        assert await api._async_splice_insert("text") == b"text"
+        assert await api._async_splice_insert(chunks()) == b"abcd"
+        for source in (
+            pathlib.Path("/must-not-be-read"),
+            io.BytesIO(b"must-not-be-read"),
+        ):
+            try:
+                await api._async_splice_insert(source)
+            except TypeError:
+                pass
+            else:
+                raise AssertionError("async splice accepted a synchronous source")
+
+    assert "AsyncByteSplice" in api.__dict__
+    asyncio.run(check())
+
+
 async def test_async_factory() -> None:
     response = api.ApiResponse(
         200,
@@ -727,8 +810,9 @@ def main() -> None:
     test_malformed_responses_and_typed_errors()
     test_retry_policy_applies_to_sync_and_async_transports()
     test_streaming_bodies_are_lazy_and_closeable()
+    test_async_splice_insertions_never_read_synchronous_sources()
     asyncio.run(test_async_factory())
-    print("SDK Python runtime: 8 tests")
+    print("SDK Python runtime: 9 tests")
 
 
 if __name__ == "__main__":

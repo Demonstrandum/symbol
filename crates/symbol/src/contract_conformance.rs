@@ -1104,17 +1104,18 @@ async fn execute(probe: Probe) {
         "{} response status",
         probe.endpoint
     );
-    let declared = contract.success_statuses.contains(&probe.status)
-        || contract.error_statuses.contains(&probe.status);
+    let declared = contract.outcome(probe.status, probe_variant(probe));
     assert!(
-        declared,
-        "{} observed undeclared status {}",
-        probe.endpoint, probe.status
+        declared.is_some(),
+        "{} observed undeclared status {} variant {:?}",
+        probe.endpoint,
+        probe.status,
+        probe_variant(probe)
     );
     for expected in probe.response_headers {
         assert!(
             contract
-                .response_headers
+                .response_headers()
                 .iter()
                 .any(|name| name.eq_ignore_ascii_case(expected.name))
                 || matches!(
@@ -1152,15 +1153,15 @@ async fn execute(probe: Probe) {
 }
 
 async fn assert_success_location_is_readable(probe: Probe, app: &Router, location: Option<String>) {
-    let fixture = contract::contract_fixture();
-    let outcomes = fixture
-        .operations
-        .iter()
-        .find(|outcomes| outcomes.name == probe.endpoint)
-        .expect("every probe has a fixture operation");
-    if !outcomes.success_outcomes.iter().any(|outcome| {
-        outcome.status == probe.status && outcome.request_variant == probe_variant(probe)
-    }) {
+    let endpoint = endpoint(probe.endpoint);
+    if endpoint
+        .exact_outcome(
+            contract::OutcomeKind::Success,
+            probe.status,
+            probe_variant(probe),
+        )
+        .is_none()
+    {
         return;
     }
     let Some(location) = location else {
@@ -1184,25 +1185,14 @@ async fn assert_success_location_is_readable(probe: Probe, app: &Router, locatio
 }
 
 async fn assert_exact_outcome(probe: Probe, response: Response) {
-    let fixture = contract::contract_fixture();
-    let outcomes = fixture
-        .operations
-        .iter()
-        .find(|outcomes| outcomes.name == probe.endpoint)
-        .expect("every probe has a fixture operation");
-    let expected = outcomes
-        .success_outcomes
-        .iter()
-        .chain(&outcomes.error_outcomes)
-        .find(|outcome| {
-            outcome.status == probe.status
-                && (outcome.request_variant == "default"
-                    || outcome.request_variant == probe_variant(probe))
-        })
+    let expected = endpoint(probe.endpoint)
+        .outcome(probe.status, probe_variant(probe))
         .unwrap_or_else(|| {
             panic!(
-                "{} status {} lacks an exact outcome",
-                probe.endpoint, probe.status
+                "{} status {} variant {:?} lacks an exact outcome",
+                probe.endpoint,
+                probe.status,
+                probe_variant(probe)
             )
         });
     for required in expected.required_headers {
@@ -1249,15 +1239,22 @@ async fn assert_exact_outcome(probe: Probe, response: Response) {
     }
 }
 
-fn probe_variant(probe: Probe) -> &'static str {
+fn probe_variant(probe: Probe) -> contract::RequestVariant {
     if probe.endpoint != "allocated file" {
-        return "default";
+        return contract::RequestVariant::Default;
     }
-    probe
+    match probe
         .request_headers
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case("allocation-action"))
         .map_or("create", |(_, value)| *value)
+    {
+        "create" => contract::RequestVariant::Create,
+        "finalize" => contract::RequestVariant::Finalize,
+        "propose" => contract::RequestVariant::Propose,
+        "cancel" => contract::RequestVariant::Cancel,
+        variant => panic!("unknown allocation probe variant {variant}"),
+    }
 }
 
 async fn send(
@@ -1315,7 +1312,15 @@ async fn conditional_probe(endpoint_name: &str, path: &str) {
         "{endpoint_name}"
     );
     let contract = endpoint(endpoint_name);
-    assert!(contract.success_statuses.contains(&304));
+    assert!(
+        contract
+            .exact_outcome(
+                contract::OutcomeKind::Success,
+                304,
+                contract::RequestVariant::Default,
+            )
+            .is_some()
+    );
     assert!(response.headers().contains_key("etag"));
     assert!(response.headers().contains_key("cache-control"));
 }
@@ -1453,7 +1458,15 @@ async fn mutation_contract_executes_noop_and_stale_write_paths() {
         .await
         .unwrap();
     assert_eq!(no_op.status(), StatusCode::OK);
-    assert!(endpoint("site put").success_statuses.contains(&200));
+    assert!(
+        endpoint("site put")
+            .exact_outcome(
+                contract::OutcomeKind::Success,
+                200,
+                contract::RequestVariant::Default,
+            )
+            .is_some()
+    );
     assert!(!no_op.headers().contains_key("undo-token"));
 
     let inventory = app
@@ -1494,7 +1507,15 @@ async fn mutation_contract_executes_noop_and_stale_write_paths() {
         .await
         .unwrap();
     assert_eq!(stale.status(), StatusCode::PRECONDITION_FAILED);
-    assert!(endpoint("file put").error_statuses.contains(&412));
+    assert!(
+        endpoint("file put")
+            .exact_outcome(
+                contract::OutcomeKind::Error,
+                412,
+                contract::RequestVariant::Default,
+            )
+            .is_some()
+    );
     assert!(stale.headers().contains_key("etag"));
     assert!(stale.headers().contains_key("content-revision"));
 }

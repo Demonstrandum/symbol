@@ -33,6 +33,7 @@ libsqlite3-sys = { version = "0.38.2", features = ["bundled"] }
 sea-query = { version = "1.0.2", features = ["backend-sqlite", "derive"], default-features = false }
 
 [dev-dependencies]
+proptest = "1.11.0"
 pulldown-cmark = "0.13.4"
 swc_core = { version = "77.0.3", default-features = false, features = ["common", "ecma_ast", "ecma_codegen", "ecma_parser_typescript", "ecma_transforms_typescript", "ecma_transforms_module", "ecma_visit"] }
 tempfile = "3"

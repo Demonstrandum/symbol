@@ -1670,6 +1670,10 @@ export class SymbolClient {
     });
   }
 
+  [Symbol.asyncDispose](): Promise<void> {
+    return Promise.resolve();
+  }
+
   get origin(): URL {
     return new URL(stateFor(this).origin.href);
   }

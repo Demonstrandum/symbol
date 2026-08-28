@@ -218,6 +218,8 @@ if [ -d "${data_root}/blobs" ]; then
   sudo cp --archive --reflink=auto "${data_root}/blobs" "${backup_dir}/blobs"
   find "${data_root}/blobs" -type f -printf '%P\t%s\n' |
     LC_ALL=C sort >"${backup_inventory}"
+else
+  sudo touch "${backup_dir}/blobs.absent"
 fi
 sudo cp "${backup_inventory}" "${backup_dir}/blob-files.tsv"
 if sudo test -e "${installed_unit}"; then
@@ -258,6 +260,8 @@ rollback() {
   if sudo test -d "${backup_dir}/blobs"; then
     sudo rm -rf "${data_root}/blobs"
     sudo cp --archive "${backup_dir}/blobs" "${data_root}/blobs"
+  elif sudo test -e "${backup_dir}/blobs.absent"; then
+    sudo rm -rf "${data_root}/blobs"
   fi
   if sudo test -e "${backup_dir}/symbol.service"; then
     sudo cp --archive "${backup_dir}/symbol.service" "${installed_unit}"
@@ -265,6 +269,8 @@ rollback() {
   elif sudo test -e "${backup_dir}/symbol.service.absent"; then
     sudo rm -f "${installed_unit}"
     sudo systemctl daemon-reload
+    paused=0
+    exit 1
   fi
   if ! sudo systemctl start symbol ||
     ! sudo systemctl is-active --quiet symbol ||

@@ -19,7 +19,7 @@ from collections.abc import (
 )
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from enum import StrEnum
+from enum import IntEnum, StrEnum
 from pathlib import Path
 from types import TracebackType
 from typing import (
@@ -208,6 +208,7 @@ type ByteSource = bytes | bytearray | memoryview[int] | ByteReader | Path
 type Source = ByteSource | str
 type AsyncByteSource = bytes | bytearray | memoryview[int] | AsyncIterable[bytes]
 type AsyncSource = AsyncByteSource | str
+type AsyncSpliceSource = AsyncSource
 type Headers = tuple[tuple[str, str], ...]
 
 
@@ -271,6 +272,18 @@ def _async_body(value: object) -> bytes | AsyncIterable[bytes] | None:
             raise TypeError(
                 "async request bodies require bytes, text, or AsyncIterable[bytes]"
             )
+
+
+async def _async_splice_insert(value: object) -> bytes:
+    prepared = _async_body(value)
+    if prepared is None:
+        return b""
+    if isinstance(prepared, bytes):
+        return prepared
+    chunks = bytearray()
+    async for chunk in prepared:
+        chunks.extend(chunk)
+    return bytes(chunks)
 
 
 def _source_replayable(value: object) -> bool:
@@ -604,15 +617,20 @@ class NetworkRequestError(OSError):
         self._async_retry: (
             Callable[[RetryPolicy | None], Awaitable[ApiResponse]] | None
         ) = None
+        self.operation: RetryableOperation[Any] | None = None
 
-    def retry(self, policy: RetryPolicy | None = None) -> ApiResponse:
+    def retry(self, policy: RetryPolicy | None = None) -> Any:
+        if self.operation is not None:
+            return self.operation.retry(policy)
         if not self.replayable:
             raise BodyNotReplayableError
         if self._retry is None:
             raise OperationStateError("network operation has no synchronous retry")
         return self._retry(policy)
 
-    async def aretry(self, policy: RetryPolicy | None = None) -> ApiResponse:
+    async def aretry(self, policy: RetryPolicy | None = None) -> Any:
+        if self.operation is not None:
+            return await self.operation.aretry(policy)
         if not self.replayable:
             raise BodyNotReplayableError
         if self._async_retry is None:
@@ -630,6 +648,167 @@ class BodyNotReplayableError(RuntimeError):
 
 class OperationStateError(RuntimeError):
     pass
+
+
+class OperationPhase(IntEnum):
+    RUNNING = 0
+    SUCCEEDED = 1
+    FAILED = 2
+
+
+class RetryableOperation[T](Protocol):
+    phase: OperationPhase
+    attempts: tuple[RequestAttempt, ...]
+
+    def retry(self, policy: RetryPolicy | None = None) -> T: ...
+    async def aretry(self, policy: RetryPolicy | None = None) -> T: ...
+
+
+class _SyncRetryableOperation[T]:
+    def __init__(
+        self,
+        send: Callable[[], ApiResponse],
+        decode: Callable[[ApiResponse], T],
+    ) -> None:
+        self.phase = OperationPhase.RUNNING
+        self.attempts: tuple[RequestAttempt, ...] = ()
+        self._send = send
+        self._decode = decode
+        self._retry_raw: Callable[[RetryPolicy | None], ApiResponse] | None = None
+        self._replayable = False
+        self._owner: NetworkRequestError | SymbolApiError | None = None
+
+    def _run(self) -> T:
+        try:
+            return self._complete(self._send())
+        except (NetworkRequestError, SymbolApiError) as error:
+            self._bind(error)
+            raise
+
+    def retry(self, policy: RetryPolicy | None = None) -> T:
+        if self.phase is not OperationPhase.FAILED:
+            raise OperationStateError("operation is not in a retryable failed state")
+        if not self._replayable:
+            raise BodyNotReplayableError
+        if self._retry_raw is None:
+            raise OperationStateError("operation has no synchronous retry")
+        self.phase = OperationPhase.RUNNING
+        try:
+            return self._complete(self._retry_raw(policy))
+        except (NetworkRequestError, SymbolApiError) as error:
+            self._bind(error)
+            raise
+
+    async def aretry(self, policy: RetryPolicy | None = None) -> T:
+        del policy
+        raise OperationStateError("operation has no asynchronous retry")
+
+    def _complete(self, response: ApiResponse) -> T:
+        try:
+            value = self._decode(response)
+        except SymbolApiError as error:
+            self._bind(error)
+            raise
+        self.phase = OperationPhase.SUCCEEDED
+        self.attempts = response.attempts
+        if self._owner is not None:
+            self._owner.attempts = self.attempts
+        return value
+
+    def _bind(self, error: NetworkRequestError | SymbolApiError) -> None:
+        self.phase = OperationPhase.FAILED
+        self.attempts = error.attempts
+        self._replayable = error.replayable
+        self._owner = error
+        error.operation = self
+        self._retry_raw = (
+            error._retry
+            if isinstance(error, NetworkRequestError)
+            else error.response._retry
+        )
+
+
+class _AsyncRetryableOperation[T]:
+    def __init__(
+        self,
+        send: Callable[[], Awaitable[ApiResponse]],
+        decode: Callable[[ApiResponse], Awaitable[T]],
+    ) -> None:
+        self.phase = OperationPhase.RUNNING
+        self.attempts: tuple[RequestAttempt, ...] = ()
+        self._send = send
+        self._decode = decode
+        self._retry_raw: (
+            Callable[[RetryPolicy | None], Awaitable[ApiResponse]] | None
+        ) = None
+        self._replayable = False
+        self._owner: NetworkRequestError | SymbolApiError | None = None
+
+    async def _run(self) -> T:
+        try:
+            return await self._complete(await self._send())
+        except (NetworkRequestError, SymbolApiError) as error:
+            self._bind(error)
+            raise
+
+    def retry(self, policy: RetryPolicy | None = None) -> T:
+        del policy
+        raise OperationStateError("operation has no synchronous retry")
+
+    async def aretry(self, policy: RetryPolicy | None = None) -> T:
+        if self.phase is not OperationPhase.FAILED:
+            raise OperationStateError("operation is not in a retryable failed state")
+        if not self._replayable:
+            raise BodyNotReplayableError
+        if self._retry_raw is None:
+            raise OperationStateError("operation has no asynchronous retry")
+        self.phase = OperationPhase.RUNNING
+        try:
+            return await self._complete(await self._retry_raw(policy))
+        except (NetworkRequestError, SymbolApiError) as error:
+            self._bind(error)
+            raise
+
+    async def _complete(self, response: ApiResponse) -> T:
+        try:
+            value = await self._decode(response)
+        except SymbolApiError as error:
+            self._bind(error)
+            raise
+        self.phase = OperationPhase.SUCCEEDED
+        self.attempts = response.attempts
+        if self._owner is not None:
+            self._owner.attempts = self.attempts
+        return value
+
+    def _bind(self, error: NetworkRequestError | SymbolApiError) -> None:
+        self.phase = OperationPhase.FAILED
+        self.attempts = error.attempts
+        self._replayable = error.replayable
+        self._owner = error
+        error.operation = self
+        self._retry_raw = (
+            error._async_retry
+            if isinstance(error, NetworkRequestError)
+            else error.response._async_retry
+        )
+
+
+def _run_typed_sync[T](
+    send: Callable[[], ApiResponse],
+    decode: Callable[[ApiResponse], T],
+) -> T:
+    return _SyncRetryableOperation(send, decode)._run()
+
+
+async def _run_typed_async[T](
+    send: Callable[[], Awaitable[ApiResponse]],
+    decode: Callable[[ApiResponse], T],
+) -> T:
+    async def decode_async(response: ApiResponse) -> T:
+        return decode(response)
+
+    return await _AsyncRetryableOperation(send, decode_async)._run()
 
 
 class _StdlibBackend:
@@ -1216,6 +1395,13 @@ class ByteSplice:
 
 
 @dataclass(frozen=True, slots=True)
+class AsyncByteSplice:
+    offset: int
+    delete_bytes: int
+    insert: AsyncSpliceSource = b""
+
+
+@dataclass(frozen=True, slots=True)
 class RelativeExpiry:
     duration: str
 
@@ -1467,6 +1653,16 @@ class SymbolStats:
     serving: ServingStats
 
 
+def _decode_symbol_stats(response: ApiResponse) -> SymbolStats:
+    if response.status != 200:
+        _raise(response)
+    return _symbol_stats(_json_object(response), response)
+
+
+async def _decode_symbol_stats_async(response: ApiResponse) -> SymbolStats:
+    return _decode_symbol_stats(response)
+
+
 @dataclass(frozen=True, slots=True)
 class ManagementStatus:
     managed: bool
@@ -1484,11 +1680,16 @@ class SymbolApiError(RuntimeError):
         self.idempotency_key = idempotency_key
         self.attempts = response.attempts
         self.replayable = response.replayable
+        self.operation: RetryableOperation[Any] | None = None
 
-    def retry(self, policy: RetryPolicy | None = None) -> ApiResponse:
+    def retry(self, policy: RetryPolicy | None = None) -> Any:
+        if self.operation is not None:
+            return self.operation.retry(policy)
         return self.response.retry(policy)
 
-    async def aretry(self, policy: RetryPolicy | None = None) -> ApiResponse:
+    async def aretry(self, policy: RetryPolicy | None = None) -> Any:
+        if self.operation is not None:
+            return await self.operation.aretry(policy)
         return await self.response.aretry(policy)
 
     def abort(self) -> None:
@@ -2470,11 +2671,11 @@ class _SymbolSync:
         )
 
     def stats(self) -> SymbolStats:
-        response = self._send(HttpMethod.GET, self.origin + "/STATS")
-        if response.status != 200:
-            _raise(response)
-        value = _json_object(response)
-        return _symbol_stats(value, response)
+        operation = _SyncRetryableOperation(
+            lambda: self._send(HttpMethod.GET, self.origin + "/STATS"),
+            _decode_symbol_stats,
+        )
+        return operation._run()
 
     def api_client(
         self,
@@ -2530,14 +2731,14 @@ class _SymbolSync:
         options: PublishOptions = PublishOptions(),
     ) -> MutationReceipt:
         key = options.idempotency_key or secrets.token_hex(16)
-        return _mutation(
-            self._send(
+        return _run_typed_sync(
+            lambda: self._send(
                 HttpMethod.PUT,
                 self.origin + "/",
                 headers=_publish_headers(options, key, self.creator_claim),
                 body=body,
             ),
-            key,
+            lambda response: _mutation(response, key),
         )
 
     def sites(self) -> DirectoryListing:
@@ -2677,13 +2878,13 @@ class SiteClient:
         key = options.idempotency_key or secrets.token_hex(16)
         headers = _options(options, key=key)
         headers.append(("Alias-Target", target))
-        return _alias(
-            self.symbol._send(
+        return _run_typed_sync(
+            lambda: self.symbol._send(
                 HttpMethod.ALIAS,
                 _url(self.symbol.origin, self.name, *path.split("/")),
                 headers=headers,
             ),
-            key,
+            lambda response: _alias(response, key),
         )
 
     def aliases(
@@ -2703,10 +2904,12 @@ class SiteClient:
             },
             separators=(",", ":"),
         )
-        response = self.symbol._send(
-            HttpMethod.ALIAS, self.url, headers=headers, body=body
+        return _run_typed_sync(
+            lambda: self.symbol._send(
+                HttpMethod.ALIAS, self.url, headers=headers, body=body
+            ),
+            lambda response: _alias_batch(response, key),
         )
-        return _alias_batch(response, key)
 
     def copy(
         self, destination: str, options: MutationOptions = MutationOptions()
@@ -2715,10 +2918,9 @@ class SiteClient:
         key = options.idempotency_key or secrets.token_hex(16)
         headers = _options(options, key=key)
         headers.append(("Destination", "/" + destination.strip("/")))
-        return _mutation(
-            self.symbol._send(HttpMethod.COPY, self.url, headers=headers),
-            key,
-            True,
+        return _run_typed_sync(
+            lambda: self.symbol._send(HttpMethod.COPY, self.url, headers=headers),
+            lambda response: _mutation(response, key, True),
         )
 
     def move(
@@ -2727,9 +2929,9 @@ class SiteClient:
         options = replace(options, token=options.token or self.token)
         headers = _options(options)
         headers.append(("Destination", "/" + destination.strip("/")))
-        return _mutation(
-            self.symbol._send(HttpMethod.MOVE, self.url, headers=headers),
-            expected_changed=True,
+        return _run_typed_sync(
+            lambda: self.symbol._send(HttpMethod.MOVE, self.url, headers=headers),
+            lambda response: _mutation(response, expected_changed=True),
         )
 
     def management(self) -> ManagementClient:
@@ -2757,19 +2959,20 @@ class FolderClient:
             headers.append(("File-Suffix", options.name.suffix))
         if options.name.extension:
             headers.append(("File-Extension", options.name.extension.lstrip(".")))
-        return _allocation(
-            self.site.symbol._send(
+        url = _url(
+            self.site.symbol.origin,
+            self.site.name,
+            *self.path.split("/"),
+            trailing=True,
+        )
+        return _run_typed_sync(
+            lambda: self.site.symbol._send(
                 HttpMethod.POST,
-                _url(
-                    self.site.symbol.origin,
-                    self.site.name,
-                    *self.path.split("/"),
-                    trailing=True,
-                ),
+                url,
                 headers=headers,
                 body=body,
             ),
-            key,
+            lambda response: _allocation(response, key),
         )
 
     def _custom(
@@ -2851,9 +3054,9 @@ class FolderClient:
                 ("File-Name", filename),
             )
         )
-        return _allocation(
-            self.site.symbol._send(HttpMethod.POST, url, headers=final_headers),
-            logical_key,
+        return _run_typed_sync(
+            lambda: self.site.symbol._send(HttpMethod.POST, url, headers=final_headers),
+            lambda response: _allocation(response, logical_key),
         )
 
     def bytes(
@@ -2916,16 +3119,20 @@ class FileClient:
         options = replace(options, token=options.token or self.site.token)
         headers = _options(options)
         headers.append(("Content-Type", str(media_type)))
-        return _mutation(
-            self.site.symbol._send(HttpMethod.PUT, self.url, headers=headers, body=body)
+        return _run_typed_sync(
+            lambda: self.site.symbol._send(
+                HttpMethod.PUT, self.url, headers=headers, body=body
+            ),
+            _mutation,
         )
 
     def remove(self, options: MutationOptions = MutationOptions()) -> DeleteReceipt:
         options = replace(options, token=options.token or self.site.token)
-        return _delete_receipt(
-            self.site.symbol._send(
+        return _run_typed_sync(
+            lambda: self.site.symbol._send(
                 HttpMethod.DELETE, self.url, headers=_options(options)
-            )
+            ),
+            _delete_receipt,
         )
 
     def hash(self) -> Blake3:
@@ -2949,11 +3156,11 @@ class FileClient:
                 ("If-Content-Match", f'"{base_hash}"'),
             )
         )
-        return _mutation(
-            self.site.symbol._send(
+        return _run_typed_sync(
+            lambda: self.site.symbol._send(
                 HttpMethod.REPLACE, self.url, headers=headers, body=body
             ),
-            key,
+            lambda response: _mutation(response, key),
         )
 
     def splice(
@@ -2996,11 +3203,11 @@ class FileClient:
                 frame.extend(len(insertion).to_bytes(8, "big"))
             frame.extend(b"".join(insertions))
             body = bytes(frame)
-        return _mutation(
-            self.site.symbol._send(
+        return _run_typed_sync(
+            lambda: self.site.symbol._send(
                 HttpMethod.PATCH, self.url, headers=headers, body=body
             ),
-            key,
+            lambda response: _mutation(response, key),
         )
 
 
@@ -3190,11 +3397,11 @@ class _SymbolAsync:
         )
 
     async def stats(self) -> SymbolStats:
-        response = await self._send(HttpMethod.GET, self.origin + "/STATS")
-        if response.status != 200:
-            _raise(response)
-        value = _json_object(response)
-        return _symbol_stats(value, response)
+        operation = _AsyncRetryableOperation(
+            lambda: self._send(HttpMethod.GET, self.origin + "/STATS"),
+            _decode_symbol_stats_async,
+        )
+        return await operation._run()
 
     async def api_client(
         self,
@@ -3257,14 +3464,14 @@ class _SymbolAsync:
         options: PublishOptions = PublishOptions(),
     ) -> MutationReceipt:
         key = options.idempotency_key or secrets.token_hex(16)
-        return _mutation(
-            await self._send(
+        return await _run_typed_async(
+            lambda: self._send(
                 HttpMethod.PUT,
                 self.origin + "/",
                 headers=_publish_headers(options, key, self.creator_claim),
                 body=body,
             ),
-            key,
+            lambda response: _mutation(response, key),
         )
 
     async def sites(self) -> DirectoryListing:
@@ -3314,13 +3521,13 @@ class AsyncSiteClient:
         key = options.idempotency_key or secrets.token_hex(16)
         headers = _options(options, key=key)
         headers.append(("Alias-Target", target))
-        return _alias(
-            await self.symbol._send(
+        return await _run_typed_async(
+            lambda: self.symbol._send(
                 HttpMethod.ALIAS,
                 _url(self.symbol.origin, self.name, *path.split("/")),
                 headers=headers,
             ),
-            key,
+            lambda response: _alias(response, key),
         )
 
     async def aliases(
@@ -3340,10 +3547,12 @@ class AsyncSiteClient:
             },
             separators=(",", ":"),
         )
-        response = await self.symbol._send(
-            HttpMethod.ALIAS, self.url, headers=headers, body=body
+        return await _run_typed_async(
+            lambda: self.symbol._send(
+                HttpMethod.ALIAS, self.url, headers=headers, body=body
+            ),
+            lambda response: _alias_batch(response, key),
         )
-        return _alias_batch(response, key)
 
     async def archive(self, format: str = "tar.gz") -> ApiResponse:
         return await self.symbol._send(
@@ -3375,10 +3584,9 @@ class AsyncSiteClient:
         key = options.idempotency_key or secrets.token_hex(16)
         headers = _options(options, key=key)
         headers.append(("Destination", "/" + destination.strip("/")))
-        return _mutation(
-            await self.symbol._send(HttpMethod.COPY, self.url, headers=headers),
-            key,
-            True,
+        return await _run_typed_async(
+            lambda: self.symbol._send(HttpMethod.COPY, self.url, headers=headers),
+            lambda response: _mutation(response, key, True),
         )
 
     async def move(
@@ -3389,9 +3597,9 @@ class AsyncSiteClient:
         options = replace(options, token=options.token or self.token)
         headers = _options(options)
         headers.append(("Destination", "/" + destination.strip("/")))
-        return _mutation(
-            await self.symbol._send(HttpMethod.MOVE, self.url, headers=headers),
-            expected_changed=True,
+        return await _run_typed_async(
+            lambda: self.symbol._send(HttpMethod.MOVE, self.url, headers=headers),
+            lambda response: _mutation(response, expected_changed=True),
         )
 
     async def undo(
@@ -3487,19 +3695,20 @@ class AsyncFolderClient:
             headers.append(("File-Suffix", name.suffix))
         if name.extension:
             headers.append(("File-Extension", name.extension.lstrip(".")))
-        return _allocation(
-            await self.site.symbol._send(
+        url = _url(
+            self.site.symbol.origin,
+            self.site.name,
+            *self.path.split("/"),
+            trailing=True,
+        )
+        return await _run_typed_async(
+            lambda: self.site.symbol._send(
                 HttpMethod.POST,
-                _url(
-                    self.site.symbol.origin,
-                    self.site.name,
-                    *self.path.split("/"),
-                    trailing=True,
-                ),
+                url,
                 headers=headers,
                 body=body,
             ),
-            key,
+            lambda response: _allocation(response, key),
         )
 
     async def _custom(
@@ -3578,9 +3787,9 @@ class AsyncFolderClient:
                 ("File-Name", filename),
             )
         )
-        return _allocation(
-            await self.site.symbol._send(HttpMethod.POST, url, headers=final_headers),
-            logical_key,
+        return await _run_typed_async(
+            lambda: self.site.symbol._send(HttpMethod.POST, url, headers=final_headers),
+            lambda response: _allocation(response, logical_key),
         )
 
     async def bytes(
@@ -3649,20 +3858,22 @@ class AsyncFileClient:
         options = replace(options, token=options.token or self.site.token)
         headers = _options(options)
         headers.append(("Content-Type", str(media_type)))
-        return _mutation(
-            await self.site.symbol._send(
+        return await _run_typed_async(
+            lambda: self.site.symbol._send(
                 HttpMethod.PUT, self.url, headers=headers, body=body
-            )
+            ),
+            _mutation,
         )
 
     async def remove(
         self, options: MutationOptions = MutationOptions()
     ) -> DeleteReceipt:
         options = replace(options, token=options.token or self.site.token)
-        return _delete_receipt(
-            await self.site.symbol._send(
+        return await _run_typed_async(
+            lambda: self.site.symbol._send(
                 HttpMethod.DELETE, self.url, headers=_options(options)
-            )
+            ),
+            _delete_receipt,
         )
 
     async def hash(self) -> Blake3:
@@ -3691,16 +3902,16 @@ class AsyncFileClient:
                 ("If-Content-Match", f'"{base_hash}"'),
             )
         )
-        return _mutation(
-            await self.site.symbol._send(
+        return await _run_typed_async(
+            lambda: self.site.symbol._send(
                 HttpMethod.REPLACE, self.url, headers=headers, body=body
             ),
-            key,
+            lambda response: _mutation(response, key),
         )
 
     async def splice(
         self,
-        change: ByteSplice,
+        change: AsyncByteSplice,
         *,
         base_hash: Blake3,
         options: MutationOptions = MutationOptions(),
@@ -3709,7 +3920,7 @@ class AsyncFileClient:
 
     async def patch(
         self,
-        changes: Iterable[ByteSplice],
+        changes: Iterable[AsyncByteSplice],
         *,
         base_hash: Blake3,
         options: MutationOptions = MutationOptions(),
@@ -3717,7 +3928,9 @@ class AsyncFileClient:
         options = replace(options, token=options.token or self.site.token)
         key = options.idempotency_key or secrets.token_hex(16)
         changes = tuple(changes)
-        insertions = tuple(_body(item.insert) or b"" for item in changes)
+        insertions = tuple(
+            [await _async_splice_insert(item.insert) for item in changes]
+        )
         descriptor = ",".join(
             f"offset={item.offset}; delete={item.delete_bytes}; insert={len(insertion)}"
             for item, insertion in zip(changes, insertions, strict=True)
@@ -3738,11 +3951,11 @@ class AsyncFileClient:
                 frame.extend(len(insertion).to_bytes(8, "big"))
             frame.extend(b"".join(insertions))
             body = bytes(frame)
-        return _mutation(
-            await self.site.symbol._send(
+        return await _run_typed_async(
+            lambda: self.site.symbol._send(
                 HttpMethod.PATCH, self.url, headers=headers, body=body
             ),
-            key,
+            lambda response: _mutation(response, key),
         )
 
 

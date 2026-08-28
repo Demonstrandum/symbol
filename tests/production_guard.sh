@@ -4,6 +4,9 @@ set -eu
 ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT HUP INT TERM
+REAL_CAT=$(command -v cat)
+REAL_CP=$(command -v cp)
+export REAL_CAT REAL_CP
 GUARD_MARKER="${TMP}/operation-reached"
 export GUARD_MARKER
 cat >"${TMP}/cargo" <<'EOF'
@@ -85,6 +88,7 @@ JOURNAL_RECENT="${TMP}/journal-recent"
 SLEEP_MARKER="${TMP}/sleep-reached"
 PAUSE_MARKER="${TMP}/pause-reached"
 RESUME_MARKER="${TMP}/resume-reached"
+START_MARKER="${TMP}/start-reached"
 RUNNING_EXE="${TMP}/running-symbol"
 RUNNING_EXE_TARGET="${TMP}/running-symbol-target"
 DEPLOY_BINARY="${TMP}/deployed-symbol"
@@ -103,7 +107,8 @@ export \
   SLEEP_MARKER \
   PAUSE_MARKER \
   RESTORE_MARKER \
-  RESUME_MARKER
+  RESUME_MARKER \
+  START_MARKER
 mkdir -p "${DATA_ROOT}/blobs"
 printf 'old binary\n' >"${RUNNING_EXE_TARGET}"
 ln -s "${RUNNING_EXE_TARGET}" "${RUNNING_EXE}"
@@ -162,9 +167,17 @@ case "$1" in
     ;;
   restart)
     : >"${DEPLOY_MARKER}"
+    if [ "${RESTART_ACTION:-}" = create-blobs ]; then
+      mkdir -p "${DATA_ROOT}/blobs"
+      printf 'new blob\n' >"${DATA_ROOT}/blobs/new"
+    fi
     [ "${RESTART_FAILURE:-0}" != 1 ] || exit 1
     ;;
-  stop | start)
+  stop)
+    ;;
+  start)
+    : >"${START_MARKER}"
+    [ -e "${SYMBOL_INSTALLED_UNIT}" ] || exit 5
     ;;
   is-active)
     exit 0
@@ -187,7 +200,7 @@ printf 'new unit\n' >"${destination}"
 EOF
 cat >"${TMP}/cp" <<'EOF'
 #!/bin/sh
-/bin/cp "$@"
+"${REAL_CP}" "$@"
 case "$*" in
   *"${DEPLOY_BINARY}") : >"${RESTORE_MARKER}" ;;
   *) : >"${BACKUP_MARKER}" ;;
@@ -223,7 +236,7 @@ case " $* " in
   *" --since "*) source=${JOURNAL_RECENT} ;;
   *) source=${JOURNAL_ALL} ;;
 esac
-[ ! -s "${source}" ] || /bin/cat "${source}"
+[ ! -s "${source}" ] || "${REAL_CAT}" "${source}"
 EOF
 cat >"${TMP}/sleep" <<'EOF'
 #!/bin/sh
@@ -255,7 +268,8 @@ run_restart_guard() {
     "${SLEEP_MARKER}.finished" \
     "${PAUSE_MARKER}" \
     "${RESTORE_MARKER}" \
-    "${RESUME_MARKER}"
+    "${RESUME_MARKER}" \
+    "${START_MARKER}"
   set +e
   GUARD_OUTPUT=$(
     PATH="${TMP}:${PATH}" \
@@ -270,6 +284,7 @@ run_restart_guard() {
       JOURNAL_FAILURE="${JOURNAL_FAILURE:-0}" \
       CURL_FAILURE="${CURL_FAILURE:-0}" \
       PAUSE_ACTION="${PAUSE_ACTION:-}" \
+      RESTART_ACTION="${RESTART_ACTION:-}" \
       RESTART_FAILURE="${RESTART_FAILURE:-0}" \
       SLEEP_ACTION="${SLEEP_ACTION:-}" \
       sh "${ROOT}/ops/restart.sh" 2>&1
@@ -314,7 +329,7 @@ set -- "${BACKUP_ROOT}"/*
   [ -f "$1/symbol.service" ] &&
   [ -f "$1/symbol" ] &&
   [ ! -L "$1/symbol" ] &&
-  [ "$(/bin/cat "$1/symbol")" = 'old binary' ] ||
+  [ "$(cat "$1/symbol")" = 'old binary' ] ||
   {
     printf 'successful restart backup omitted blobs or service unit\n' >&2
     exit 1
@@ -348,20 +363,42 @@ RESTART_FAILURE=1
 export RESTART_FAILURE
 run_restart_guard 0
 unset RESTART_FAILURE
-[ "${GUARD_STATUS}" -eq 1 ] && [ ! -e "${INSTALLED_UNIT}" ] ||
+[ "${GUARD_STATUS}" -eq 1 ] &&
+  [ ! -e "${INSTALLED_UNIT}" ] &&
+  [ ! -e "${START_MARKER}" ] ||
   {
-    printf 'first-install rollback left the new service unit behind:\n%s\n' \
+    printf 'first-install rollback left or started the new service unit:\n%s\n' \
       "${GUARD_OUTPUT}" >&2
     exit 1
   }
 printf 'old unit\n' >"${INSTALLED_UNIT}"
-[ "$(/bin/cat "${DEPLOY_BINARY}")" = 'old binary' ] &&
-  [ "$(/bin/cat "${DATA_ROOT}/blobs/aa")" = 'blob' ] &&
-  [ "$(/bin/cat "${INSTALLED_UNIT}")" = 'old unit' ] ||
+[ "$(cat "${DEPLOY_BINARY}")" = 'old binary' ] &&
+  [ "$(cat "${DATA_ROOT}/blobs/aa")" = 'blob' ] &&
+  [ "$(cat "${INSTALLED_UNIT}")" = 'old unit' ] ||
   {
     printf 'rollback did not restore binary, blobs, and service unit\n' >&2
     exit 1
   }
+
+write_journal_all \
+  'symbol_mutation_start mutation_id=12 method=PUT' \
+  'symbol_mutation_finish mutation_id=12 method=PUT status=200'
+: >"${JOURNAL_RECENT}"
+rm -rf "${DATA_ROOT}/blobs"
+printf 'new binary\n' >"${DEPLOY_BINARY}"
+RESTART_ACTION=create-blobs
+RESTART_FAILURE=1
+export RESTART_ACTION RESTART_FAILURE
+run_restart_guard 0
+unset RESTART_ACTION RESTART_FAILURE
+[ "${GUARD_STATUS}" -eq 1 ] && [ ! -e "${DATA_ROOT}/blobs" ] ||
+  {
+    printf 'rollback did not restore an absent blob directory:\n%s\n' \
+      "${GUARD_OUTPUT}" >&2
+    exit 1
+  }
+mkdir -p "${DATA_ROOT}/blobs"
+printf 'blob\n' >"${DATA_ROOT}/blobs/aa"
 
 write_journal_all \
   'symbol_mutation_start mutation_id=9 method=PUT' \
@@ -516,7 +553,7 @@ assert_guard_refused
     exit 1
   }
 
-case "$(/bin/cat "${ROOT}/ops/symbol.service")" in
+case "$(cat "${ROOT}/ops/symbol.service")" in
   *"Environment=RUST_LOG=info,symbol::mutation=info"*"LogRateLimitIntervalSec=0"*) ;;
   *)
     printf 'service does not reliably retain mutation signals at info\n' >&2

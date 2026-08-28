@@ -288,13 +288,58 @@
             python3 tests/sdk/py/optional.py
             python3 tests/sdk/py/real.py
           '';
-          sdkDocs = sdkCheck "symbol-sdk-docs" [ pkgs.python3 ] ''
+          sdkDocs = sdkCheck "symbol-sdk-docs" (
+            e2eInputs ++ [
+              pkgs.nodejs
+              pkgs.typescript
+              pythonSdk
+            ]
+          ) ''
             export SYMBOL_BIN="${package}/bin/symbol"
             python3 tests/api_contract.py
             python3 tests/documentation_surface.py
+            ${pythonSdk}/bin/python3 tests/manual_examples.py
+          '';
+          e2eInputs = [
+            pkgs.b3sum
+            pkgs.coreutils
+            pkgs.curl
+            pkgs.diffutils
+            pkgs.findutils
+            pkgs.gawk
+            pkgs.gnused
+            pkgs.gnutar
+            pkgs.gzip
+            pkgs.python3
+            pkgs.unzip
+            pkgs.zip
+          ];
+          aliasTransferE2e = sdkCheck "symbol-alias-transfer-e2e" e2eInputs ''
+            export SERVER="${package}/bin/symbol"
+            export CLIENT="$src/static/symbol.sh"
+            sh tests/alias_transfer_e2e.sh
+          '';
+          lifecycleE2e = sdkCheck "symbol-lifecycle-e2e" e2eInputs ''
+            export SERVER="${package}/bin/symbol"
+            export CLIENT="$src/static/symbol.sh"
+            sh tests/lifecycle_e2e.sh
+          '';
+          productionGuard = sdkCheck "symbol-production-guard" (
+            e2eInputs ++ [ pkgs.cargo ]
+          ) ''
+            sh tests/production_guard.sh
+          '';
+          concurrencySoak = sdkCheck "symbol-concurrency-soak" e2eInputs ''
+            export SERVER="${package}/bin/symbol"
+            export SYMBOL_SOAK_SECONDS=30
+            sh tests/concurrency_soak.sh
           '';
           named = posix // {
+            alias-transfer-e2e = aliasTransferE2e;
+            concurrency-soak = concurrencySoak;
+            lifecycle-e2e = lifecycleE2e;
             inherit package;
+            production-guard = productionGuard;
             generated-sources = generatedSources;
             generated-provenance = provenance;
             public-api-freeze = publicApiFreeze;

@@ -694,6 +694,22 @@ fn accept_flavor(accept: &str) -> Option<Flavor> {
     }
 }
 
+fn flush_pending(pending: &mut Option<String>, lead: &mut String, sections: &mut [Section]) {
+    let Some(text) = pending.take() else {
+        return;
+    };
+    if sections.is_empty() {
+        if lead.is_empty() {
+            *lead = text;
+        } else {
+            lead.push_str("\n\n");
+            lead.push_str(&text);
+        }
+    } else if let Some(section) = sections.last_mut() {
+        section.blocks.push(Block::Prose(text));
+    }
+}
+
 fn parse(src: &str) -> Result<Page, String> {
     let mut title = String::new();
     let mut lead = String::new();
@@ -702,23 +718,6 @@ fn parse(src: &str) -> Result<Page, String> {
     let mut prev_blank = false;
     let mut in_fence = false;
     let mut fence_buf = String::new();
-
-    let flush_pending =
-        |pending: &mut Option<String>, lead: &mut String, sections: &mut Vec<Section>| {
-            let Some(text) = pending.take() else {
-                return;
-            };
-            if sections.is_empty() {
-                if lead.is_empty() {
-                    *lead = text;
-                } else {
-                    lead.push_str("\n\n");
-                    lead.push_str(&text);
-                }
-            } else if let Some(section) = sections.last_mut() {
-                section.blocks.push(Block::Prose(text));
-            }
-        };
 
     for line in src.lines() {
         if in_fence {

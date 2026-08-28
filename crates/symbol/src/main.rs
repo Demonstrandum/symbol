@@ -3009,7 +3009,7 @@ mod tests {
             .unwrap_or_else(|| panic!("missing contract {name}"));
         let code = status.as_u16();
         assert!(
-            endpoint.success_statuses.contains(&code) || endpoint.error_statuses.contains(&code),
+            endpoint.has_status(code),
             "{name} does not declare observed status {code}"
         );
     }

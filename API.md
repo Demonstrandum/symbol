@@ -341,15 +341,18 @@ failed, and non-replayable operations reject retry.
 
 ## Complete workflow
 
+<!-- EXEC:TS:START -->
 ```ts
 import {
   MediaTypes,
   RetryPolicies,
   SymbolClient,
-} from "http://127.0.0.1:4341/symbol.js";
+} from "./symbol.js";
 
+const origin = new URL(import.meta.url).searchParams.get("origin");
+if (!origin) throw new Error("the module URL needs an origin query parameter");
 await using symbol = new SymbolClient({
-  origin: "http://127.0.0.1:4341",
+  origin,
   retryPolicy: RetryPolicies.Default,
 });
 
@@ -375,6 +378,7 @@ await site.file("config.json").replace('{"enabled":false}', {
 const stack = await site.undoStack();
 if (stack.entries.length > 0) await site.undo(stack.entries[0].token);
 ```
+<!-- EXEC:TS:END -->
 <!-- API:JS:END -->
 
 <!-- API:PYTHON:START -->
@@ -519,6 +523,8 @@ asyncio.run(main())
 
 Async request bodies accept bytes, text, or `AsyncIterable[bytes]`. They reject
 `Path` and synchronous readers instead of hiding blocking work in a thread.
+Async splice operations use `AsyncByteSplice`; insertion values follow the same
+non-blocking rule and are materialized before the atomic request is sent.
 
 ```python
 async def chunks():
@@ -584,10 +590,13 @@ with symbol.site("media").file("movie.mp4").get() as response:
 ```
 
 Every failed replayable response retains `attempts`, `replayable`,
-`idempotency_key`, and `retry`/`aretry`. Terminal network failures preserve the
-same logical request. Successful, aborted, disposed, and non-replayable
-operations reject manual retry. `Retry-After` never exceeds
-`RetryPolicy.maximum_delay`.
+`idempotency_key`, and `retry`/`aretry`. Typed statistics, allocation, alias,
+and content-mutation failures also expose their stateful `operation`; retry
+returns the original typed result rather than a raw response. A successful
+manual retry moves that operation to `OperationPhase.SUCCEEDED` and cannot be
+reused. Terminal network failures preserve the same logical request.
+Successful, aborted, disposed, and non-replayable operations reject manual
+retry. `Retry-After` never exceeds `RetryPolicy.maximum_delay`.
 
 Optional backends import lazily; importing `/symbol.py` requires only Python
 3.14. Models are frozen, slotted dataclasses. Request methods use exact receipt
@@ -595,10 +604,11 @@ and error classes; raw arbitrary JSON alone remains dynamically typed.
 Management tokens remain caller-owned in-memory values. Context-manager exit
 closes owned transports exactly once and leaves borrowed clients open.
 
-Synchronous uploads accept bytes, text, `Path`, and `ByteReader`. Async uploads
-accept bytes, text, or a native `AsyncIterable[bytes]`; they deliberately reject
-`Path` and synchronous readers instead of hiding blocking file I/O in worker
-threads. Responses stream through `iter_bytes`/`aiter_bytes`.
+Synchronous uploads and `ByteSplice` insertions accept bytes, text, `Path`, and
+`ByteReader`. Async uploads and `AsyncByteSplice` insertions accept bytes, text,
+or a native `AsyncIterable[bytes]`; they deliberately reject `Path` and
+synchronous readers instead of hiding blocking file I/O in worker threads.
+Responses stream through `iter_bytes`/`aiter_bytes`.
 
 Successful operations cannot be retried. Failed replayable HTTP and network
 operations preserve immutable attempt history, idempotency identity, and
@@ -630,7 +640,10 @@ and `release`; file clients expose `patch`.
 
 ## Complete workflow
 
+<!-- EXEC:PYTHON:START -->
 ```python
+import os
+
 from symbol_api import (
     AliasDefinition,
     CreateFileOptions,
@@ -641,7 +654,7 @@ from symbol_api import (
     Symbol,
 )
 
-origin = "http://127.0.0.1:4341"
+origin = os.environ["SYMBOL_BASE"]
 
 with Symbol(origin=origin, retry_policy=RetryPolicies.DEFAULT) as symbol:
     created = symbol.create(
@@ -684,6 +697,7 @@ with Symbol(origin=origin, retry_policy=RetryPolicies.DEFAULT) as symbol:
     if stack.entries:
         site.undo(stack.entries[0].token)
 ```
+<!-- EXEC:PYTHON:END -->
 <!-- API:PYTHON:END -->
 
 <!-- API:SHELL:START -->
@@ -946,6 +960,7 @@ Records older than seven days are pruned.
 
 ## Complete workflow
 
+<!-- EXEC:SHELL:START -->
 ```sh
 # Publish a folder to a chosen name.
 symbol put demo ./dist
@@ -977,6 +992,7 @@ symbol undo demo-next
 # Download without deleting.
 symbol get demo-next demo-next.zip
 ```
+<!-- EXEC:SHELL:END -->
 <!-- API:SHELL:END -->
 
 <!-- API:PROTOCOL:START -->

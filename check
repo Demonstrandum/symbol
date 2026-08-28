@@ -39,6 +39,7 @@ uv --project tooling run --frozen ruff format --check --config tooling/pyproject
 uv --project tooling run --frozen python tests/sdk/py/runtime.py
 uv --project tooling run --frozen python tests/sdk/py/optional.py
 uv --project tooling run --frozen python tests/sdk/py/real.py
+uv --project tooling run --frozen python tests/manual_examples.py
 sh -n static/symbol.sh
 sh -n tests/symbol_client.sh
 sh -n tests/alias_transfer_e2e.sh
