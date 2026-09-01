@@ -162,7 +162,8 @@ delete omitted paths. `ifMatch` provides optimistic whole-site concurrency.
 ### `files(path?)`
 
 With no path, returns the exact inventory: files, aliases, content revision,
-tree hash, and cache metadata. With a path, returns a browsable subtree.
+tree hash, creation/update timestamps, the publish timeline, and cache
+metadata. With a path, returns a browsable subtree.
 
 ### `archive(format?)` and `pop(format?)`
 
@@ -1479,10 +1480,14 @@ Content-Revision: 4
 Cache-Control: no-cache
 Content-Type: application/json
 
-{"site":"hello","content_revision":4,"tree_hash":"blake3:<tree hash>","files":[{"path":"index.html","hash":"blake3:<file hash>","size":14}]}
+{"site":"hello","created_at":"2026-01-02T03:04:05Z","updated_at":"2026-01-02T03:04:05Z","content_revision":4,"tree_hash":"blake3:<tree hash>","events":[{"kind":"created","at":"2026-01-02T03:04:05Z","files":0}],"files":[{"path":"index.html","hash":"blake3:<file hash>","size":14}],"aliases":[]}
 ```
 
 Inventory files are sorted by path and exclude generated `symbol.toml`.
+`created_at` is null for sites created before this field existed. `events` is
+the newest-first publish timeline (`created`, `publish`, `rename`, `restore`),
+capped at 100 entries, where `files` counts changed paths. GET responses carry
+`Last-Modified` from the site's last publish time.
 The inventory JSON path does not process `If-None-Match`; it always returns
 `200`. Without JSON Accept, this route returns a cached body listing with the
 listing schema below.

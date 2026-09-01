@@ -7,7 +7,7 @@ use sea_query::{
     IndexCreateStatement, IntoIden, IntoTableRef, SqliteQueryBuilder, Table, TableCreateStatement,
 };
 
-pub const LATEST_SCHEMA_VERSION: i64 = 9;
+pub const LATEST_SCHEMA_VERSION: i64 = 10;
 pub const FILE_ENTRY_KIND: i64 = 0;
 pub const ALLOCATED_ENTRY_KIND: i64 = 1;
 pub const ALIAS_ENTRY_KIND: i64 = 2;
@@ -17,6 +17,7 @@ enum Sites {
     Table,
     Id,
     Name,
+    Created,
     Updated,
     PublicUrl,
     ContentRevision,
@@ -155,6 +156,16 @@ enum UndoAliasDeltas {
 }
 
 #[derive(Iden)]
+enum SiteEvents {
+    Table,
+    Id,
+    SiteId,
+    Kind,
+    Occurred,
+    Files,
+}
+
+#[derive(Iden)]
 enum Metadata {
     Table,
     Key,
@@ -186,6 +197,7 @@ enum UndoSites {
     Name,
     Existed,
     PublicUrl,
+    Created,
     Updated,
     ContentRevision,
     TreeHash,
@@ -285,6 +297,7 @@ pub fn tables() -> Vec<TableCreateStatement> {
     vec![
         sites_table(),
         blobs_table(),
+        site_events_table(),
         site_entries_table(),
         files_table(),
         metadata_table(),
@@ -376,6 +389,11 @@ pub fn indexes() -> Vec<IndexCreateStatement> {
             [Aliases::SiteId, Aliases::CanonicalTarget],
         ),
         index(
+            "site_events_site",
+            SiteEvents::Table,
+            [SiteEvents::SiteId, SiteEvents::Occurred],
+        ),
+        index(
             "aliases_cache",
             Aliases::Table,
             [
@@ -406,13 +424,13 @@ pub fn schema_sql() -> String {
 
 pub fn schema_v6_sql() -> String {
     let tables = vec![
-        sites_table(),
+        sites_v6_table(),
         blobs_table(),
         files_v6_table(),
         metadata_table(),
         undo_operations_table(),
         undo_names_table(),
-        undo_sites_table(),
+        undo_sites_v6_table(),
         undo_files_table(),
         expiry_policies_table(),
         undo_expiry_policies_table(),
@@ -610,6 +628,28 @@ pub fn upgrade_v7_to_v8() -> Vec<String> {
     ]
 }
 
+pub fn upgrade_v9_to_v10() -> Vec<String> {
+    vec![
+        Table::alter()
+            .table(Sites::Table)
+            .add_column(ColumnDef::new(Sites::Created).integer())
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        Table::alter()
+            .table(UndoSites::Table)
+            .add_column(ColumnDef::new(UndoSites::Created).integer())
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        site_events_table().to_string(SqliteQueryBuilder),
+        index(
+            "site_events_site",
+            SiteEvents::Table,
+            [SiteEvents::SiteId, SiteEvents::Occurred],
+        )
+        .to_string(SqliteQueryBuilder),
+    ]
+}
+
 pub fn upgrade_v8_to_v9() -> Vec<String> {
     vec![
         Table::rename()
@@ -678,6 +718,12 @@ pub fn upgrade_v8_to_v9() -> Vec<String> {
 #[cfg(test)]
 pub fn downgrade_v9_to_v6_before_copy() -> Vec<String> {
     vec![
+        Table::drop()
+            .table(SiteEvents::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        "ALTER TABLE \"sites\" DROP COLUMN \"created\"".to_string(),
+        "ALTER TABLE \"undo_sites\" DROP COLUMN \"created\"".to_string(),
         Table::drop()
             .table(UndoAliasDeltas::Table)
             .to_owned()
@@ -818,6 +864,7 @@ fn sites_table() -> TableCreateStatement {
         .if_not_exists()
         .col(ColumnDef::new(Sites::Id).integer().primary_key())
         .col(ColumnDef::new(Sites::Name).text().not_null().unique_key())
+        .col(ColumnDef::new(Sites::Created).integer())
         .col(ColumnDef::new(Sites::Updated).integer().not_null())
         .col(
             ColumnDef::new(Sites::PublicUrl)
@@ -846,6 +893,29 @@ fn sites_table() -> TableCreateStatement {
                 .integer()
                 .not_null()
                 .default(0),
+        )
+        .to_owned()
+}
+
+fn site_events_table() -> TableCreateStatement {
+    Table::create()
+        .table(SiteEvents::Table)
+        .if_not_exists()
+        .col(ColumnDef::new(SiteEvents::Id).integer().primary_key())
+        .col(ColumnDef::new(SiteEvents::SiteId).integer().not_null())
+        .col(ColumnDef::new(SiteEvents::Kind).integer().not_null())
+        .col(ColumnDef::new(SiteEvents::Occurred).integer().not_null())
+        .col(
+            ColumnDef::new(SiteEvents::Files)
+                .integer()
+                .not_null()
+                .default(0),
+        )
+        .foreign_key(
+            ForeignKey::create()
+                .from(SiteEvents::Table, SiteEvents::SiteId)
+                .to(Sites::Table, Sites::Id)
+                .on_delete(ForeignKeyAction::Cascade),
         )
         .to_owned()
 }
@@ -897,6 +967,68 @@ fn files_table() -> TableCreateStatement {
             ForeignKey::create()
                 .from(Files::Table, Files::Hash)
                 .to(Blobs::Table, Blobs::Hash),
+        )
+        .to_owned()
+}
+
+fn sites_v6_table() -> TableCreateStatement {
+    Table::create()
+        .table(Sites::Table)
+        .if_not_exists()
+        .col(ColumnDef::new(Sites::Id).integer().primary_key())
+        .col(ColumnDef::new(Sites::Name).text().not_null().unique_key())
+        .col(ColumnDef::new(Sites::Updated).integer().not_null())
+        .col(
+            ColumnDef::new(Sites::PublicUrl)
+                .text()
+                .not_null()
+                .default(""),
+        )
+        .col(
+            ColumnDef::new(Sites::ContentRevision)
+                .integer()
+                .not_null()
+                .default(0),
+        )
+        .col(
+            ColumnDef::new(Sites::TreeHash)
+                .text()
+                .not_null()
+                .default(""),
+        )
+        .col(ColumnDef::new(Sites::CreatorKind).integer())
+        .col(ColumnDef::new(Sites::CreatorHash).blob())
+        .col(ColumnDef::new(Sites::ClaimHash).blob())
+        .col(ColumnDef::new(Sites::ManagementHash).blob())
+        .col(
+            ColumnDef::new(Sites::ManagementStatus)
+                .integer()
+                .not_null()
+                .default(0),
+        )
+        .to_owned()
+}
+
+fn undo_sites_v6_table() -> TableCreateStatement {
+    Table::create()
+        .table(UndoSites::Table)
+        .if_not_exists()
+        .col(ColumnDef::new(UndoSites::Token).text().primary_key())
+        .col(ColumnDef::new(UndoSites::Name).text().not_null())
+        .col(ColumnDef::new(UndoSites::Existed).integer().not_null())
+        .col(ColumnDef::new(UndoSites::PublicUrl).text().not_null())
+        .col(ColumnDef::new(UndoSites::Updated).integer().not_null())
+        .col(
+            ColumnDef::new(UndoSites::ContentRevision)
+                .integer()
+                .not_null(),
+        )
+        .col(ColumnDef::new(UndoSites::TreeHash).text().not_null())
+        .foreign_key(
+            ForeignKey::create()
+                .from(UndoSites::Table, UndoSites::Token)
+                .to(UndoOperations::Table, UndoOperations::Token)
+                .on_delete(ForeignKeyAction::Cascade),
         )
         .to_owned()
 }
@@ -1007,6 +1139,7 @@ fn undo_sites_table() -> TableCreateStatement {
         .col(ColumnDef::new(UndoSites::Name).text().not_null())
         .col(ColumnDef::new(UndoSites::Existed).integer().not_null())
         .col(ColumnDef::new(UndoSites::PublicUrl).text().not_null())
+        .col(ColumnDef::new(UndoSites::Created).integer())
         .col(ColumnDef::new(UndoSites::Updated).integer().not_null())
         .col(
             ColumnDef::new(UndoSites::ContentRevision)

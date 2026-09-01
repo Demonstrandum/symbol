@@ -4607,10 +4607,29 @@ pub struct InventoryAlias {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SiteInventory {
     pub site: String,
+    pub created_at: Option<String>,
+    pub updated_at: String,
     pub content_revision: u64,
     pub tree_hash: String,
+    pub events: Vec<SiteEvent>,
     pub files: Vec<InventoryFile>,
     pub aliases: Vec<InventoryAlias>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SiteEventKind {
+    Created,
+    Publish,
+    Rename,
+    Restore,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct SiteEvent {
+    pub kind: SiteEventKind,
+    pub at: String,
+    pub files: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

@@ -1,9 +1,11 @@
 -- AUTO-GENERATED FROM crates/symbol/src/database/schema.rs
 PRAGMA foreign_keys = ON;
 
-CREATE TABLE IF NOT EXISTS "sites" ( "id" integer PRIMARY KEY, "name" text NOT NULL UNIQUE, "updated" integer NOT NULL, "public_url" text NOT NULL DEFAULT '', "content_revision" integer NOT NULL DEFAULT 0, "tree_hash" text NOT NULL DEFAULT '', "creator_kind" integer, "creator_hash" blob, "claim_hash" blob, "management_hash" blob, "management_status" integer NOT NULL DEFAULT 0 );
+CREATE TABLE IF NOT EXISTS "sites" ( "id" integer PRIMARY KEY, "name" text NOT NULL UNIQUE, "created" integer, "updated" integer NOT NULL, "public_url" text NOT NULL DEFAULT '', "content_revision" integer NOT NULL DEFAULT 0, "tree_hash" text NOT NULL DEFAULT '', "creator_kind" integer, "creator_hash" blob, "claim_hash" blob, "management_hash" blob, "management_status" integer NOT NULL DEFAULT 0 );
 
 CREATE TABLE IF NOT EXISTS "blobs" ( "hash" text PRIMARY KEY, "bytes" blob NOT NULL DEFAULT x'', "size" integer NOT NULL );
+
+CREATE TABLE IF NOT EXISTS "site_events" ( "id" integer PRIMARY KEY, "site_id" integer NOT NULL, "kind" integer NOT NULL, "occurred" integer NOT NULL, "files" integer NOT NULL DEFAULT 0, FOREIGN KEY ("site_id") REFERENCES "sites" ("id") ON DELETE CASCADE );
 
 CREATE TABLE IF NOT EXISTS "site_entries" ( "site_id" integer NOT NULL, "path" text NOT NULL, "kind" integer NOT NULL, PRIMARY KEY ("site_id", "path"), UNIQUE ("site_id", "path", "kind"), FOREIGN KEY ("site_id") REFERENCES "sites" ("id") ON DELETE CASCADE );
 
@@ -15,7 +17,7 @@ CREATE TABLE IF NOT EXISTS "undo_operations" ( "token" text PRIMARY KEY, "kind" 
 
 CREATE TABLE IF NOT EXISTS "undo_names" ( "token" text NOT NULL, "name" text NOT NULL, PRIMARY KEY ("token", "name"), FOREIGN KEY ("token") REFERENCES "undo_operations" ("token") ON DELETE CASCADE );
 
-CREATE TABLE IF NOT EXISTS "undo_sites" ( "token" text PRIMARY KEY, "name" text NOT NULL, "existed" integer NOT NULL, "public_url" text NOT NULL, "updated" integer NOT NULL, "content_revision" integer NOT NULL, "tree_hash" text NOT NULL, FOREIGN KEY ("token") REFERENCES "undo_operations" ("token") ON DELETE CASCADE );
+CREATE TABLE IF NOT EXISTS "undo_sites" ( "token" text PRIMARY KEY, "name" text NOT NULL, "existed" integer NOT NULL, "public_url" text NOT NULL, "created" integer, "updated" integer NOT NULL, "content_revision" integer NOT NULL, "tree_hash" text NOT NULL, FOREIGN KEY ("token") REFERENCES "undo_operations" ("token") ON DELETE CASCADE );
 
 CREATE TABLE IF NOT EXISTS "undo_files" ( "token" text NOT NULL, "path" text NOT NULL, "hash" text NOT NULL, "size" integer NOT NULL, PRIMARY KEY ("token", "path"), FOREIGN KEY ("token") REFERENCES "undo_operations" ("token") ON DELETE CASCADE, FOREIGN KEY ("hash") REFERENCES "blobs" ("hash") );
 
@@ -58,6 +60,7 @@ CREATE INDEX IF NOT EXISTS "management_idempotency_expiry" ON "management_idempo
 CREATE INDEX IF NOT EXISTS "management_audit_site" ON "management_audit" ("site_name", "occurred");
 CREATE INDEX IF NOT EXISTS "pending_allocations_expiry" ON "pending_allocations" ("expires");
 CREATE INDEX IF NOT EXISTS "aliases_dependency" ON "aliases" ("site_id", "canonical_target");
+CREATE INDEX IF NOT EXISTS "site_events_site" ON "site_events" ("site_id", "occurred");
 CREATE INDEX IF NOT EXISTS "aliases_cache" ON "aliases" ("site_id", "resolved_kind", "resolved_hash", "resolved_size");
 
-PRAGMA user_version = 9;
+PRAGMA user_version = 10;

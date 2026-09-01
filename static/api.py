@@ -1514,11 +1514,21 @@ class AliasInventoryEntry:
 
 
 @dataclass(frozen=True, slots=True)
+class SiteEvent:
+    kind: str
+    at: datetime
+    files: int
+
+
+@dataclass(frozen=True, slots=True)
 class FileInventory:
     site: SiteName
+    created_at: datetime | None
+    updated_at: datetime
     content_revision: int
     tree_hash: TreeHash
     etag: EntityTag
+    events: tuple[SiteEvent, ...]
     files: tuple[FileEntry, ...]
     aliases: tuple[AliasInventoryEntry, ...]
 
@@ -2045,14 +2055,31 @@ def _file_inventory(response: ApiResponse) -> FileInventory:
         raise MalformedResponseError(response) from error
     return FileInventory(
         _string(value["site"], response),
+        _date(value["created_at"], response),
+        _date(value["updated_at"], response),
         _integer(value["content_revision"], response),
         TreeHash(_string(value["tree_hash"], response)),
         parsed_etag,
+        tuple(
+            _site_event(item, response) for item in _array(value["events"], response)
+        ),
         tuple(_file_entry(item, response) for item in _array(value["files"], response)),
         tuple(
             _alias_inventory_entry(item, response)
             for item in _array(value["aliases"], response)
         ),
+    )
+
+
+def _site_event(value: object, response: ApiResponse) -> SiteEvent:
+    entry = _exact_object(value, ("kind", "at", "files"), response)
+    kind = _string(entry["kind"], response)
+    if kind not in ("created", "publish", "rename", "restore"):
+        raise MalformedResponseError(response)
+    return SiteEvent(
+        kind=kind,
+        at=_date(entry["at"], response),
+        files=_integer(entry["files"], response),
     )
 
 
