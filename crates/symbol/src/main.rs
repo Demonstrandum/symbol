@@ -2572,6 +2572,17 @@ async fn send_expiring_blob(
         app,
     )
     .await;
+    let updated = app
+        .run_store({
+            let name = name.to_string();
+            move |store| Ok(store.site_updated_at(&name))
+        })
+        .await
+        .ok()
+        .flatten();
+    if let Some(updated) = updated {
+        insert_last_modified_header(response.headers_mut(), updated);
+    }
     insert_expiry_headers(response.headers_mut(), &report);
     response
 }
@@ -2869,6 +2880,25 @@ fn insert_undo_headers(headers: &mut HeaderMap, undo: &store::UndoInfo) {
     headers.insert(
         "undo-expires",
         HeaderValue::from_str(&undo.expires_at).expect("valid undo expiry"),
+    );
+}
+
+fn insert_last_modified_header(headers: &mut HeaderMap, updated_millis: i64) {
+    let http_date = time::OffsetDateTime::from_unix_timestamp_nanos(
+        i128::from(updated_millis) * 1_000_000,
+    )
+    .expect("site timestamp is representable")
+    .to_offset(time::UtcOffset::UTC)
+    .format(
+        &time::format_description::parse_borrowed::<2>(
+            "[weekday repr:short], [day padding:zero] [month repr:short] [year] [hour]:[minute]:[second] GMT",
+        )
+        .expect("valid HTTP date format"),
+    )
+    .expect("site date is representable");
+    headers.insert(
+        header::LAST_MODIFIED,
+        HeaderValue::from_str(&http_date).expect("valid Last-Modified header"),
     );
 }
 

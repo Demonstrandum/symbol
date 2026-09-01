@@ -791,8 +791,16 @@ function validateSchema(schema, value) {
             assert(Array.isArray(object.entries));
             return;
         case "file_inventory":
-            exactKeys(object, ["site", "content_revision", "tree_hash", "files", "aliases"], schema);
+            exactKeys(object, [
+                "site", "created_at", "updated_at", "content_revision", "tree_hash", "events",
+                "files", "aliases",
+            ], schema);
             assert.match(object.tree_hash, /^blake3:[0-9a-f]{64}$/);
+            assert(Array.isArray(object.events));
+            object.events.forEach((event) => {
+                exactKeys(event, ["kind", "at", "files"], schema);
+                assert(["created", "publish", "rename", "restore"].includes(event.kind));
+            });
             return;
         case "undo_stack":
             exactKeys(object, ["site", "entries"], schema);
@@ -1372,8 +1380,11 @@ function listingFixture(includeBuiltin = false) {
 function inventoryFixture() {
     return {
         site: "hello",
+        created_at: "2026-08-26T12:00:00Z",
+        updated_at: "2026-08-26T12:00:00Z",
         content_revision: 1,
         tree_hash: treeHash(),
+        events: [{ kind: "created", at: "2026-08-26T12:00:00Z", files: 0 }],
         files: [{ path: "index.html", hash: `blake3:${"a".repeat(64)}`, size: 8 }],
         aliases: [],
     };

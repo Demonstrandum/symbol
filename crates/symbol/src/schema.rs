@@ -2,6 +2,7 @@ diesel::table! {
     sites (id) {
         id -> BigInt,
         name -> Text,
+        created -> Nullable<BigInt>,
         updated -> BigInt,
         public_url -> Text,
         content_revision -> BigInt,
@@ -67,11 +68,22 @@ diesel::table! {
 }
 
 diesel::table! {
+    site_events (id) {
+        id -> BigInt,
+        site_id -> BigInt,
+        kind -> BigInt,
+        occurred -> BigInt,
+        files -> BigInt,
+    }
+}
+
+diesel::table! {
     undo_sites (token) {
         token -> Text,
         name -> Text,
         existed -> BigInt,
         public_url -> Text,
+        created -> Nullable<BigInt>,
         updated -> BigInt,
         content_revision -> BigInt,
         tree_hash -> Text,
@@ -248,6 +260,7 @@ diesel::table! {
 }
 
 diesel::joinable!(site_entries -> sites (site_id));
+diesel::joinable!(site_events -> sites (site_id));
 diesel::joinable!(files -> sites (site_id));
 diesel::joinable!(files -> blobs (hash));
 diesel::joinable!(expiry_policies -> sites (site_id));
@@ -261,6 +274,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     sites,
     blobs,
     site_entries,
+    site_events,
     files,
     metadata,
     undo_operations,

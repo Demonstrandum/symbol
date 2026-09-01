@@ -22,7 +22,8 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 pub use symbol_contract::{
     AliasTargetKind, CacheStats, InventoryAlias, InventoryFile, ManagementStatus, ReaderStats,
-    ServingStats, SiteInventory, SizeDistribution, Stats, UndoEntry, UndoStack,
+    ServingStats, SiteEvent, SiteEventKind, SiteInventory, SizeDistribution, Stats, UndoEntry,
+    UndoStack,
 };
 
 use crate::blob_store::BlobFiles;
@@ -38,8 +39,9 @@ use crate::sanitize::{self, TokenCounts};
 use crate::schema::{
     aliases, allocated_entries, blobs, expiry_policies, files, idempotency_records,
     management_audit, management_idempotency, management_tombstones, metadata, path_aggregates,
-    pending_allocations, site_entries, sites, undo_alias_deltas, undo_allocated_deltas,
-    undo_expiry_policies, undo_file_deltas, undo_files, undo_names, undo_operations, undo_sites,
+    pending_allocations, site_entries, site_events, sites, undo_alias_deltas,
+    undo_allocated_deltas, undo_expiry_policies, undo_file_deltas, undo_files, undo_names,
+    undo_operations, undo_sites,
 };
 use crate::secrets::{ClaimToken, ClaimTokenHash, ManagementToken, ManagementTokenHash};
 #[cfg(test)]
@@ -142,6 +144,7 @@ struct ManagementSiteRow {
 #[diesel(table_name = sites)]
 struct NewSite<'a> {
     name: &'a str,
+    created: Option<i64>,
     updated: i64,
     public_url: &'a str,
     content_revision: i64,
@@ -1545,6 +1548,23 @@ impl Store {
         let mut snapshot = DbTransaction::begin(&mut db)?;
         let (revision, tree_hash) = site_revision_locked(&mut snapshot, name)?;
         let site_id = site_id_locked(&mut snapshot, name)?;
+        let (created, updated) = sites::table
+            .find(site_id)
+            .select((sites::created, sites::updated))
+            .first::<(Option<i64>, i64)>(&mut *snapshot)?;
+        let events = site_events::table
+            .filter(site_events::site_id.eq(site_id))
+            .order((site_events::occurred.desc(), site_events::id.desc()))
+            .limit(100)
+            .select((site_events::kind, site_events::occurred, site_events::files))
+            .load::<(i64, i64, i64)>(&mut *snapshot)?
+            .into_iter()
+            .map(|(kind, occurred, files)| SiteEvent {
+                kind: site_event_kind(kind),
+                at: format_timestamp(occurred),
+                files: files.max(0).cast_unsigned(),
+            })
+            .collect();
         let rows = files::table
             .filter(files::site_id.eq(site_id))
             .filter(files::path.ne(MANIFEST_PATH))
@@ -1598,11 +1618,26 @@ impl Store {
         snapshot.commit()?;
         Ok(SiteInventory {
             site: name.to_string(),
+            created_at: created.map(format_timestamp),
+            updated_at: format_timestamp(updated),
             content_revision: revision,
             tree_hash,
+            events,
             files: inventory,
             aliases,
         })
+    }
+
+    pub fn site_updated_at(&self, name: &str) -> Option<i64> {
+        let Ok(name) = parse_site_name(name) else {
+            return None;
+        };
+        let mut db = self.inner.readers.get();
+        sites::table
+            .filter(sites::name.eq(name))
+            .select(sites::updated)
+            .first::<i64>(&mut *db)
+            .ok()
     }
 
     pub fn site_exists(&self, name: &str) -> bool {
@@ -2033,6 +2068,13 @@ impl Store {
                 sites::content_revision.eq(sites::content_revision + 1),
             ))
             .execute(&mut *tx)?;
+        record_site_event(
+            &mut tx,
+            site_id,
+            StoredSiteEventKind::Publish,
+            changed_paths.len(),
+            now,
+        )?;
         let alias_changes = changed_paths
             .iter()
             .map(|path| AliasChange::Alias(path))
@@ -3228,6 +3270,7 @@ impl Store {
         let destination_id = diesel::insert_into(sites::table)
             .values(NewSite {
                 name: &destination,
+                created: Some(now),
                 updated: now,
                 public_url: &public_url,
                 content_revision: revision,
@@ -3440,6 +3483,7 @@ impl Store {
             .filter(sites::name.eq(destination))
             .select((sites::id, sites::content_revision))
             .first::<(i64, i64)>(&mut *tx)?;
+        record_site_event(&mut tx, site_id, StoredSiteEventKind::Rename, 0, now)?;
         let files = site_entries::table
             .filter(site_entries::site_id.eq(site_id))
             .filter(site_entries::path.ne(MANIFEST_PATH))
@@ -3905,6 +3949,7 @@ impl Store {
         diesel::insert_into(sites::table)
             .values(NewSite {
                 name,
+                created: (!existed).then_some(now),
                 updated: now,
                 public_url: &self.inner.public_url,
                 content_revision: 0,
@@ -3920,6 +3965,9 @@ impl Store {
             .on_conflict_do_nothing()
             .execute(tx)?;
         let site_id = site_id_locked(tx, name)?;
+        if !existed {
+            record_site_event(tx, site_id, StoredSiteEventKind::Created, 0, now)?;
+        }
         for file in files {
             let previous_size = files::table
                 .find((site_id, file.path.as_str()))
@@ -3989,6 +4037,13 @@ impl Store {
         diesel::update(sites::table.find(site_id))
             .set((sites::updated.eq(now), sites::content_revision.eq(revision)))
             .execute(tx)?;
+        record_site_event(
+            tx,
+            site_id,
+            StoredSiteEventKind::Publish,
+            changed_paths.len(),
+            now,
+        )?;
         let alias_changes = files
             .iter()
             .map(|file| AliasChange::Entry(file.path.as_str()))
@@ -4772,22 +4827,24 @@ impl Store {
                 restored_at: format_timestamp(restored),
             });
         }
-        let (snapshot_name, existed, public_url, updated, content_revision, tree_hash) =
+        let (snapshot_name, existed, public_url, created, updated, content_revision, tree_hash) =
             undo_sites::table
                 .find(&latest)
                 .select((
                     undo_sites::name,
                     undo_sites::existed,
                     undo_sites::public_url,
+                    undo_sites::created,
                     undo_sites::updated,
                     undo_sites::content_revision,
                     undo_sites::tree_hash,
                 ))
-                .first::<(String, i64, String, i64, i64, String)>(&mut *tx)?;
+                .first::<(String, i64, String, Option<i64>, i64, i64, String)>(&mut *tx)?;
         let snapshot = SiteSnapshot {
             name: snapshot_name,
             existed: existed != 0,
             public_url,
+            created,
             updated,
             content_revision,
             tree_hash,
@@ -4804,6 +4861,7 @@ impl Store {
             let site_id = diesel::insert_into(sites::table)
                 .values(NewSite {
                     name: &snapshot.name,
+                    created: snapshot.created,
                     updated: snapshot.updated,
                     public_url: &snapshot.public_url,
                     content_revision: snapshot.content_revision,
@@ -4933,6 +4991,13 @@ impl Store {
             restore_expiry_policies_locked(&mut tx, &latest, site_id)?;
             rebuild_aggregates_locked(&mut tx, site_id)?;
             regenerate_site(&mut tx, &self.inner.blob_files, site_id, snapshot.updated)?;
+            record_site_event(
+                &mut tx,
+                site_id,
+                StoredSiteEventKind::Restore,
+                0,
+                snapshot.updated,
+            )?;
             let tombstone_names = undo_names::table
                 .filter(undo_names::token.eq(&latest))
                 .select(undo_names::name)
@@ -5331,6 +5396,54 @@ enum UndoKind {
     Alias = 12,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i64)]
+enum StoredSiteEventKind {
+    Created = 1,
+    Publish = 2,
+    Rename = 3,
+    Restore = 4,
+}
+
+impl StoredSiteEventKind {
+    const fn from_code(value: i64) -> Option<Self> {
+        match value {
+            1 => Some(Self::Created),
+            2 => Some(Self::Publish),
+            3 => Some(Self::Rename),
+            4 => Some(Self::Restore),
+            _ => None,
+        }
+    }
+
+    const fn contract(self) -> SiteEventKind {
+        match self {
+            Self::Created => SiteEventKind::Created,
+            Self::Publish => SiteEventKind::Publish,
+            Self::Rename => SiteEventKind::Rename,
+            Self::Restore => SiteEventKind::Restore,
+        }
+    }
+}
+
+fn record_site_event(
+    tx: &mut SqliteConnection,
+    site_id: i64,
+    kind: StoredSiteEventKind,
+    files: usize,
+    now: i64,
+) -> Result<(), diesel::result::Error> {
+    diesel::insert_into(site_events::table)
+        .values((
+            site_events::site_id.eq(site_id),
+            site_events::kind.eq(kind as i64),
+            site_events::occurred.eq(now),
+            site_events::files.eq(i64::try_from(files).unwrap_or(i64::MAX)),
+        ))
+        .execute(tx)?;
+    Ok(())
+}
+
 impl UndoKind {
     const fn as_str(self) -> &'static str {
         match self {
@@ -5413,6 +5526,7 @@ struct SiteSnapshot {
     name: String,
     existed: bool,
     public_url: String,
+    created: Option<i64>,
     updated: i64,
     content_revision: i64,
     tree_hash: String,
@@ -5965,6 +6079,7 @@ fn finish_entry_mutation(
             sites::content_revision.eq(sites::content_revision + 1),
         ))
         .execute(tx)?;
+    record_site_event(tx, site_id, StoredSiteEventKind::Publish, paths.len(), now)?;
     let alias_changes = paths
         .iter()
         .map(|path| AliasChange::Entry(path))
@@ -6982,25 +7097,28 @@ fn snapshot_site_with_description(
         .select((
             sites::name,
             sites::public_url,
+            sites::created,
             sites::updated,
             sites::content_revision,
             sites::tree_hash,
         ))
-        .first::<(String, String, i64, i64, String)>(tx)
+        .first::<(String, String, Option<i64>, i64, i64, String)>(tx)
         .optional()?
         .map_or_else(
             || SiteSnapshot {
                 name: name.to_string(),
                 existed: false,
                 public_url: String::new(),
+                created: None,
                 updated: now,
                 content_revision: 0,
                 tree_hash: String::new(),
             },
-            |(name, public_url, updated, content_revision, tree_hash)| SiteSnapshot {
+            |(name, public_url, created, updated, content_revision, tree_hash)| SiteSnapshot {
                 name,
                 existed: true,
                 public_url,
+                created,
                 updated,
                 content_revision,
                 tree_hash,
@@ -7012,6 +7130,7 @@ fn snapshot_site_with_description(
             undo_sites::name.eq(&site.name),
             undo_sites::existed.eq(i64::from(site.existed)),
             undo_sites::public_url.eq(&site.public_url),
+            undo_sites::created.eq(site.created),
             undo_sites::updated.eq(site.updated),
             undo_sites::content_revision.eq(site.content_revision),
             undo_sites::tree_hash.eq(&site.tree_hash),
@@ -7113,22 +7232,24 @@ fn snapshot_entry_deltas(
     diesel::insert_into(undo_names::table)
         .values((undo_names::token.eq(&token), undo_names::name.eq(name)))
         .execute(tx)?;
-    let (site_id, public_url, updated, content_revision, tree_hash) = sites::table
+    let (site_id, public_url, created, updated, content_revision, tree_hash) = sites::table
         .filter(sites::name.eq(name))
         .select((
             sites::id,
             sites::public_url,
+            sites::created,
             sites::updated,
             sites::content_revision,
             sites::tree_hash,
         ))
-        .first::<(i64, String, i64, i64, String)>(tx)?;
+        .first::<(i64, String, Option<i64>, i64, i64, String)>(tx)?;
     diesel::insert_into(undo_sites::table)
         .values((
             undo_sites::token.eq(&token),
             undo_sites::name.eq(name),
             undo_sites::existed.eq(1_i64),
             undo_sites::public_url.eq(public_url),
+            undo_sites::created.eq(created),
             undo_sites::updated.eq(updated),
             undo_sites::content_revision.eq(content_revision),
             undo_sites::tree_hash.eq(tree_hash),
@@ -7371,6 +7492,7 @@ fn restore_entry_deltas(
         .collect::<Vec<_>>();
     refresh_aliases_locked(tx, site_id, &alias_changes)?;
     regenerate_site(tx, blob_files, site_id, updated)?;
+    record_site_event(tx, site_id, StoredSiteEventKind::Restore, 0, updated)?;
     Ok(updated)
 }
 
@@ -8405,6 +8527,12 @@ fn undo_token() -> Result<String, StoreError> {
 
 fn toml_escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn site_event_kind(kind: i64) -> SiteEventKind {
+    let stored = StoredSiteEventKind::from_code(kind)
+        .unwrap_or_else(|| panic!("stored site event kind {kind} is unknown"));
+    stored.contract()
 }
 
 fn format_timestamp(millis: i64) -> String {
@@ -11541,6 +11669,7 @@ mod tests {
         diesel::insert_into(sites::table)
             .values(NewSite {
                 name: "existing",
+                created: Some(1),
                 updated: 1,
                 public_url: "https://symbol.example",
                 content_revision: 7,
@@ -11602,6 +11731,7 @@ mod tests {
         diesel::insert_into(sites::table)
             .values(NewSite {
                 name: "legacy",
+                created: Some(1),
                 updated: 1,
                 public_url: "https://symbol.example",
                 content_revision: 2,
@@ -12278,6 +12408,7 @@ mod tests {
             let site_id = diesel::insert_into(sites::table)
                 .values(NewSite {
                     name: "hello",
+                    created: Some(0),
                     updated: 0,
                     public_url: "",
                     content_revision: 0,

@@ -705,11 +705,22 @@ export interface AliasInventoryEntry {
 
 export interface FileInventory {
   readonly site: string;
+  readonly createdAt: Date | null;
+  readonly updatedAt: Date;
   readonly contentRevision: number;
   readonly treeHash: TreeHash;
+  readonly events: readonly SiteEvent[];
   readonly etag: EntityTag;
   readonly files: readonly FileEntry[];
   readonly aliases: readonly AliasInventoryEntry[];
+}
+
+export type SiteEventKind = "created" | "publish" | "rename" | "restore";
+
+export interface SiteEvent {
+  readonly kind: SiteEventKind;
+  readonly at: Date;
+  readonly files: number;
 }
 
 export type DirectoryEntry =
@@ -4493,7 +4504,16 @@ async function decodeCachedDirectoryListing(response: Response): Promise<CachedD
 async function decodeFileInventory(response: Response): Promise<FileInventory> {
   const value = exactRecord(
     await jsonValue(response),
-    ["site", "content_revision", "tree_hash", "files", "aliases"],
+    [
+      "site",
+      "created_at",
+      "updated_at",
+      "content_revision",
+      "tree_hash",
+      "events",
+      "files",
+      "aliases",
+    ],
     "file inventory",
   );
   const files = array(value.files, "file inventory.files").map((entry, index) => {
@@ -4509,6 +4529,9 @@ async function decodeFileInventory(response: Response): Promise<FileInventory> {
   );
   const contentRevision = unsigned(value.content_revision, "file inventory.content_revision");
   const treeHash = treeHashValue(value.tree_hash, "file inventory.tree_hash");
+  const events = array(value.events, "file inventory.events").map((entry, index) =>
+    decodeSiteEvent(entry, `file inventory.events[${index}]`),
+  );
   if (
     unsignedHeader(response, "Content-Revision") !== contentRevision ||
     quotedTreeHashHeader(response, "ETag") !== treeHash
@@ -4518,11 +4541,27 @@ async function decodeFileInventory(response: Response): Promise<FileInventory> {
   requireCacheControl(response);
   return Object.freeze({
     site: stringValue(value.site, "file inventory.site"),
+    createdAt: nullableDate(value.created_at, "file inventory.created_at"),
+    updatedAt: dateValue(value.updated_at, "file inventory.updated_at"),
     contentRevision,
     treeHash,
+    events: Object.freeze(events),
     etag: requiredHeader(response, "ETag"),
     files: Object.freeze(files),
     aliases: Object.freeze(aliases),
+  });
+}
+
+function decodeSiteEvent(value: unknown, label: string): SiteEvent {
+  const record = exactRecord(value, ["kind", "at", "files"], label);
+  const kind = stringValue(record.kind, `${label}.kind`);
+  if (kind !== "created" && kind !== "publish" && kind !== "rename" && kind !== "restore") {
+    throw new TypeError(`${label}.kind must be a site event kind`);
+  }
+  return Object.freeze({
+    kind,
+    at: dateValue(record.at, `${label}.at`),
+    files: unsigned(record.files, `${label}.files`),
   });
 }
 
