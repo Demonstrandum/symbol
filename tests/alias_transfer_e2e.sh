@@ -82,7 +82,7 @@ inventory=$(curl -fsS -H 'Accept: application/json' \
   "${BASE}/e2e-alias/FILES")
 contains "${inventory}" '"path":"file-link"' &&
   [ "$(curl -fsS "${BASE}/e2e-alias/file-link")" = app-v1 ] &&
-  [ "$(curl -fsS "${BASE}/e2e-alias/dir-link/index.html")" = docs ] &&
+  [ "$(curl -fsSL "${BASE}/e2e-alias/dir-link/index.html")" = docs ] &&
   [ "$(curl -fsS "${BASE}/e2e-alias/chain")" = app-v1 ] ||
   fail 'tar upload preserves file directory and chained aliases'
 dangling_status=$(curl -sS -o /dev/null -w '%{http_code}' \
@@ -102,7 +102,7 @@ contains "${inventory}" '"path":"file-link"' &&
 [ "$(curl -fsS "${BASE}/e2e-alias/file-link")" = app-v1 ] ||
   fail 'ALIAS file fixture resolves'
 ok 'ALIAS file fixture resolves'
-dir_status=$(curl -sS -o "${ROOT}/dir-alias.out" -w '%{http_code}' \
+dir_status=$(curl -fsSL -o "${ROOT}/dir-alias.out" -w '%{http_code}' \
   "${BASE}/e2e-alias/dir-link/index.html")
 [ "${dir_status}" = 200 ] &&
   [ "$(cat "${ROOT}/dir-alias.out")" = docs ] ||
@@ -259,7 +259,7 @@ with zipfile.ZipFile(path, "w") as archive:
 PY
 "${CLIENT}" put -u e2e-zip "${ROOT}/work/upload.zip" >/dev/null
 [ "$(curl -fsS "${BASE}/e2e-zip/file-link")" = zip-app ] &&
-  [ "$(curl -fsS "${BASE}/e2e-zip/dir-link/index.html")" = zip-docs ] &&
+  [ "$(curl -fsSL "${BASE}/e2e-zip/dir-link/index.html")" = zip-docs ] &&
   [ "$(curl -fsS "${BASE}/e2e-zip/chain")" = zip-app ] ||
   fail 'ZIP upload preserves aliases'
 zip_dangling=$(curl -sS -o /dev/null -w '%{http_code}' \

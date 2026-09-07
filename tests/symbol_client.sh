@@ -83,6 +83,9 @@ case "$method:$url" in
   GET:*/UNDO)
     body='{"site":"hello","entries":[{"token":"tok1","description":"restore file","expires_at":"2027-01-01T00:00:00Z","remaining_seconds":100}]}'
     ;;
+  GET:*/STATS)
+    body='{"sites":1,"files":2,"bytes":10}'
+    ;;
   GET:*/symbol.toml)
     if [ "${MOCK_COMMON_ROOT_INVENTORY:-0}" = 1 ]; then
       body='version = 1
@@ -116,11 +119,14 @@ tree_hash = "blake3:new"
   GET:*/API/VERSION)
     body='{"api_version":"0.4.1","absolute_revision":12,"source_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","commit":"0123456789abcdef","dirty":true}'
     ;;
+  GET:http://mock/FILES)
+    body='{"path":"/","files":2,"bytes":10,"entries":[{"kind":"site","name":"hello","files":2,"bytes":10}]}'
+    ;;
   GET:*/FILES)
     if [ "${MOCK_LIST_ALIASES:-0}" = 1 ]; then
-      body='hello/       2 files   10 B
-file-link -> index.html
-dir-link -> assets'
+      body='{"site":"hello","content_revision":1,"tree_hash":"blake3:base","files":[],"aliases":[{"path":"file-link","target":"index.html","target_kind":"file"},{"path":"dir-link","target":"assets","target_kind":"directory"}]}'
+    elif [ "${MOCK_AWKWARD_NAMES:-0}" = 1 ]; then
+      body='{"site":"hello","content_revision":1,"tree_hash":"blake3:base","files":[{"path":"12 B.txt","hash":"blake3:local","size":3},{"path":"-leading.txt","hash":"blake3:local","size":1},{"path":"has -> arrow.txt","hash":"blake3:local","size":4},{"path":"my file.txt","hash":"blake3:local","size":5},{"path":"unicodé.txt","hash":"blake3:local","size":2}],"aliases":[{"path":"link","target":"my file.txt","target_kind":"file"}]}'
     elif [ "${MOCK_ALIAS_INVENTORY:-0}" = 1 ]; then
       body='{"site":"hello","content_revision":1,"tree_hash":"blake3:base","files":[{"path":"-leading","hash":"blake3:local","size":8},{"path":"assets/app.js","hash":"blake3:local","size":4},{"path":"docs/index.html","hash":"blake3:local","size":5}],"aliases":[{"path":"chain","target":"file-link","target_kind":"file"},{"path":"dangling","target":"missing","target_kind":null},{"path":"dir-link","target":"docs","target_kind":"directory"},{"path":"file-link","target":"assets/app.js","target_kind":"file"}]}'
     elif [ "${MOCK_COMMON_ROOT_INVENTORY:-0}" = 1 ]; then
@@ -307,6 +313,19 @@ contains "${help}" 'symbol api [--json]' &&
   ok 'api help names the json flag' ||
   not_ok 'api help names the json flag'
 
+help=$("${CLIENT}" help put)
+contains "${help}" '--replace replaces the whole site tree' &&
+  contains "${help}" 'puts merge into an existing site' &&
+  contains "${help}" 'there is no prompt' &&
+  ok 'put help names merge, replace, and no prompt' ||
+  not_ok 'put help names merge, replace, and no prompt'
+
+help=$("${CLIENT}" help rm)
+contains "${help}" 'there is no prompt' &&
+  contains "${help}" 'NAME deletes the whole site' &&
+  ok 'rm help names no prompt and site vs path delete' ||
+  not_ok 'rm help names no prompt and site vs path delete'
+
 : > "${LOG}"
 out=$("${CLIENT}" -t alias-token alias hello current/app.js ../assets/app.js)
 log=$(cat "${LOG}")
@@ -347,6 +366,83 @@ contains "${out}" 'http://mock/hello/file-link -> index.html' &&
   contains "${out}" 'http://mock/hello/dir-link -> assets' &&
   ok 'linked list output renders alias arrows' ||
   not_ok 'linked list output renders alias arrows'
+
+out=$(MOCK_AWKWARD_NAMES=1 "${CLIENT}" ls hello)
+contains "${out}" '12 B.txt' &&
+  contains "${out}" 'has -> arrow.txt' &&
+  contains "${out}" 'my file.txt' &&
+  contains "${out}" '-leading.txt' &&
+  contains "${out}" 'unicodé.txt' &&
+  ok 'ls prints awkward names from inventory JSON' ||
+  not_ok 'ls prints awkward names from inventory JSON'
+
+out=$(MOCK_AWKWARD_NAMES=1 "${CLIENT}" ls -l hello)
+contains "${out}" 'http://mock/hello/12 B.txt' &&
+  contains "${out}" 'http://mock/hello/has -> arrow.txt' &&
+  contains "${out}" 'http://mock/hello/my file.txt' &&
+  contains "${out}" 'http://mock/hello/-leading.txt' &&
+  contains "${out}" 'http://mock/hello/unicodé.txt' &&
+  contains "${out}" 'http://mock/hello/link -> my file.txt' &&
+  ok 'ls -l URLs are exact for awkward names' ||
+  not_ok 'ls -l URLs are exact for awkward names'
+
+out=$("${CLIENT}" ls --json hello)
+contains "${out}" '"path":"index.html"' &&
+  python3 -c 'import json,sys; json.loads(sys.argv[1])' "${out}" &&
+  ok 'ls --json prints parseable inventory JSON' ||
+  not_ok 'ls --json prints parseable inventory JSON'
+
+out=$("${CLIENT}" stats --json)
+contains "${out}" '"sites":1' &&
+  python3 -c 'import json,sys; json.loads(sys.argv[1])' "${out}" &&
+  ok 'stats --json prints parseable JSON' ||
+  not_ok 'stats --json prints parseable JSON'
+
+out=$("${CLIENT}" undo --stack --json hello)
+contains "${out}" '"token":"tok1"' &&
+  python3 -c 'import json,sys; json.loads(sys.argv[1])' "${out}" &&
+  ok 'undo --stack --json prints parseable JSON' ||
+  not_ok 'undo --stack --json prints parseable JSON'
+
+: > "${LOG}"
+SYMBOL_NO_UPDATE_CHECK=1 "${CLIENT}" url hello >/dev/null
+if contains "$(cat "${LOG}")" '/symbol.sh/HASH'; then
+  not_ok 'SYMBOL_NO_UPDATE_CHECK skips the update nag'
+else
+  ok 'SYMBOL_NO_UPDATE_CHECK skips the update nag'
+fi
+
+rm -f "${XDG_STATE_HOME}/symbol/update-nag"
+: > "${LOG}"
+"${CLIENT}" url hello >/dev/null
+if contains "$(cat "${LOG}")" '/symbol.sh/HASH'; then
+  : > "${LOG}"
+  "${CLIENT}" url hello >/dev/null
+  if contains "$(cat "${LOG}")" '/symbol.sh/HASH'; then
+    not_ok 'update nag is throttled to once per 24h'
+  else
+    ok 'update nag is throttled to once per 24h'
+  fi
+else
+  not_ok 'update nag is throttled to once per 24h'
+fi
+
+mkdir -p "${ROOT}/work/replace-src"
+printf 'a\n' > "${ROOT}/work/replace-src/a.txt"
+: > "${LOG}"
+"${CLIENT}" put --replace hello "${ROOT}/work/replace-src" >/dev/null
+contains "$(cat "${LOG}")" 'Replace: 1' &&
+  ok 'put --replace sends Replace on a site upload' ||
+  not_ok 'put --replace sends Replace on a site upload'
+
+if "${CLIENT}" put --replace hello "${ROOT}/work/replace-src/a.txt" dest.txt \
+  >"${ROOT}/replace.out" 2>"${ROOT}/replace.err"; then
+  not_ok 'put --replace rejects a single-file dest'
+elif contains "$(cat "${ROOT}/replace.err")" 'whole site'; then
+  ok 'put --replace rejects a single-file dest'
+else
+  not_ok 'put --replace rejects a single-file dest'
+fi
 
 : > "${LOG}"
 out=$("${CLIENT}" co hello target)

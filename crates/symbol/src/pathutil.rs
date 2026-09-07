@@ -49,6 +49,32 @@ pub const fn looks_like_apple_fork(bytes: &[u8]) -> bool {
         && (bytes[3] == 0x00 || bytes[3] == 0x07)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HtmlSuffix {
+    Html,
+    Htm,
+}
+
+pub fn html_suffix(name: &str) -> Option<(&str, HtmlSuffix)> {
+    if let Some(stem) = name.strip_suffix(".html") {
+        return (!stem.is_empty() && !stem.ends_with('/')).then_some((stem, HtmlSuffix::Html));
+    }
+    if let Some(stem) = name.strip_suffix(".htm") {
+        return (!stem.is_empty() && !stem.ends_with('/')).then_some((stem, HtmlSuffix::Htm));
+    }
+    None
+}
+
+pub fn pretty_html_name<'a>(name: &'a str, occupied: impl Fn(&str) -> bool) -> &'a str {
+    match html_suffix(name) {
+        Some((stem, HtmlSuffix::Html)) if !occupied(stem) => stem,
+        Some((stem, HtmlSuffix::Htm)) if !occupied(stem) && !occupied(&format!("{stem}.html")) => {
+            stem
+        }
+        _ => name,
+    }
+}
+
 fn is_noise_name(name: &str) -> bool {
     if name.starts_with("._") || name == "Icon\r" {
         return true;
@@ -114,5 +140,31 @@ mod tests {
         assert!(is_junk(Path::new("metadata.bin"), Some(&appledouble)));
         assert!(!is_junk(Path::new("index.html"), Some(b"<h1>ok</h1>")));
         assert!(is_junk(Path::new("._index.html"), Some(b"<h1>ok</h1>")));
+    }
+
+    #[test]
+    fn html_suffix_is_exact_and_pretty_name_is_unambiguous() {
+        assert_eq!(html_suffix("about.html"), Some(("about", HtmlSuffix::Html)));
+        assert_eq!(html_suffix("about.htm"), Some(("about", HtmlSuffix::Htm)));
+        assert_eq!(html_suffix("About.HTML"), None);
+        assert_eq!(html_suffix("about.xhtml"), None);
+        assert_eq!(html_suffix(".html"), None);
+        assert_eq!(
+            pretty_html_name("about.html", |name| name == "about.html"),
+            "about"
+        );
+        assert_eq!(
+            pretty_html_name("about.html", |name| name == "about" || name == "about.html"),
+            "about.html"
+        );
+        assert_eq!(
+            pretty_html_name("about.htm", |name| name == "about.htm"
+                || name == "about.html"),
+            "about.htm"
+        );
+        assert_eq!(
+            pretty_html_name("about.htm", |name| name == "about.htm"),
+            "about"
+        );
     }
 }

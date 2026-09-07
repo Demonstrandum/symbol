@@ -125,7 +125,7 @@ with tempfile.TemporaryDirectory() as root:
                 assert backend_symbol.stats().sites >= 1
                 sync_path = f"backend-sync-{index}.bin"
                 backend_symbol.site("python-sdk").file(sync_path).put(upload_source)
-                response = backend_symbol.site("python-sdk").file("index.html").get()
+                response = backend_symbol.site("python-sdk").file("index").get()
                 assert b"".join(response.iter_bytes(4)) == b"<h1>python</h1>"
 
         async def check_async_backends() -> None:
@@ -147,7 +147,7 @@ with tempfile.TemporaryDirectory() as root:
                         .put(upload_chunks())
                     )
                     response = await (
-                        backend_symbol.site("python-sdk").file("index.html").get()
+                        backend_symbol.site("python-sdk").file("index").get()
                     )
                     chunks = bytearray()
                     async for chunk in response.aiter_bytes(4):

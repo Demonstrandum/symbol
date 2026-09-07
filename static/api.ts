@@ -213,6 +213,7 @@ export interface PublishOptions extends MutationOptions {
   readonly mediaType?: MediaType | string;
   readonly filename?: string;
   readonly unpack?: boolean;
+  readonly replace?: boolean;
   readonly managed?: boolean;
 }
 
@@ -221,6 +222,7 @@ export interface SitePutOptions extends RequestOptions {
   readonly mediaType?: MediaType | string;
   readonly filename?: string;
   readonly unpack?: boolean;
+  readonly replace?: boolean;
   readonly managed?: boolean;
 }
 
@@ -1980,6 +1982,7 @@ export class SiteClient {
       mediaType: options.mediaType,
       filename: options.filename,
       unpack: options.unpack,
+      replace: options.replace,
       managed: options.managed,
     };
     return requestOperation(this.client, {
@@ -3078,19 +3081,69 @@ function hostedBodyOperation<T>(
   options: RequestOptions,
   decode: (response: Response) => Promise<T>,
 ): Operation<T> {
-  return requestOperation(client, {
-    endpoint,
-    path,
-    method: "GET",
-    options,
-    headers: new Headers(),
-    body: replayBody(null),
+  const state = stateFor(client);
+  return new Operation({
     idempotencyKey: null,
-    sendIdempotencyKey: false,
+    replayable: () => true,
     retrySafe: true,
-    successStatuses: [200],
-    decode,
+    retryPolicy: state.retryPolicy,
+    signal: options.signal === undefined ? null : options.signal,
     dispose: null,
+    executor: async (signal, reportStatus) => {
+      const first = await executeRequest(
+        client,
+        {
+          endpoint,
+          path,
+          method: "GET",
+          options,
+          headers: new Headers(),
+          body: replayBody(null),
+          idempotencyKey: null,
+          sendIdempotencyKey: false,
+          retrySafe: true,
+          successStatuses: [200, 307],
+          decode: async (response) => response,
+          dispose: null,
+        },
+        signal,
+        reportStatus,
+      );
+      if (first.status === 200) {
+        return decode(first);
+      }
+      const location = new URL(requiredHeader(first, "Location"), first.url);
+      if (location.origin !== state.origin.origin) {
+        throw new UnexpectedResponseError(
+          "UnexpectedResponseError",
+          endpoint,
+          first.status,
+          `redirect left origin: ${location.origin}`,
+          null,
+          first,
+        );
+      }
+      await first.body?.cancel();
+      return executeRequest(
+        client,
+        {
+          endpoint,
+          path: `${location.pathname}${location.search}`,
+          method: "GET",
+          options,
+          headers: new Headers(),
+          body: replayBody(null),
+          idempotencyKey: null,
+          sendIdempotencyKey: false,
+          retrySafe: true,
+          successStatuses: [200],
+          decode,
+          dispose: null,
+        },
+        signal,
+        reportStatus,
+      );
+    },
   });
 }
 
@@ -4018,6 +4071,9 @@ function publishHeaders(options: PublishOptions, creatorClaim: string | null): H
   }
   if (options.unpack === true) {
     headers.set("Unpack", "true");
+  }
+  if (options.replace === true) {
+    headers.set("Replace", "true");
   }
   if (options.managed === true) {
     headers.set("Management-Action", "claim");

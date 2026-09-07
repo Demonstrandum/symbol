@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt::Write as _;
 
 use axum::body::Bytes;
@@ -8,6 +9,7 @@ use symbol_contract::{Listing, ListingEntry, ListingKind};
 
 use crate::http_cache::{self, Representation};
 use crate::page;
+use crate::pathutil::pretty_html_name;
 use crate::store::{AliasResolvedKind, DirList, EntryKind, SiteList};
 
 pub fn sites(headers: &HeaderMap, list: &SiteList) -> Response {
@@ -255,6 +257,7 @@ fn render_html(site: &str, rel: &str, list: &DirList, files_view: bool) -> Strin
     let parent = parent_href(site, rel, files_view);
     let files_href = format!("/{site}/FILES/");
     let site_href = format!("/{site}/");
+    let occupied = listing_occupied_names(rel, list);
     let see_site = files_view
         && list.entries.iter().any(|entry| {
             entry.kind == EntryKind::File
@@ -293,9 +296,10 @@ fn render_html(site: &str, rel: &str, list: &DirList, files_view: bool) -> Strin
                     }
                 }
                 @for entry in &list.entries {
-                    a.row href=(entry_href(site, rel, &entry.name, entry.kind, files_view)) {
+                    @let shown = listing_entry_name(&entry.name, entry.kind, &occupied);
+                    a.row href=(entry_href(site, rel, shown, entry.kind, files_view)) {
                         span.name {
-                            (&entry.name)
+                            (shown)
                             @if entry.kind == EntryKind::Directory { "/" }
                         }
                         span.meta {
@@ -420,6 +424,26 @@ fn dir_href(site: &str, rel: &str, files_view: bool) -> String {
         format!("/{site}/")
     } else {
         format!("/{site}/{rel}/")
+    }
+}
+
+fn listing_occupied_names<'a>(rel: &str, list: &'a DirList) -> HashSet<&'a str> {
+    let mut names = HashSet::new();
+    for entry in &list.entries {
+        names.insert(entry.name.as_str());
+    }
+    for alias in &list.aliases {
+        if let Some(name) = direct_alias_name(rel, &alias.path) {
+            names.insert(name);
+        }
+    }
+    names
+}
+
+fn listing_entry_name<'a>(name: &'a str, kind: EntryKind, occupied: &HashSet<&str>) -> &'a str {
+    match kind {
+        EntryKind::Directory => name,
+        EntryKind::File => pretty_html_name(name, |candidate| occupied.contains(candidate)),
     }
 }
 
@@ -721,9 +745,13 @@ mod tests {
         let body = render_html("hello", "docs", &list, true);
         assert!(body.contains(r#"class="see-site" href="/hello/docs/""#));
         assert!(body.contains(">see site</a>"));
+        assert!(body.contains(r#"href="/hello/docs/index""#));
+        assert!(body.contains(r#">index</span>"#));
+        assert!(!body.contains("index.html"));
 
         let body = render_html("hello", "docs", &list, false);
         assert!(!body.contains(r#"class="see-site""#));
+        assert!(body.contains(r#"href="/hello/docs/index""#));
     }
 
     #[tokio::test]

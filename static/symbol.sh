@@ -38,13 +38,25 @@ start_update_check() {
   case "${1:-}" in
     update|upgrade|-h|--help|help|"") return 0 ;;
   esac
+  [ -z "${SYMBOL_NO_UPDATE_CHECK:-}" ] || return 0
   case "${HOST}" in
     http://*|https://*) ;;
     *) return 0 ;;
   esac
+  nag_state=${XDG_STATE_HOME:-${HOME}/.local/state}/symbol/update-nag
+  now=$(date +%s)
+  if [ -f "${nag_state}" ]; then
+    last=$(tr -d ' \t\r\n' < "${nag_state}")
+    case "${last}" in
+      ''|*[!0-9]*) ;;
+      *) [ "$((now - last))" -lt 86400 ] && return 0 ;;
+    esac
+  fi
   hashfile=$(dirname "$(client_path)")/.symbol.blake3
   UPDATE_NOTE=$(mktemp) || return 0
   {
+    mkdir -p "$(dirname "${nag_state}")" || exit 0
+    printf '%s\n' "${now}" > "${nag_state}"
     if [ ! -f "${hashfile}" ]; then
       printf '\nsymbol client is missing its hash file. run:\n  symbol update\n' > "${UPDATE_NOTE}"
       exit 0
@@ -95,7 +107,7 @@ usage() {
 symbol: static hosting on ${HOST}
 
 usage:
-  symbol put [-u] [--managed] [NAME [FILE [DEST]]]
+  symbol put [-u] [--replace] [--managed] [NAME [FILE [DEST]]]
   symbol clone NAME [DIR]
   symbol get NAME [ARCHIVE]
   symbol pop NAME [ARCHIVE]
@@ -108,20 +120,22 @@ usage:
   symbol expire [NAME [PATH]] [POLICY]
   symbol manage [NAME ACTION]
   symbol recover
-  symbol ls [-l] [NAME]
+  symbol ls [-l] [--json] [NAME]
   symbol rm NAME [PATH]
   symbol url NAME
   symbol api [--json]
-  symbol stats
+  symbol stats [--json]
   symbol update
   symbol help
 
 global:
   -t, --token TOKEN   management token (also after the command, before --)
+  --json              machine-readable output where the command supports it
 
 put:
   -u, --unpack        unpack archives; directories are always unpacked
   -f PATH             force piped input's remote file path
+  --replace           replace the site tree; remote paths not in the upload are removed
   --managed           create a managed site
   with no arguments, publish the nearest symbol.toml project
 
@@ -137,6 +151,7 @@ aliases:
 
 env: SYMBOL_HOST (default ${HOST}); SYMBOL_TOKEN
      SYMBOL_STDIN=tty|always|never (default tty)
+     SYMBOL_NO_UPDATE_CHECK=1 skips the client update nag
 EOF
 }
 
@@ -144,35 +159,156 @@ command_help() {
   case "$1" in
     put) cat <<'EOF'
 symbol put: publish or merge files into a site
-usage: symbol put [-u|--unpack] [--managed] [NAME [FILE [DEST]]]
+usage: symbol put [-u|--unpack] [--replace] [--managed] [--json]
+                  [NAME [FILE [DEST]]]
        command | symbol put [NAME] -
        command | symbol put            (terminal only)
+
+puts merge into an existing site and keep remote paths you did not upload.
+--replace replaces the whole site tree and deletes remote paths missing
+from the upload. generated symbol.toml is kept either way.
+there is no prompt and no confirmation.
+stdin is read only when the source is - , or when no file source is given
+and a terminal is attached (SYMBOL_STDIN=always|never overrides).
+--json prints a mutation envelope instead of status lines.
 EOF
       ;;
-    clone) printf '%s\n' 'symbol clone: create a local checkout' 'usage: symbol clone NAME [DIR]' ;;
-    get) printf '%s\n' 'symbol get: download a site without deleting it' 'usage: symbol get NAME [ARCHIVE|-]' ;;
-    pop) printf '%s\n' 'symbol pop: download and remove a site' 'usage: symbol pop NAME [ARCHIVE|-]' ;;
-    copy) printf '%s\n' 'symbol copy: duplicate a site on the server' 'usage: symbol copy [--managed] SRC [DST]' ;;
-    remix) printf '%s\n' 'symbol remix: duplicate a site and clone the copy locally' 'usage: symbol remix [--managed] SRC [DST]' ;;
-    move) printf '%s\n' 'symbol move: rename a site without transferring files' 'usage: symbol move SRC DST' ;;
-    alias) printf '%s\n' 'symbol alias: create live path aliases atomically' 'usage: symbol alias SITE PATH TARGET [PATH TARGET ...]' ;;
-    api) printf '%s\n' 'symbol api: show the live server API version and build' 'usage: symbol api [--json]' ;;
-    stats) printf '%s\n' 'symbol stats: show storage, deduplication, cache, and reader totals' 'usage: symbol stats' ;;
-    sync) printf '%s\n' 'symbol sync: publish only when the remote baseline has not changed' 'usage: symbol sync [--check]' ;;
-    undo) printf '%s\n' 'symbol undo: reverse a retained mutation or inspect the undo stack' 'usage: symbol undo [--stack] [NAME [TOKEN]]' ;;
+    clone) cat <<'EOF'
+symbol clone: create a local checkout
+usage: symbol clone NAME [DIR]
+
+downloads the site, writes symbol.toml, and recreates aliases as symlinks
+when the filesystem allows it.
+EOF
+      ;;
+    get) cat <<'EOF'
+symbol get: download a site without deleting it
+usage: symbol get NAME [ARCHIVE|-]
+
+writes a tar.gz, tar, or zip. - writes archive bytes to stdout.
+EOF
+      ;;
+    pop) cat <<'EOF'
+symbol pop: download and remove a site
+usage: symbol pop NAME [ARCHIVE|-]
+
+the site is removed only after the archive is produced. undo is retained
+for 4 hours. - writes archive bytes to stdout.
+EOF
+      ;;
+    copy) cat <<'EOF'
+symbol copy: duplicate a site on the server
+usage: symbol copy [--managed] [--json] SRC [DST]
+
+reuses blob content. omit DST for a generated name.
+--json prints a mutation envelope.
+EOF
+      ;;
+    remix) cat <<'EOF'
+symbol remix: duplicate a site and clone the copy locally
+usage: symbol remix [--managed] SRC [DST]
+
+if the clone fails, the server copy is kept and the cleanup command is
+printed.
+EOF
+      ;;
+    move) cat <<'EOF'
+symbol move: rename a site without transferring files
+usage: symbol move [--json] SRC DST
+
+--json prints a mutation envelope.
+EOF
+      ;;
+    alias) cat <<'EOF'
+symbol alias: create live path aliases atomically
+usage: symbol alias [--json] SITE PATH TARGET [PATH TARGET ...]
+
+one pair is one alias. several pairs are one batch. --json prints the
+server receipt.
+EOF
+      ;;
+    api) cat <<'EOF'
+symbol api: show the live server API version and build
+usage: symbol api [--json]
+
+--json writes the /API/VERSION document.
+EOF
+      ;;
+    stats) cat <<'EOF'
+symbol stats: show storage, deduplication, cache, and reader totals
+usage: symbol stats [--json]
+
+--json writes the /STATS document.
+EOF
+      ;;
+    sync) cat <<'EOF'
+symbol sync: publish only when the remote baseline has not changed
+usage: symbol sync [--check]
+
+requires a local symbol.toml checkout. compares local files to the
+recorded baseline and current upstream tree. it does not delete remote
+paths that are missing locally. --check prints the proposed diff.
+EOF
+      ;;
+    undo) cat <<'EOF'
+symbol undo: reverse a retained mutation or inspect the undo stack
+usage: symbol undo [--stack] [--json] [NAME [TOKEN]]
+
+without a token, reverses the newest applicable mutation. --stack lists
+retained undos. --json writes the stack or a mutation envelope.
+EOF
+      ;;
     expire) expire_help ;;
     manage) cat <<'EOF'
 symbol manage: enable or inspect write protection
-usage: symbol manage NAME --status|--claim|--rotate|--release
+usage: symbol manage [--json] NAME --status|--claim|--rotate|--release
        symbol put --managed NAME SOURCE
+
+reads stay public. claim and rotate print a token once. --json writes
+the {"managed":...} body only.
 EOF
       ;;
-    recover) printf '%s\n' 'symbol recover: resume interrupted idempotent creations and copies' 'usage: symbol recover' ;;
-    ls) printf '%s\n' 'symbol ls: list sites or one site tree' 'usage: symbol ls [-l] [NAME]' ;;
-    rm) printf '%s\n' 'symbol rm: delete a path or site without saving an archive' 'usage: symbol rm NAME [PATH]' ;;
-    url) printf '%s\n' 'symbol url: print the public URL for a site' 'usage: symbol url NAME' ;;
-    update) printf '%s\n' 'symbol update: reinstall the client from the configured server' 'usage: symbol update' ;;
-    help) printf '%s\n' 'symbol help: show general or command-specific help' 'usage: symbol help [COMMAND]' ;;
+    recover) cat <<'EOF'
+symbol recover: resume interrupted idempotent creations and copies
+usage: symbol recover
+
+replays pending generated PUT/COPY operations with their original
+idempotency identity.
+EOF
+      ;;
+    ls) cat <<'EOF'
+symbol ls: list sites or one site tree
+usage: symbol ls [-l|--links] [--json] [NAME]
+
+without NAME, lists sites. with NAME, lists every file and alias path.
+-l adds URLs. names are taken from JSON fields and are not parsed from
+the table. --json writes the server listing or inventory document.
+EOF
+      ;;
+    rm) cat <<'EOF'
+symbol rm: delete a path or site without saving an archive
+usage: symbol rm [--json] NAME [PATH]
+
+there is no prompt. NAME deletes the whole site. NAME PATH deletes that
+file or subtree. undo metadata is retained for 4 hours.
+--json prints a mutation envelope.
+EOF
+      ;;
+    url) cat <<'EOF'
+symbol url: print the public URL for a site
+usage: symbol url NAME
+EOF
+      ;;
+    update) cat <<'EOF'
+symbol update: reinstall the client from the configured server
+usage: symbol update
+EOF
+      ;;
+    help) cat <<'EOF'
+symbol help: show general or command-specific help
+usage: symbol help [COMMAND]
+EOF
+      ;;
     *) usage_error "unknown command for help: $1" ;;
   esac
 }
@@ -401,70 +537,191 @@ print_stats() {
   '
 }
 
-print_links() {
-  base=${1%/}
-  nested=$2
-  awk -v base="${base}" -v nested="${nested}" '
-    function spaces(n, out) {
-      out = ""
-      while (n-- > 0) out = out " "
-      return out
-    }
-    function trim(value) {
-      sub(/^[[:space:]]+/, "", value)
-      sub(/[[:space:]]+$/, "", value)
-      return value
-    }
-    BEGIN {
-      size = "[0-9]+(\\.[0-9]+)?[[:space:]]+(B|KiB|MiB|GiB|TiB|PiB)"
-    }
-    {
-      line = $0
-      count_pattern = "[[:space:]]+[0-9]+ files[[:space:]]+" size "([[:space:]]+total)?[[:space:]]*$"
-      size_pattern = "[[:space:]]+" size "[[:space:]]*$"
-      if (match(line, count_pattern) || match(line, size_pattern)) {
-        line_match_start = RSTART
-        matched = substr(line, line_match_start, RLENGTH)
-        match(matched, /[^[:space:]]/)
-        starts[NR] = line_match_start + RSTART - 1
-        names[NR] = trim(substr(line, 1, line_match_start - 1))
-        metadata[NR] = trim(matched)
-        if (minimum_start == 0 || starts[NR] < minimum_start) minimum_start = starts[NR]
-      } else {
-        names[NR] = trim(line)
+json_ls_lib() {
+  cat <<'AWK'
+function spaces(n, out) {
+  out = ""
+  while (n-- > 0) out = out " "
+  return out
+}
+function skip_string(s, i,    c) {
+  i++
+  while (i <= length(s)) {
+    c = substr(s, i, 1)
+    if (c == "\\") { i += 2; continue }
+    if (c == "\"") return i
+    i++
+  }
+  return i
+}
+function collect_objects(text, dest,    i, c, depth, start, n) {
+  n = 0
+  depth = 0
+  for (i = 1; i <= length(text); i++) {
+    c = substr(text, i, 1)
+    if (c == "\"") { i = skip_string(text, i); continue }
+    if (c == "{") {
+      if (depth == 0) start = i
+      depth++
+    } else if (c == "}") {
+      depth--
+      if (depth == 0) {
+        n++
+        dest[n] = substr(text, start, i - start + 1)
       }
+    }
+  }
+  return n
+}
+function array_after(text, key,    token, start, i, c, depth) {
+  token = "\"" key "\""
+  start = index(text, token)
+  if (!start) return ""
+  text = substr(text, start + length(token))
+  sub(/^[[:space:]]*:[[:space:]]*/, "", text)
+  if (substr(text, 1, 1) != "[") return ""
+  depth = 0
+  for (i = 1; i <= length(text); i++) {
+    c = substr(text, i, 1)
+    if (c == "\"") { i = skip_string(text, i); continue }
+    if (c == "[") depth++
+    else if (c == "]") {
+      depth--
+      if (depth == 0) return substr(text, 1, i)
+    }
+  }
+  return text
+}
+function unescape(s,    out, i, c, n) {
+  out = ""
+  n = length(s)
+  for (i = 1; i <= n; i++) {
+    c = substr(s, i, 1)
+    if (c == "\\" && i < n) {
+      i++
+      c = substr(s, i, 1)
+      if (c == "n") out = out "\n"
+      else if (c == "t") out = out "\t"
+      else if (c == "r") out = out "\r"
+      else out = out c
+    } else out = out c
+  }
+  return out
+}
+function json_str(obj, key,    token, rest, i, c, start) {
+  token = "\"" key "\""
+  start = index(obj, token)
+  if (!start) return ""
+  rest = substr(obj, start + length(token))
+  sub(/^[[:space:]]*:[[:space:]]*/, "", rest)
+  if (substr(rest, 1, 1) != "\"") return ""
+  for (i = 2; i <= length(rest); i++) {
+    c = substr(rest, i, 1)
+    if (c == "\\") { i++; continue }
+    if (c == "\"") return unescape(substr(rest, 2, i - 2))
+  }
+  return ""
+}
+function json_num(obj, key,    token, rest, value) {
+  token = "\"" key "\""
+  if (!index(obj, token)) return ""
+  rest = substr(obj, index(obj, token) + length(token))
+  sub(/^[[:space:]]*:[[:space:]]*/, "", rest)
+  if (substr(rest, 1, 4) == "null") return ""
+  split(rest, value, /[,}]/)
+  gsub(/[[:space:]]/, "", value[1])
+  return value[1]
+}
+function human_size(n,    units, i, value) {
+  units[1] = "B"; units[2] = "KiB"; units[3] = "MiB"
+  units[4] = "GiB"; units[5] = "TiB"; units[6] = "PiB"
+  value = n + 0
+  i = 1
+  while (value >= 1024 && i < 6) { value = value / 1024; i++ }
+  if (i == 1) return sprintf("%d B", n + 0)
+  if (value >= 100) return sprintf("%.0f %s", value, units[i])
+  if (value >= 10) return sprintf("%.1f %s", value, units[i])
+  return sprintf("%.2f %s", value, units[i])
+}
+AWK
+}
 
-      name = names[NR]
-      arrow = index(name, " -> ")
-      if (arrow) {
-        alias_target[NR] = substr(name, arrow)
-        name = substr(name, 1, arrow - 1)
-      }
-      if (name == "") {
-        links[NR] = ""
-      } else if (nested && NR == 1) {
-        links[NR] = base
-      } else if (name == "../") {
-        links[NR] = base "/.."
-      } else {
-        sub(/\/$/, "", name)
-        links[NR] = base "/" name
-      }
-      links[NR] = links[NR] alias_target[NR]
-      if (length(links[NR]) > link_width) link_width = length(links[NR])
-      lines = NR
+print_listing() {
+  base=${1%/}
+  links=$2
+  awk -v base="${base}" -v links="${links}" "$(json_ls_lib)"'
+    {
+      text = text $0
     }
     END {
-      for (i = 1; i <= lines; i++) {
-        if (metadata[i] == "") {
-          print links[i]
-        } else {
-          printf "%s%s  %s%s\n",
-            links[i],
-            spaces(link_width - length(links[i])),
-            spaces(starts[i] - minimum_start),
-            metadata[i]
-        }
+      n = collect_objects(array_after(text, "entries"), obj)
+      for (i = 1; i <= n; i++) {
+        kind = json_str(obj[i], "kind")
+        name = json_str(obj[i], "name")
+        target = json_str(obj[i], "target")
+        files = json_num(obj[i], "files")
+        bytes = json_num(obj[i], "bytes")
+        label = name
+        if (kind == "site" || kind == "directory" || kind == "builtin") label = name "/"
+        if (links) {
+          if (kind == "builtin") row = base "/" name
+          else row = base "/" name
+        } else row = label
+        if (kind == "alias" && target != "") row = row " -> " target
+        rows[i] = row
+        if (kind == "builtin") meta[i] = "built-in"
+        else if (files != "") meta[i] = files " files   " human_size(bytes)
+        else if (bytes != "") meta[i] = human_size(bytes)
+        else meta[i] = ""
+        if (length(row) > width) width = length(row)
+      }
+      for (i = 1; i <= n; i++) {
+        if (meta[i] == "") print rows[i]
+        else printf "%s%s  %s\n", rows[i], spaces(width - length(rows[i])), meta[i]
+      }
+      total_files = json_num(text, "files")
+      total_bytes = json_num(text, "bytes")
+      if (total_files != "") {
+        printf "%s%s  %s files   %s total\n",
+          spaces(width), "", total_files, human_size(total_bytes)
+      }
+    }
+  '
+}
+
+print_inventory() {
+  base=${1%/}
+  links=$2
+  awk -v base="${base}" -v links="${links}" "$(json_ls_lib)"'
+    {
+      text = text $0
+    }
+    END {
+      n = 0
+      files = collect_objects(array_after(text, "files"), fileobj)
+      for (i = 1; i <= files; i++) {
+        n++
+        path = json_str(fileobj[i], "path")
+        bytes = json_num(fileobj[i], "size")
+        row = links ? base "/" path : path
+        rows[n] = row
+        meta[n] = human_size(bytes)
+        if (length(row) > width) width = length(row)
+      }
+      aliases = collect_objects(array_after(text, "aliases"), aliasobj)
+      for (i = 1; i <= aliases; i++) {
+        n++
+        path = json_str(aliasobj[i], "path")
+        target = json_str(aliasobj[i], "target")
+        row = links ? base "/" path : path
+        if (target != "") row = row " -> " target
+        rows[n] = row
+        meta[n] = ""
+        if (length(row) > width) width = length(row)
+      }
+      for (i = 1; i <= n; i++) {
+        if (meta[i] == "") print rows[i]
+        else printf "%s%s  %s\n", rows[i], spaces(width - length(rows[i])), meta[i]
       }
     }
   '
@@ -602,6 +859,7 @@ claim_from_manifest() {
 
 TOKEN_EXPLICIT=
 TOKEN_SEEN=0
+JSON_OUTPUT=0
 parse_global_tokens() {
   args=$(mktemp) || exit 1
   : > "${args}"
@@ -628,6 +886,11 @@ parse_global_tokens() {
           TOKEN_EXPLICIT=${1#*=}
           [ -n "${TOKEN_EXPLICIT}" ] || usage_error "--token requires a token"
           TOKEN_SEEN=1
+          shift
+          continue
+          ;;
+        --json)
+          JSON_OUTPUT=1
           shift
           continue
           ;;
@@ -720,7 +983,54 @@ header_value() {
   ' "${HTTP_HEADERS}"
 }
 
+print_mutation_json() {
+  message=$1
+  if [ -z "${message}" ] && [ -s "${HTTP_BODY}" ]; then
+    message=$(tr -d '\r' < "${HTTP_BODY}")
+    message=${message%"${message##*[![:space:]]}"}
+  fi
+  location=$(header_value Location)
+  etag=$(header_value ETag)
+  revision=$(header_value Content-Revision)
+  undo=$(header_value Undo-Token)
+  printf '{'
+  sep=
+  if [ -n "${message}" ]; then
+    printf '"message":%s' "$(printf '%s\n' "${message}" | json_quote)"
+    sep=,
+  fi
+  if [ -n "${location}" ]; then
+    printf '%s"location":%s' "${sep}" "$(printf '%s\n' "${location}" | json_quote)"
+    sep=,
+  fi
+  if [ -n "${etag}" ]; then
+    printf '%s"etag":%s' "${sep}" "$(printf '%s\n' "${etag}" | json_quote)"
+    sep=,
+  fi
+  if [ -n "${revision}" ]; then
+    printf '%s"content_revision":%s' "${sep}" "$(printf '%s\n' "${revision}" | json_quote)"
+    sep=,
+  fi
+  if [ -n "${undo}" ]; then
+    printf '%s"undo_token":%s' "${sep}" "$(printf '%s\n' "${undo}" | json_quote)"
+  fi
+  printf '}\n'
+}
+
 print_mutation_result() {
+  if [ "${JSON_OUTPUT}" -eq 1 ]; then
+    print_mutation_json "${STATUS_MESSAGE:-}"
+    STATUS_MESSAGE=
+    management_count=$(header_value Sanitized-Management-Tokens)
+    claim_count=$(header_value Sanitized-Creator-Claims)
+    management_count=${management_count:-0}
+    claim_count=${claim_count:-0}
+    if [ "${management_count}" != 0 ] || [ "${claim_count}" != 0 ]; then
+      printf 'warning: redacted %s management tokens and %s creator claims from uploaded files\n' \
+        "${management_count}" "${claim_count}" >&2
+    fi
+    return
+  fi
   suppress_body=${2:-0}
   if [ "${suppress_body}" -eq 0 ] && [ -s "${HTTP_BODY}" ]; then
     cat "${HTTP_BODY}"
@@ -739,6 +1049,14 @@ print_mutation_result() {
     printf 'warning: redacted %s management tokens and %s creator claims from uploaded files\n' \
       "${management_count}" "${claim_count}" >&2
   fi
+}
+
+emit_status() {
+  if [ "${JSON_OUTPUT}" -eq 1 ]; then
+    STATUS_MESSAGE=$1
+    return
+  fi
+  printf '%s\n' "$1"
 }
 
 command_registry() {
@@ -1010,7 +1328,7 @@ relative_alias_target() (
         out = out (out == "" ? "" : "/") ".."
       for (i = common + 1; i <= to_count; i++)
         out = out (out == "" ? "" : "/") target_parts[i]
-      print out == "" ? "." : out
+      print (out == "" ? "." : out)
     }
   '
 )
@@ -1461,12 +1779,14 @@ save_response_secrets() {
   management=$(header_value Management-Token)
   claim=$(header_value Creator-Claim)
   [ -z "${management}" ] || {
-    printf 'management token (shown once):\n  %s\n' "${management}"
+    [ "${JSON_OUTPUT}" -eq 1 ] ||
+      printf 'management token (shown once):\n  %s\n' "${management}"
     local_manifest=$(matching_manifest "${base}" "${name}" 2>/dev/null || true)
     [ -z "${local_manifest}" ] || write_secret_sidecar token "${management}" "${local_manifest}"
   }
   [ -z "${claim}" ] || {
-    printf 'creator claim (shown once):\n  %s\n' "${claim}"
+    [ "${JSON_OUTPUT}" -eq 1 ] ||
+      printf 'creator claim (shown once):\n  %s\n' "${claim}"
     local_manifest=$(matching_manifest "${base}" "${name}" 2>/dev/null || true)
     [ -z "${local_manifest}" ] || write_secret_sidecar claim "${claim}" "${local_manifest}"
   }
@@ -1490,6 +1810,11 @@ put_file_request() {
   while IFS= read -r arg; do set -- "$@" "${arg}"; done < "${auth}"
   rm -f "${auth}"
   [ -z "${conditional}" ] || set -- "$@" -H "If-Match: ${conditional}"
+  if [ "${REPLACE_SITE:-0}" -eq 1 ]; then
+    [ "${generated}" -eq 0 ] || usage_error "--replace requires a site name"
+    [ -z "${remote}" ] || usage_error "--replace applies to a whole site, not a single path"
+    set -- "$@" -H 'Replace: 1'
+  fi
   claim_manifest=$(matching_manifest "${base}" "${site}" 2>/dev/null || true)
   if [ -z "${claim_manifest}" ] && [ -d "${source}" ] && [ -f "${source}/symbol.toml" ]; then
     candidate_host=$(manifest_value host "${source}/symbol.toml" 2>/dev/null || true)
@@ -1583,11 +1908,11 @@ put_file_request() {
       fi
     else
       if awk 'index($0, "changed: false") { found=1 } END { exit !found }' "${HTTP_BODY}"; then
-        printf 'already up to date %s/%s/\n' "${base}" "${site}"
+        emit_status "already up to date ${base}/${site}/"
       elif [ "${HTTP_STATUS}" = 201 ]; then
-        printf 'created %s/%s/\n' "${base}" "${site}"
+        emit_status "created ${base}/${site}/"
       elif [ "${HTTP_STATUS}" = 200 ]; then
-        printf 'updated %s/%s/\n' "${base}" "${site}"
+        emit_status "updated ${base}/${site}/"
       fi
       print_mutation_result "${site}" 1
       save_response_secrets "${base}" "${site}"
@@ -1675,13 +2000,13 @@ put_file_request() {
     final_name=${final_name##*/}
   fi
   if [ "${managed_response_lost}" -eq 1 ]; then
-    printf 'created %s/%s/; response was lost, run: symbol recover\n' "${base}" "${site}"
+    emit_status "created ${base}/${site}/; response was lost, run: symbol recover"
   elif awk 'index($0, "changed: false") { found=1 } END { exit !found }' "${HTTP_BODY}"; then
-    printf 'already up to date %s/%s/\n' "${base}" "${final_name}"
+    emit_status "already up to date ${base}/${final_name}/"
   elif [ "${HTTP_STATUS}" = 201 ]; then
-    printf 'created %s/%s/\n' "${base}" "${final_name}"
+    emit_status "created ${base}/${final_name}/"
   elif [ "${HTTP_STATUS}" = 200 ]; then
-    printf 'updated %s/%s/\n' "${base}" "${final_name}"
+    emit_status "updated ${base}/${final_name}/"
   fi
   if [ "${managed_response_lost}" -eq 0 ]; then
     print_mutation_result "${final_name}" 1
@@ -1834,9 +2159,9 @@ copy_or_move_request() {
     finish_pending_claim "${RESULT_NAME}"
   fi
   if [ "${method}" = COPY ]; then
-    printf 'copied %s/%s/ -> %s\n' "${HOST}" "${source}" "${location}"
+    emit_status "copied ${HOST}/${source}/ -> ${location}"
   else
-    printf 'moved %s/%s/ -> %s\n' "${HOST}" "${source}" "${location}"
+    emit_status "moved ${HOST}/${source}/ -> ${location}"
   fi
   if [ -z "${recovered_location}" ]; then
     print_mutation_result "${RESULT_NAME}" 1
@@ -2083,6 +2408,7 @@ default retention
 
 expiration is disabled until explicitly enabled.
 expired content remains undoable for 4 hours.
+--json writes the expiry report.
 
 option aliases:
   --info and --graph are aliases for --show.
@@ -2713,13 +3039,19 @@ put_alias_request() {
     rm -rf "${alias_work}"
     return 1
   fi
-  print_mutation_result "${alias_site}" 1
-  if [ "${alias_count}" -eq 1 ]; then
-    printf 'aliased %s/%s/%s -> %s\n' \
-      "${HOST}" "${alias_site}" "${alias_path}" "${alias_target}"
+  if [ "${JSON_OUTPUT}" -eq 1 ]; then
+    cat "${HTTP_BODY}"
+    last=$(tail -c 1 "${HTTP_BODY}" 2>/dev/null || true)
+    [ -z "${last}" ] || printf '\n'
   else
-    printf 'aliased %s paths atomically in %s/%s/\n' \
-      "${alias_count}" "${HOST}" "${alias_site}"
+    print_mutation_result "${alias_site}" 1
+    if [ "${alias_count}" -eq 1 ]; then
+      printf 'aliased %s/%s/%s -> %s\n' \
+        "${HOST}" "${alias_site}" "${alias_path}" "${alias_target}"
+    else
+      printf 'aliased %s paths atomically in %s/%s/\n' \
+        "${alias_count}" "${HOST}" "${alias_site}"
+    fi
   fi
   rm -rf "${alias_work}"
   [ -z "${alias_manifest}" ] ||
@@ -2987,10 +3319,12 @@ case "${cmd}" in
     unpack=0
     managed=0
     forced=
+    REPLACE_SITE=0
     while [ "$#" -gt 0 ]; do
       case "$1" in
         -u|--unpack) unpack=1; shift ;;
         --managed) managed=1; shift ;;
+        --replace) REPLACE_SITE=1; shift ;;
         -f)
           [ "$#" -ge 2 ] || usage_error "-f requires a remote path"
           forced=$2
@@ -3113,17 +3447,20 @@ case "${cmd}" in
     done
     [ "$#" -le 1 ] || usage_error "ls accepts at most one site name"
     if [ "$#" -eq 0 ]; then
-      if [ "${links}" -eq 1 ]; then
-        request GET /FILES | print_links "${HOST}" 0
+      listing=$(request GET /FILES -H 'Accept: application/json')
+      if [ "${JSON_OUTPUT}" -eq 1 ]; then
+        printf '%s\n' "${listing}"
       else
-        request GET /FILES
+        printf '%s\n' "${listing}" | print_listing "${HOST}" "${links}"
       fi
     else
       name=$1
-      if [ "${links}" -eq 1 ]; then
-        request GET "/${name}/FILES" | print_links "${HOST}/${name}" 1
+      is_site_name "${name}" || usage_error "invalid site name: ${name}"
+      inventory=$(request GET "/${name}/FILES" -H 'Accept: application/json')
+      if [ "${JSON_OUTPUT}" -eq 1 ]; then
+        printf '%s\n' "${inventory}"
       else
-        request GET "/${name}/FILES"
+        printf '%s\n' "${inventory}" | print_inventory "${HOST}/${name}" "${links}"
       fi
     fi
     ;;
@@ -3203,7 +3540,11 @@ case "${cmd}" in
     is_site_name "${name}" || usage_error "invalid site name: ${name}"
     if [ "${stack}" -eq 1 ]; then
       [ -z "${token}" ] || usage_error "--stack does not accept a token"
-      request GET "/${name}/UNDO" | awk '
+      stack_json=$(request GET "/${name}/UNDO")
+      if [ "${JSON_OUTPUT}" -eq 1 ]; then
+        printf '%s\n' "${stack_json}"
+      else
+      printf '%s\n' "${stack_json}" | awk '
         BEGIN { print "TOKEN      WOULD UNDO                         EXPIRES" }
         function human(seconds, days, hours, minutes, text) {
           seconds = int(seconds)
@@ -3234,6 +3575,7 @@ case "${cmd}" in
           }
         }
       '
+      fi
     else
       auth=$(mktemp) || exit 1
       auth_args_file "${auth}"
@@ -3242,7 +3584,7 @@ case "${cmd}" in
       rm -f "${auth}"
       [ -z "${token}" ] || set -- "$@" -H "Undo-Token: ${token}"
       http_request UNDO "${base}/${name}" "$@" || exit 1
-      cat "${HTTP_BODY}"
+      print_mutation_result "${name}"
     fi
     ;;
   expire)
@@ -3279,7 +3621,13 @@ case "${cmd}" in
     [ -z "${path}" ] || target="${target}/$(urlencode_path "${path}")"
     if [ "${mode}" = show ]; then
       http_request GET "${HOST}${target}/EXPIRES" -H 'Accept: application/json' || exit 1
-      print_expire_report
+      if [ "${JSON_OUTPUT}" -eq 1 ]; then
+        cat "${HTTP_BODY}"
+        last=$(tail -c 1 "${HTTP_BODY}" 2>/dev/null || true)
+        [ -z "${last}" ] || printf '\n'
+      else
+        print_expire_report
+      fi
     else
       auth=$(mktemp) || exit 1
       auth_args_file "${auth}"
@@ -3297,6 +3645,11 @@ case "${cmd}" in
       [ -z "${max_size}" ] || set -- "$@" -H "Expiry-Max-Size: ${max_size}"
       [ -z "${power}" ] || set -- "$@" -H "Expiry-Power: ${power}"
       http_request EXPIRE "${HOST}${target}" "$@" || exit 1
+      if [ "${JSON_OUTPUT}" -eq 1 ]; then
+        cat "${HTTP_BODY}"
+        last=$(tail -c 1 "${HTTP_BODY}" 2>/dev/null || true)
+        [ -z "${last}" ] || printf '\n'
+      else
       print_mutation_result "${name}" 1
       if [ "${mode}" = never ]; then
         effective=$(json_string effective_expires_at < "${HTTP_BODY}" 2>/dev/null || true)
@@ -3310,6 +3663,7 @@ case "${cmd}" in
         fi
       elif [ -s "${HTTP_BODY}" ]; then
         print_expire_report
+      fi
       fi
     fi
     ;;
@@ -3364,6 +3718,8 @@ EOF
     fi
     http_request MANAGE "${HOST}/${name}" "$@" || exit 1
     cat "${HTTP_BODY}"
+    last=$(tail -c 1 "${HTTP_BODY}" 2>/dev/null || true)
+    [ -z "${last}" ] || printf '\n'
     save_response_secrets "${HOST}" "${name}"
     if [ "${action}" = claim ] || [ "${action}" = rotate ]; then
       management=$(header_value Management-Token)
@@ -3401,11 +3757,12 @@ EOF
     rm -f "${auth}"
     if [ "${remove_site}" -eq 1 ]; then
       http_request DELETE "${HOST}/${name}" "$@" || exit 1
-      printf 'deleted %s\n' "${name}"
+      emit_status "deleted ${name}"
       print_mutation_result "${name}" 1
     else
       encoded=$(urlencode_path "${remote_path}")
       http_request DELETE "${HOST}/${name}/${encoded}" "$@" || exit 1
+      emit_status "deleted ${name}/${remote_path}"
       print_mutation_result "${name}"
     fi
     ;;
@@ -3441,10 +3798,9 @@ EOF
     fi
     ;;
   api)
-    json=0
     while [ "$#" -gt 0 ]; do
       case "$1" in
-        --json) json=1; shift ;;
+        --json) JSON_OUTPUT=1; shift ;;
         --) shift; break ;;
         -*) usage_error "unknown flag: $1" ;;
         *) break ;;
@@ -3452,7 +3808,7 @@ EOF
     done
     [ "$#" -eq 0 ] || usage_error "api accepts no arguments"
     api_json=$(request GET /API/VERSION)
-    if [ "${json}" -eq 1 ]; then
+    if [ "${JSON_OUTPUT}" -eq 1 ]; then
       printf '%s\n' "${api_json}"
     else
       printf '%s\n' "${api_json}" | print_api
@@ -3461,7 +3817,11 @@ EOF
   stats)
     [ "$#" -eq 0 ] || usage_error "stats accepts no arguments"
     stats_json=$(request GET /STATS)
-    printf '%s\n' "${stats_json}" | print_stats
+    if [ "${JSON_OUTPUT}" -eq 1 ]; then
+      printf '%s\n' "${stats_json}"
+    else
+      printf '%s\n' "${stats_json}" | print_stats
+    fi
     ;;
   help)
     usage

@@ -1239,6 +1239,7 @@ pub static ENDPOINTS: &[EndpointContract] = &[
             "Content-Type",
             "Content-Disposition",
             "Unpack",
+            "Replace",
             "If-Match",
             "Idempotency-Key",
             "Creator-Claim",

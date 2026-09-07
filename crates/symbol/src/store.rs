@@ -823,6 +823,7 @@ pub struct PublishOptions<'a> {
     pub idempotency: Option<&'a Idempotency>,
     pub creation: CreationSecurity,
     pub authorization: Option<&'a ManagementToken>,
+    pub replace: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -3679,6 +3680,7 @@ impl Store {
                 options.expected_tree_hash,
                 options.creation,
                 options.authorization,
+                options.replace,
             )?;
             return Ok((name, mutation));
         }
@@ -3731,6 +3733,7 @@ impl Store {
                 creation: options.creation,
                 authorization: None,
                 archive_aliases,
+                replace: false,
             },
         )?;
         let published = PublishedMutation {
@@ -3781,6 +3784,7 @@ impl Store {
             expected_tree_hash,
             creation,
             authorization,
+            false,
         )
     }
 
@@ -3794,6 +3798,7 @@ impl Store {
         expected_tree_hash: Option<&str>,
         creation: CreationSecurity,
         authorization: Option<&ManagementToken>,
+        replace: bool,
     ) -> Result<MutationResult, StoreError> {
         let files = files
             .iter()
@@ -3819,6 +3824,7 @@ impl Store {
                 creation,
                 authorization,
                 archive_aliases,
+                replace,
             },
         )?;
         let removed = gc_blobs(&mut tx, now)?;
@@ -3843,6 +3849,7 @@ impl Store {
             creation,
             authorization,
             archive_aliases,
+            replace,
         } = context;
         let existed = site_exists_locked(tx, name)?;
         if existed {
@@ -3900,6 +3907,31 @@ impl Store {
         } else {
             changed |= !archive_aliases.is_empty();
         }
+        let keep = files
+            .iter()
+            .map(|file| file.path.as_str())
+            .chain(archive_aliases.iter().map(|alias| alias.path))
+            .chain(std::iter::once(MANIFEST_PATH))
+            .collect::<HashSet<_>>();
+        let mut prune_paths = Vec::new();
+        if replace && let Some(site_id) = existing_site_id {
+            prune_paths = site_entries::table
+                .filter(site_entries::site_id.eq(site_id))
+                .select(site_entries::path)
+                .load::<String>(tx)?
+                .into_iter()
+                .filter(|path| !keep.contains(path.as_str()))
+                .collect();
+            changed |= !prune_paths.is_empty();
+            if !changed {
+                changed |= expiry_policies::table
+                    .filter(expiry_policies::site_id.eq(site_id))
+                    .select(expiry_policies::path)
+                    .load::<String>(tx)?
+                    .into_iter()
+                    .any(|path| !path.is_empty() && !keep.contains(path.as_str()));
+            }
+        }
         if !changed {
             let (revision, tree_hash) = site_revision_locked(tx, name)?;
             return Ok(MutationResult {
@@ -3930,8 +3962,9 @@ impl Store {
             .iter()
             .map(|file| file.path.as_str())
             .chain(archive_aliases.iter().map(|alias| alias.path))
+            .chain(prune_paths.iter().map(String::as_str))
             .collect::<Vec<_>>();
-        let undo = if existed {
+        let undo = if existed && !replace {
             snapshot_entry_deltas(tx, name, kind, &description, &changed_paths, now)?
         } else {
             snapshot_site_with_description(tx, name, kind, &description, now)?
@@ -4026,6 +4059,9 @@ impl Store {
                 ))
                 .execute(tx)?;
         }
+        if replace && existed {
+            prune_unlisted_locked(tx, site_id, &keep)?;
+        }
         let revision = if existed {
             sites::table
                 .find(site_id)
@@ -4044,16 +4080,20 @@ impl Store {
             changed_paths.len(),
             now,
         )?;
-        let alias_changes = files
-            .iter()
-            .map(|file| AliasChange::Entry(file.path.as_str()))
-            .chain(
-                archive_aliases
-                    .iter()
-                    .map(|alias| AliasChange::Alias(alias.path)),
-            )
-            .collect::<Vec<_>>();
-        refresh_aliases_locked(tx, site_id, &alias_changes)?;
+        if replace && existed {
+            refresh_all_aliases_locked(tx, site_id)?;
+        } else {
+            let alias_changes = files
+                .iter()
+                .map(|file| AliasChange::Entry(file.path.as_str()))
+                .chain(
+                    archive_aliases
+                        .iter()
+                        .map(|alias| AliasChange::Alias(alias.path)),
+                )
+                .collect::<Vec<_>>();
+            refresh_aliases_locked(tx, site_id, &alias_changes)?;
+        }
         refresh_expiry_for_changes_locked(tx, site_id, &changed_paths, now)?;
         let tree_hash = regenerate_site(tx, &self.inner.blob_files, site_id, now)?;
         prune_undo_locked(tx, now)?;
@@ -5514,6 +5554,7 @@ struct MergeContext<'a> {
     creation: CreationSecurity,
     authorization: Option<&'a ManagementToken>,
     archive_aliases: &'a [ArchiveAlias<'a>],
+    replace: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -8280,6 +8321,57 @@ fn finish_partial_expiry_locked(
 }
 
 #[allow(clippy::too_many_lines)]
+fn prune_unlisted_locked(
+    tx: &mut SqliteConnection,
+    site_id: i64,
+    keep: &HashSet<&str>,
+) -> Result<(), StoreError> {
+    let prune = site_entries::table
+        .filter(site_entries::site_id.eq(site_id))
+        .select(site_entries::path)
+        .load::<String>(tx)?
+        .into_iter()
+        .filter(|path| !keep.contains(path.as_str()))
+        .collect::<Vec<_>>();
+    if !prune.is_empty() {
+        let removed_files = files::table
+            .filter(files::site_id.eq(site_id))
+            .filter(files::path.eq_any(&prune))
+            .select((files::path, files::size))
+            .load::<(String, i64)>(tx)?;
+        let removed_allocated = allocated_entries::table
+            .filter(allocated_entries::site_id.eq(site_id))
+            .filter(allocated_entries::path.eq_any(&prune))
+            .select((allocated_entries::path, allocated_entries::size))
+            .load::<(String, i64)>(tx)?;
+        for (path, size) in removed_files.iter().chain(&removed_allocated) {
+            adjust_aggregates_locked(tx, site_id, path, -*size, -1)?;
+        }
+        diesel::delete(
+            site_entries::table
+                .filter(site_entries::site_id.eq(site_id))
+                .filter(site_entries::path.eq_any(&prune)),
+        )
+        .execute(tx)?;
+    }
+    let prune_expiry = expiry_policies::table
+        .filter(expiry_policies::site_id.eq(site_id))
+        .select(expiry_policies::path)
+        .load::<String>(tx)?
+        .into_iter()
+        .filter(|path| !path.is_empty() && !keep.contains(path.as_str()))
+        .collect::<Vec<_>>();
+    if !prune_expiry.is_empty() {
+        diesel::delete(
+            expiry_policies::table
+                .filter(expiry_policies::site_id.eq(site_id))
+                .filter(expiry_policies::path.eq_any(&prune_expiry)),
+        )
+        .execute(tx)?;
+    }
+    Ok(())
+}
+
 fn regenerate_site(
     tx: &mut SqliteConnection,
     blobs: &BlobFiles,
@@ -12303,6 +12395,40 @@ mod tests {
             Err(StoreError::IdempotencyConflict)
         ));
         assert_eq!(store.stats().unwrap().sites, 1);
+    }
+
+    #[test]
+    fn replace_put_prunes_missing_paths_and_one_undo_restores_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+        store.put_file("hello", "a.txt", b"a").unwrap();
+        store.put_file("hello", "b.txt", b"b").unwrap();
+        let upload = dir.path().join("a.txt");
+        fs::write(&upload, b"a2").unwrap();
+        let result = store
+            .publish_uploaded_file(
+                Some("hello"),
+                "a.txt",
+                upload,
+                PublishOptions {
+                    replace: true,
+                    ..PublishOptions::default()
+                },
+            )
+            .unwrap()
+            .1;
+        assert!(result.changed);
+        assert!(matches!(
+            store.lookup("hello", "b.txt"),
+            Err(StoreError::NotFound)
+        ));
+        assert!(store.lookup("hello", "a.txt").is_ok());
+        assert!(store.lookup("hello", "symbol.toml").is_ok());
+        store
+            .undo("hello", Some(&result.undo.unwrap().token))
+            .unwrap();
+        assert!(store.lookup("hello", "b.txt").is_ok());
+        assert!(store.lookup("hello", "a.txt").is_ok());
     }
 
     #[test]

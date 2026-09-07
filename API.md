@@ -720,6 +720,8 @@ may appear before or after the command, before `--`.
 `SYMBOL_STDIN` is `tty` (default), `always`, or `never`: a pipe without `-`
 is stdin only when no file source is given, and only in a terminal unless
 set to `always`. `never` requires `-`.
+`SYMBOL_NO_UPDATE_CHECK=1` skips the client update nag. The nag is also
+throttled to once per 24 hours.
 
 `-` means stdin in an upload/source position and stdout in a download
 destination position. The client keeps binary stdout clean so archives can be
@@ -737,7 +739,7 @@ symbol help remix
 ### `put`
 
 ```sh
-symbol put [-u|--unpack] [--managed] [NAME [FILE [DEST]]]
+symbol put [-u|--unpack] [--replace] [--managed] [--json] [NAME [FILE [DEST]]]
 command | symbol put [NAME] -
 ```
 
@@ -749,7 +751,9 @@ pass `-` or set `never`.
 Without `NAME`, Symbol creates a random site. A single HTML input becomes
 `index.html`. Directories are packed and unpacked automatically. `-u` unpacks
 tar, tar.gz, zip, or gzip. Publishing to an existing site merges only the
-supplied paths.
+supplied paths. `--replace` replaces the whole site tree and deletes remote
+paths that are not in the upload; generated `symbol.toml` is kept. There is
+no prompt. `--json` prints a mutation envelope.
 
 ### `clone`
 
@@ -787,12 +791,13 @@ clone fails, it reports the retained server copy and exact cleanup command.
 ### `alias`
 
 ```sh
-symbol alias SITE PATH TARGET [PATH TARGET ...]
+symbol alias [--json] SITE PATH TARGET [PATH TARGET ...]
 ```
 
 One pair creates one live alias. Multiple pairs are sent as one atomic batch.
 Targets are site-relative and follow symlink semantics. Cycles, root escapes,
-reserved namespaces, and path shadowing are rejected.
+reserved namespaces, and path shadowing are rejected. `--json` writes the
+server receipt.
 
 ### `sync`
 
@@ -801,73 +806,80 @@ symbol sync
 symbol sync --check
 ```
 
-Sync compares local changes with the checkout baseline and current upstream
-tree. It refuses divergent upstream changes instead of overwriting them.
-`--check` prints the proposed diff without publishing.
+Sync requires a local `symbol.toml` checkout. It compares local changes with
+the checkout baseline and current upstream tree. It refuses divergent
+upstream changes instead of overwriting them and does not delete remote
+paths that are missing locally. `--check` prints the proposed diff without
+publishing.
 
 ### `undo`
 
 ```sh
-symbol undo [NAME [TOKEN]]
-symbol undo --stack [NAME]
+symbol undo [--json] [NAME [TOKEN]]
+symbol undo --stack [--json] [NAME]
 ```
 
 Without a token, reverses the newest applicable retained mutation. `--stack`
 shows token, action, creation time, expiry time, and remaining duration.
+`--json` writes the stack document or a mutation envelope.
 
 ### `expire`
 
 ```sh
 symbol expire
-symbol expire NAME [PATH] --in DURATION
-symbol expire NAME [PATH] --at RFC3339
-symbol expire NAME [PATH] --decay [LIMITS]
-symbol expire NAME [PATH] --never
-symbol expire NAME [PATH] --show
+symbol expire [--json] NAME [PATH] --in DURATION
+symbol expire [--json] NAME [PATH] --at RFC3339
+symbol expire [--json] NAME [PATH] --decay [LIMITS]
+symbol expire [--json] NAME [PATH] --never
+symbol expire [--json] NAME [PATH] --show
 ```
 
 Bare `expire` prints the retention graph and help. Relative and absolute modes
 set direct deadlines. Decay combines minimum age, maximum age, maximum size,
-and power. Child targets inherit limiting parent caps.
+and power. Child targets inherit limiting parent caps. `--json` writes the expiry report.
 
 ### `manage`
 
 ```sh
-symbol manage NAME --status
-symbol manage NAME --claim
-symbol manage NAME --rotate
-symbol manage NAME --release
+symbol manage [--json] NAME --status
+symbol manage [--json] NAME --claim
+symbol manage [--json] NAME --rotate
+symbol manage [--json] NAME --release
 ```
 
 Management is optional write protection. Reads remain public. Claim and rotate
-return a token once; release makes writes open again.
+return a token once; release makes writes open again. `--json` writes the
+`{"managed":…}` body only.
 
 ### `ls`, `stats`, `url`, and `api`
 
 ```sh
-symbol ls
-symbol ls -l NAME
-symbol stats
+symbol ls [--json]
+symbol ls -l [--json] NAME
+symbol stats [--json]
 symbol url NAME
 symbol api
 symbol api --json
 ```
 
-`ls` lists sites or a linked file tree. `stats` shows logical/physical bytes,
-deduplication, distributions, cache, and reader metrics. `url` prints one
-canonical site URL for scripting. `api` prints the live `/API/VERSION`
-document: semantic version, absolute revision, source hash, git commit, and
-dirty bit. `--json` writes the server JSON.
+`ls` lists sites or one site tree from listing/inventory JSON fields, so
+names are never parsed out of the table. `-l` adds URLs. `ls -l --json` is
+the same as `ls --json`. `stats` shows logical/physical bytes, deduplication,
+distributions, cache, and reader metrics. `url` prints one canonical site
+URL for scripting. `api` prints the live `/API/VERSION` document: semantic
+version, absolute revision, source hash, git commit, and dirty bit. `--json`
+writes the server JSON.
 
 ### `rm`
 
 ```sh
-symbol rm NAME [PATH]
+symbol rm [--json] NAME [PATH]
 ```
 
-Deletes without downloading an archive. A path removes only that file or
-subtree; omitting it removes the site. The server still returns retained undo
-metadata.
+Deletes without downloading an archive and without a prompt. A path removes
+only that file or subtree; omitting it removes the site. The server still
+returns retained undo metadata for 4 hours. `--json` prints a mutation
+envelope.
 
 ### `recover`, `update`, and `help`
 
@@ -1190,6 +1202,11 @@ days are removed.
 : `1`, `true`, `yes`, or an empty value extracts a supported archive and
   merges its retained files.
 
+`Replace`
+: On named site PUT only, `1`, `true`, `yes`, or an empty value replaces the
+  site tree and deletes remote paths that are not in the upload. Generated
+  `symbol.toml` is kept. File PUT and unnamed PUT reject the header.
+
 ## Common mutation response headers
 
 Content mutations return some or all of:
@@ -1433,6 +1450,13 @@ non-directory request transparently tries `{path}.html` and then `{path}.htm`;
 an exact extensionless file or directory always wins. Explicit missing
 `.html`/`.htm` paths remain `404`.
 
+Unambiguous `.html` / `.htm` files also redirect: `GET /{name}/about.html`
+returns `307` to `/{name}/about` when no file, directory, or alias occupies
+`about`. A `.htm` file stays put when `{stem}.html` exists, because the
+extensionless fallback prefers `.html`. HTML directory listings use the same
+pretty links and labels; JSON and plain listings keep the stored names. `PUT`,
+`DELETE`, `EXPIRE`, and `HASH` stay on the real path.
+
 These control suffixes are reserved:
 
 - `/{name}/{path...}/HASH` returns the raw stored file hash with `200`, or `404`
@@ -1536,9 +1560,13 @@ caching, and content negotiation match `/FILES`.
 ### `PUT /{name}` and `PUT /{name}/`
 
 Creates or merges into a named site. Uploaded paths replace same-path files;
-other existing paths are retained. An identical merge returns `200`,
+other existing paths are retained unless `Replace` is set. `Replace` (`1`,
+`true`, `yes`, or empty) deletes remote files, aliases, allocated entries, and
+non-site expiry that are not in the upload; generated `symbol.toml` is kept.
+An identical merge or replace with nothing to prune returns `200`,
 `changed: false`, no undo headers, and does not increment the content revision.
-A changed existing site returns `200`; a new site returns `201`.
+A changed existing site returns `200`; a new site returns `201`. Create plus
+`Replace` is ordinary put.
 
 Body interpretation:
 
@@ -1559,6 +1587,7 @@ PUT /hello HTTP/1.1
 Content-Type: application/gzip
 Content-Disposition: attachment; filename="site.tar.gz"
 Unpack: 1
+Replace: 1
 If-Match: "blake3:<previous tree hash>"
 Authorization: Bearer sym_mgmt_...
 Content-Length: 1234
@@ -1578,14 +1607,14 @@ Content-Type: text/plain; charset=utf-8
 ok hello https://symbol.example/hello/ (3 files, changed: true)
 ```
 
-Canonical client: `symbol put NAME SOURCE`; bare `symbol put` uses the nearest
-manifest target.
+Canonical client: `symbol put NAME SOURCE` or `symbol put --replace NAME SOURCE`;
+bare `symbol put` uses the nearest manifest target.
 
 <!-- contract:file put -->
 ### `PUT /{name}/{path...}`
 
-Creates or replaces one file at the exact path. It does not honor `Unpack` and
-does not implement `Idempotency-Key`. It accepts `If-Match`.
+Creates or replaces one file at the exact path. It does not honor `Unpack` or
+`Replace` and does not implement `Idempotency-Key`. It accepts `If-Match`.
 
 Success: `201` only when the site itself is created; otherwise `200`, including
 when a new path is added to an existing site. The response body is
@@ -2069,7 +2098,6 @@ The current service does **not** implement:
 - listing pagination, search, quotas, or per-site upload limits;
 - WebDAV PROPFIND, multi-range responses, resumable multipart upload sessions,
   or server-side multipart upload;
-- replacement semantics for directory/archive PUT (PUT is merge-only);
 - automatic remote deletion from `symbol sync`;
 - server-side conflict merging;
 - recovery of a lost management token through a public HTTP admin endpoint;

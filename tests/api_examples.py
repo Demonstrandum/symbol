@@ -122,6 +122,8 @@ def execute_raw_http(example: HttpExample, managed_token: str, etag: str) -> Non
         )
         require_status(example.request_line, observed, example.expected_status)
         unpacked = request("GET", "/hello/index.html")
+        if unpacked.status == 307:
+            unpacked = request("GET", urllib.parse.urlsplit(unpacked.header("Location")).path)
         require_status("documented PUT /hello state", unpacked, 200)
         if unpacked.body != b"<h1>raw merge</h1>\n":
             raise AssertionError("documented PUT /hello did not update exact /hello state")

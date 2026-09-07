@@ -31,7 +31,7 @@ from typing import (
     cast,
     overload,
 )
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urljoin, urlsplit
 
 if TYPE_CHECKING:
     import aiohttp
@@ -1384,6 +1384,7 @@ class PublishOptions(MutationOptions):
     media_type: MediaType | str = MediaTypes.BINARY
     filename: str | None = None
     unpack: bool = False
+    replace: bool = False
     managed: bool = False
 
 
@@ -2507,6 +2508,8 @@ def _publish_headers(
         )
     if options.unpack:
         headers.append(("Unpack", "1"))
+    if options.replace:
+        headers.append(("Replace", "1"))
     if options.managed:
         headers.append(("Management-Action", "claim"))
     if creator_claim is not None:
@@ -3118,6 +3121,22 @@ class FolderClient:
         )
 
 
+def _hosted_content(file: FileClient) -> ApiResponse:
+    response = file.get()
+    if response.status == 307:
+        location = response.header("Location")
+        if location is None:
+            _raise(response)
+        response = file.site.symbol._send(
+            HttpMethod.GET,
+            urljoin(file.site.symbol.origin + "/", location),
+            headers=_options(replace(RequestOptions(), token=file.site.token)),
+        )
+    if response.status != 200:
+        _raise(response)
+    return response
+
+
 class FileClient:
     def __init__(self, site: SiteClient, path: str) -> None:
         self.site, self.path = site, path.strip("/")
@@ -3134,16 +3153,10 @@ class FileClient:
         )
 
     def text(self) -> str:
-        response = self.get()
-        if response.status != 200:
-            _raise(response)
-        return response.text()
+        return _hosted_content(self).text()
 
     def bytes(self) -> bytes:
-        response = self.get()
-        if response.status != 200:
-            _raise(response)
-        return response.body
+        return _hosted_content(self).body
 
     def json(self) -> Any:
         return _json.loads(self.text())
@@ -3858,6 +3871,22 @@ class AsyncFolderClient:
         )
 
 
+async def _ahosted_content(file: AsyncFileClient) -> ApiResponse:
+    response = await file.get()
+    if response.status == 307:
+        location = response.header("Location")
+        if location is None:
+            _raise(response)
+        response = await file.site.symbol._send(
+            HttpMethod.GET,
+            urljoin(file.site.symbol.origin + "/", location),
+            headers=_options(replace(RequestOptions(), token=file.site.token)),
+        )
+    if response.status != 200:
+        _raise(response)
+    return response
+
+
 class AsyncFileClient:
     def __init__(self, site: AsyncSiteClient, path: str) -> None:
         self.site, self.path = site, path.strip("/")
@@ -3873,16 +3902,10 @@ class AsyncFileClient:
         )
 
     async def text(self) -> str:
-        response = await self.get()
-        if response.status != 200:
-            _raise(response)
-        return await response.atext()
+        return await (await _ahosted_content(self)).atext()
 
     async def bytes(self) -> bytes:
-        response = await self.get()
-        if response.status != 200:
-            _raise(response)
-        return await response.aread()
+        return await (await _ahosted_content(self)).aread()
 
     async def json(self) -> Any:
         return _json.loads(await self.text())

@@ -247,6 +247,7 @@ struct PublishRequestOptions {
     idempotency: Option<Idempotency>,
     creation: CreationSecurity,
     authorization: Option<ManagementToken>,
+    replace: bool,
 }
 
 struct CreationRequest {
@@ -1841,11 +1842,19 @@ async fn publish(app: &App, wanted: Option<String>, headers: &HeaderMap, body: B
         .is_none()
         .then(|| idempotency_from(headers))
         .flatten();
+    let replace = wants_replace(headers);
+    if replace && wanted.is_none() {
+        return plain(
+            StatusCode::BAD_REQUEST,
+            "error: Replace applies to a named site PUT",
+        );
+    }
     let options = PublishRequestOptions {
         expected_tree_hash,
         idempotency,
         creation: creation.security,
         authorization,
+        replace,
     };
     let filename = filename_from(headers);
     let ctype = headers
@@ -1901,6 +1910,7 @@ async fn publish(app: &App, wanted: Option<String>, headers: &HeaderMap, body: B
                         idempotency: options.idempotency.as_ref(),
                         creation: options.creation,
                         authorization: options.authorization.as_ref(),
+                        replace: options.replace,
                     },
                 )
             }
@@ -2002,6 +2012,7 @@ async fn publish_archive(
                 idempotency: options.idempotency.as_ref(),
                 creation: options.creation,
                 authorization: options.authorization.as_ref(),
+                replace: options.replace,
             },
         )
     })
@@ -2028,6 +2039,12 @@ async fn put_file(
     }
     if let Err(err) = store::validate_mutation_target(&path) {
         return err.into_response();
+    }
+    if wants_replace(&headers) {
+        return plain(
+            StatusCode::BAD_REQUEST,
+            "error: Replace applies to a whole site, not a single path",
+        );
     }
     let creation = match creation_request(&headers) {
         Ok(creation) => creation,
@@ -2064,6 +2081,7 @@ async fn put_file(
                         idempotency: None,
                         creation: creation.security,
                         authorization: authorization.as_ref(),
+                        replace: false,
                     },
                 )
             }
@@ -2368,7 +2386,17 @@ async fn browse_path(
             browse_dir(&app, &name, rel, true, &headers).await
         }
         Ok(store::Node::File { .. }) => {
-            Redirect::temporary(&format!("/{name}/{rel}")).into_response()
+            let target = app
+                .run_store({
+                    let name = name.clone();
+                    let rel = rel.to_string();
+                    move |store| Ok(pretty_html_rel(&store, &name, &rel)?.unwrap_or(rel))
+                })
+                .await;
+            match target {
+                Ok(path) => Redirect::temporary(&format!("/{name}/{path}")).into_response(),
+                Err(err) => err.into_response(),
+            }
         }
         Err(err) => err.into_response(),
     }
@@ -2422,11 +2450,14 @@ async fn serve_from(app: &App, name: &str, rel: &str, headers: &HeaderMap) -> Re
         .run_store({
             let name = name.to_string();
             let rel = rel.to_string();
-            move |store| lookup_with_html_fallback(&store, &name, &rel)
+            move |store| lookup_site_get_redirecting(&store, &name, &rel)
         })
         .await;
     match node {
-        Ok(store::Node::Dir) => {
+        Ok(SiteGet::Redirect(pretty)) => {
+            Redirect::temporary(&format!("/{name}/{pretty}")).into_response()
+        }
+        Ok(SiteGet::Node(store::Node::Dir)) => {
             if !rel.is_empty() && !rel.ends_with('/') {
                 return Redirect::temporary(&format!("/{name}/{rel}/")).into_response();
             }
@@ -2448,10 +2479,66 @@ async fn serve_from(app: &App, name: &str, rel: &str, headers: &HeaderMap) -> Re
             add_target_expiry_headers(app, name, rel, response.headers_mut()).await;
             response
         }
-        Ok(store::Node::File { logical, hash }) => {
+        Ok(SiteGet::Node(store::Node::File { logical, hash })) => {
             send_expiring_blob(headers, name, &logical, &hash, app).await
         }
         Err(err) => err.into_response(),
+    }
+}
+
+enum SiteGet {
+    Redirect(String),
+    Node(store::Node),
+}
+
+fn lookup_site_get_redirecting(
+    store: &Store,
+    name: &str,
+    rel: &str,
+) -> Result<SiteGet, StoreError> {
+    if let Some(pretty) = pretty_html_rel(store, name, rel)? {
+        return Ok(SiteGet::Redirect(pretty));
+    }
+    lookup_with_html_fallback(store, name, rel).map(SiteGet::Node)
+}
+
+fn pretty_html_rel(store: &Store, site: &str, rel: &str) -> Result<Option<String>, StoreError> {
+    let (dir, name) = match rel.rsplit_once('/') {
+        Some((dir, name)) => (dir, name),
+        None => ("", rel),
+    };
+    let Some((stem, suffix)) = pathutil::html_suffix(name) else {
+        return Ok(None);
+    };
+    match store.lookup(site, rel) {
+        Ok(store::Node::File { .. }) => {}
+        Ok(store::Node::Dir) | Err(StoreError::NotFound) => return Ok(None),
+        Err(err) => return Err(err),
+    }
+    let pretty = if dir.is_empty() {
+        stem.to_string()
+    } else {
+        format!("{dir}/{stem}")
+    };
+    if path_claimed(store, site, &pretty)? {
+        return Ok(None);
+    }
+    if suffix == pathutil::HtmlSuffix::Htm && path_claimed(store, site, &format!("{pretty}.html"))?
+    {
+        return Ok(None);
+    }
+    Ok(Some(pretty))
+}
+
+fn path_claimed(store: &Store, site: &str, rel: &str) -> Result<bool, StoreError> {
+    match store.lookup(site, rel) {
+        Ok(_) => Ok(true),
+        Err(StoreError::NotFound) => match store.alias(site, rel) {
+            Ok(_) => Ok(true),
+            Err(StoreError::NotFound) => Ok(false),
+            Err(err) => Err(err),
+        },
+        Err(err) => Err(err),
     }
 }
 
@@ -2789,7 +2876,15 @@ fn range_not_satisfiable(size: u64, etag: &str, policy: http_cache::Policy) -> R
 }
 
 fn wants_unpack(headers: &HeaderMap) -> bool {
-    headers.get("unpack").is_some_and(|v| {
+    truthy_flag(headers, "unpack")
+}
+
+fn wants_replace(headers: &HeaderMap) -> bool {
+    truthy_flag(headers, "replace")
+}
+
+fn truthy_flag(headers: &HeaderMap, name: &'static str) -> bool {
+    headers.get(name).is_some_and(|v| {
         v.to_str().is_ok_and(|v| {
             let v = v.trim();
             v.is_empty()
@@ -3489,9 +3584,22 @@ mod tests {
         assert_eq!(response.headers()[header::CACHE_CONTROL], "no-cache");
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/hello/index.html")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(response.headers()[header::LOCATION], "/hello/index");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/hello/index")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -3639,6 +3747,9 @@ mod tests {
             .put_file("hello", "contact.html", b"html fallback")
             .unwrap();
         store.put_file("hello", "about", b"exact file").unwrap();
+        store
+            .put_file("hello", "contact.htm", b"htm sibling")
+            .unwrap();
         let app = router(test_app(store));
 
         for (path, expected) in [
@@ -3660,6 +3771,7 @@ mod tests {
         }
 
         let missing = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/hello/missing")
@@ -3669,6 +3781,63 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        for (path, location) in [
+            ("/hello/contact.html", "/hello/contact"),
+            ("/hello/legacy.htm", "/hello/legacy"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT, "{path}");
+            assert_eq!(response.headers()[header::LOCATION], location, "{path}");
+        }
+
+        let shadowed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/hello/about.html")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(shadowed.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(shadowed.into_body(), usize::MAX).await.unwrap(),
+            "html fallback"
+        );
+
+        let htm_sibling = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/hello/contact.htm")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(htm_sibling.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(htm_sibling.into_body(), usize::MAX).await.unwrap(),
+            "htm sibling"
+        );
+
+        let files = app
+            .oneshot(
+                Request::builder()
+                    .uri("/hello/FILES/contact.html")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(files.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(files.headers()[header::LOCATION], "/hello/contact");
     }
 
     #[tokio::test]
@@ -4091,6 +4260,86 @@ mod tests {
             store.lookup("source", "new.txt"),
             Err(StoreError::NotFound)
         ));
+    }
+
+    #[tokio::test]
+    async fn replace_header_prunes_on_site_put_and_is_rejected_on_file_put() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::new(root.path().to_path_buf()).unwrap();
+        store.put_file("hello", "keep.txt", b"keep").unwrap();
+        store.put_file("hello", "drop.txt", b"drop").unwrap();
+        let app = router(test_app(store.clone()));
+
+        let rejected = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/hello/keep.txt")
+                    .header("Replace", "1")
+                    .body(Body::from("nope"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        assert!(store.lookup("hello", "drop.txt").is_ok());
+
+        let unnamed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/")
+                    .header("Replace", "1")
+                    .header(header::CONTENT_TYPE, "text/html")
+                    .body(Body::from("<p>nope</p>"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unnamed.status(), StatusCode::BAD_REQUEST);
+
+        let replaced = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/hello")
+                    .header("Replace", "1")
+                    .header(
+                        header::CONTENT_DISPOSITION,
+                        "attachment; filename=\"keep.txt\"",
+                    )
+                    .body(Body::from("kept"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replaced.status(), StatusCode::OK);
+        assert!(store.lookup("hello", "keep.txt").is_ok());
+        assert!(matches!(
+            store.lookup("hello", "drop.txt"),
+            Err(StoreError::NotFound)
+        ));
+        assert!(store.lookup("hello", "symbol.toml").is_ok());
+        let undo = replaced.headers()["undo-token"]
+            .to_str()
+            .unwrap()
+            .to_string();
+        let restored = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::from_bytes(b"UNDO").unwrap())
+                    .uri("/hello")
+                    .header("Undo-Token", undo)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(restored.status(), StatusCode::OK);
+        assert!(store.lookup("hello", "drop.txt").is_ok());
     }
 
     #[tokio::test]
