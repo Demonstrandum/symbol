@@ -111,6 +111,7 @@ usage:
   symbol ls [-l] [NAME]
   symbol rm NAME [PATH]
   symbol url NAME
+  symbol api [--json]
   symbol stats
   symbol update
   symbol help
@@ -126,6 +127,8 @@ put:
 
 streams:
   - in a source position reads stdin
+  - put reads a pipe without - only when a terminal is attached
+    and no file source is given; SYMBOL_STDIN=always|never overrides
   - as get/pop output writes archive bytes to stdout
 
 aliases:
@@ -133,6 +136,7 @@ aliases:
   list -> ls; download -> get; delete -> rm; upgrade -> update
 
 env: SYMBOL_HOST (default ${HOST}); SYMBOL_TOKEN
+     SYMBOL_STDIN=tty|always|never (default tty)
 EOF
 }
 
@@ -142,6 +146,7 @@ command_help() {
 symbol put: publish or merge files into a site
 usage: symbol put [-u|--unpack] [--managed] [NAME [FILE [DEST]]]
        command | symbol put [NAME] -
+       command | symbol put            (terminal only)
 EOF
       ;;
     clone) printf '%s\n' 'symbol clone: create a local checkout' 'usage: symbol clone NAME [DIR]' ;;
@@ -151,6 +156,7 @@ EOF
     remix) printf '%s\n' 'symbol remix: duplicate a site and clone the copy locally' 'usage: symbol remix [--managed] SRC [DST]' ;;
     move) printf '%s\n' 'symbol move: rename a site without transferring files' 'usage: symbol move SRC DST' ;;
     alias) printf '%s\n' 'symbol alias: create live path aliases atomically' 'usage: symbol alias SITE PATH TARGET [PATH TARGET ...]' ;;
+    api) printf '%s\n' 'symbol api: show the live server API version and build' 'usage: symbol api [--json]' ;;
     stats) printf '%s\n' 'symbol stats: show storage, deduplication, cache, and reader totals' 'usage: symbol stats' ;;
     sync) printf '%s\n' 'symbol sync: publish only when the remote baseline has not changed' 'usage: symbol sync [--check]' ;;
     undo) printf '%s\n' 'symbol undo: reverse a retained mutation or inspect the undo stack' 'usage: symbol undo [--stack] [NAME [TOKEN]]' ;;
@@ -200,6 +206,30 @@ request() {
   path=$2
   shift 2
   curl -sS -X "${method}" "$@" "${HOST}${path}"
+}
+
+print_api() {
+  json=$(cat)
+  version=$(printf '%s\n' "${json}" | json_string api_version) ||
+    die "invalid API version document"
+  revision=$(printf '%s\n' "${json}" | json_string absolute_revision) ||
+    die "invalid API version document"
+  source=$(printf '%s\n' "${json}" | json_string source_hash) ||
+    die "invalid API version document"
+  commit=$(printf '%s\n' "${json}" | json_string commit) ||
+    die "invalid API version document"
+  dirty=$(printf '%s\n' "${json}" | json_string dirty) ||
+    die "invalid API version document"
+  case "${dirty}" in
+    true) dirty=yes ;;
+    false) dirty=no ;;
+    *) die "invalid API version dirty flag" ;;
+  esac
+  printf 'version   %s\n' "${version}"
+  printf 'revision  %s\n' "${revision}"
+  printf 'source    %s\n' "${source}"
+  printf 'commit    %s\n' "${commit}"
+  printf 'dirty     %s\n' "${dirty}"
 }
 
 print_stats() {
@@ -721,6 +751,7 @@ copy copy
 remix remix x
 move move rename
 alias alias
+api api
 stats stats
 sync sync
 undo undo
@@ -1714,6 +1745,31 @@ refresh_local_manifest() {
 stdin_to_temp() {
   STDIN_FILE=$(mktemp) || exit 1
   cat > "${STDIN_FILE}"
+}
+
+attached_to_terminal() {
+  [ -t 1 ] || [ -t 2 ]
+}
+
+imply_stdin_tty() {
+  [ ! -t 0 ] && attached_to_terminal
+}
+
+imply_stdin_always() {
+  [ ! -t 0 ]
+}
+
+imply_stdin_never() {
+  return 1
+}
+
+resolve_imply_stdin() {
+  case "${SYMBOL_STDIN:-tty}" in
+    tty) IMPLY_STDIN=imply_stdin_tty ;;
+    always) IMPLY_STDIN=imply_stdin_always ;;
+    never) IMPLY_STDIN=imply_stdin_never ;;
+    *) usage_error "SYMBOL_STDIN must be tty, always, or never" ;;
+  esac
 }
 
 copy_or_move_request() {
@@ -2951,9 +3007,13 @@ case "${cmd}" in
     piped=0
     explicit_stdin=0
     [ "$#" -eq 0 ] || [ "$1" != "-" ] || explicit_stdin=1
-    if [ ! -t 0 ] || [ "${explicit_stdin}" -eq 1 ]; then
+    resolve_imply_stdin
+    if [ "${explicit_stdin}" -eq 1 ]; then
       stdin_to_temp
-      if [ "${explicit_stdin}" -eq 1 ] || [ -s "${STDIN_FILE}" ]; then
+      piped=1
+    elif { [ -n "${forced}" ] || [ "$#" -eq 0 ]; } && "${IMPLY_STDIN}"; then
+      stdin_to_temp
+      if [ -s "${STDIN_FILE}" ]; then
         piped=1
       else
         rm -f "${STDIN_FILE}"
@@ -3378,6 +3438,24 @@ EOF
       if [ -n "${stats}" ]; then
         echo "  ${stats}"
       fi
+    fi
+    ;;
+  api)
+    json=0
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --json) json=1; shift ;;
+        --) shift; break ;;
+        -*) usage_error "unknown flag: $1" ;;
+        *) break ;;
+      esac
+    done
+    [ "$#" -eq 0 ] || usage_error "api accepts no arguments"
+    api_json=$(request GET /API/VERSION)
+    if [ "${json}" -eq 1 ]; then
+      printf '%s\n' "${api_json}"
+    else
+      printf '%s\n' "${api_json}" | print_api
     fi
     ;;
   stats)

@@ -159,6 +159,15 @@ class ApiIdentity:
     source_hash: Blake3
 
 
+@dataclass(frozen=True, slots=True)
+class ApiVersionDocument:
+    api_version: ApiVersion
+    absolute_revision: int
+    source_hash: Blake3
+    commit: GitCommit
+    dirty: bool
+
+
 METADATA_JSON: Final[str] = """{METADATA}"""
 
 
@@ -1961,25 +1970,27 @@ def _size_distribution(value: object, response: ApiResponse) -> SizeDistribution
     )
 
 
-def _api_identity(response: ApiResponse) -> ApiIdentity:
+def _api_version_document(response: ApiResponse) -> ApiVersionDocument:
     if response.status != 200:
         _raise(response)
     value = _exact_object(
         _json_object(response),
-        ("api_version", "absolute_revision", "source_hash"),
+        ("api_version", "absolute_revision", "source_hash", "commit", "dirty"),
         response,
     )
     try:
-        identity = ApiIdentity(
+        document = ApiVersionDocument(
             api_version=ApiVersion.parse(_string(value["api_version"], response)),
             absolute_revision=_integer(value["absolute_revision"], response),
             source_hash=Blake3(_string(value["source_hash"], response)),
+            commit=GitCommit(_string(value["commit"], response)),
+            dirty=_boolean(value["dirty"], response),
         )
     except ValueError as error:
         raise MalformedResponseError(response) from error
-    if identity.absolute_revision <= 0:
+    if document.absolute_revision <= 0:
         raise MalformedResponseError(response)
-    return identity
+    return document
 
 
 def _response_identity(response: ApiResponse) -> ApiIdentity:
@@ -2744,13 +2755,13 @@ class _SymbolSync:
             _raise(response)
         return response
 
-    def api_version(self, options: RequestOptions = RequestOptions()) -> ApiIdentity:
+    def api_version(self, options: RequestOptions = RequestOptions()) -> ApiVersionDocument:
         response = self._send(
             HttpMethod.GET,
             self.origin + "/API/VERSION",
             headers=_options(options),
         )
-        return _api_identity(response)
+        return _api_version_document(response)
 
     def create(
         self,
@@ -3477,13 +3488,13 @@ class _SymbolAsync:
 
     async def api_version(
         self, options: RequestOptions = RequestOptions()
-    ) -> ApiIdentity:
+    ) -> ApiVersionDocument:
         response = await self._send(
             HttpMethod.GET,
             self.origin + "/API/VERSION",
             headers=_options(options),
         )
-        return _api_identity(response)
+        return _api_version_document(response)
 
     async def create(
         self,
@@ -4204,6 +4215,7 @@ __all__ = (
     "ApiClientAsset",
     "ApiIdentity",
     "ApiManual",
+    "ApiVersionDocument",
     "ApiMetadata",
     "ApiRequest",
     "ApiResponse",

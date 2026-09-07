@@ -221,10 +221,15 @@ def test_sync_client_mapping() -> None:
             "api_version": api.API_VERSION,
             "absolute_revision": api.API_REVISION,
             "source_hash": api.SOURCE_HASH,
+            "commit": api.BUILD_COMMIT,
+            "dirty": api.BUILD_DIRTY,
         },
         (("Content-Type", "application/json"),),
     )
-    assert symbol.api_version().source_hash == api.SOURCE_HASH
+    document = symbol.api_version()
+    assert document.source_hash == api.SOURCE_HASH
+    assert document.commit == api.BUILD_COMMIT
+    assert document.dirty == api.BUILD_DIRTY
 
     backend.queue(200, b"hello", (("Content-Type", "text/plain"),))
     assert symbol.site("demo").file("space name.txt").text() == "hello"

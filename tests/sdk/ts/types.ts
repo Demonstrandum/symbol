@@ -5,6 +5,7 @@ import {
   type ArchiveDownload,
   BodyNotReplayableError,
   type CachedApiIdentity,
+  type SymbolApiVersion,
   type CachedFileInventory,
   type CachedTextAsset,
   ContentFormats,
@@ -59,6 +60,7 @@ type _AllocationExact = Expect<NoOptional<AllocationReceipt>>;
 type _ReplacementExact = Expect<NoOptional<FileReplaceReceipt>>;
 type _SpliceExact = Expect<NoOptional<SpliceReceipt>>;
 type _ExpiryExact = Expect<NoOptional<ExpiryReport>>;
+type _ApiVersionExact = Expect<NoOptional<SymbolApiVersion>>;
 
 async function narrowing(): Promise<void> {
   const cached = await inventory;
@@ -72,6 +74,8 @@ async function narrowing(): Promise<void> {
   const identity = await apiIdentity;
   if (identity.status === 200) {
     identity.identity.apiVersion.join(".");
+    identity.identity.commit.length;
+    identity.identity.dirty === true || identity.identity.dirty === false;
   } else {
     const absent: null = identity.identity;
     void absent;

@@ -775,10 +775,12 @@ function validateSchema(schema, value) {
     const object = exactObject(value, schema);
     switch (schema) {
         case "api_version":
-            exactKeys(object, ["api_version", "absolute_revision", "source_hash"], schema);
+            exactKeys(object, ["api_version", "absolute_revision", "source_hash", "commit", "dirty"], schema);
             assert.match(object.api_version, /^\d+\.\d+\.\d+$/);
             assert(Number.isSafeInteger(object.absolute_revision));
             assert.match(object.source_hash, /^[0-9a-f]{64}$/);
+            assert.match(object.commit, /^(?:unknown|[0-9a-fA-F]{7,64})$/);
+            assert.equal(typeof object.dirty, "boolean");
             return;
         case "stats":
             exactKeys(object, [
@@ -959,6 +961,8 @@ function canonicalOutcome(
                 api_version: "0.0.0",
                 absolute_revision: 1,
                 source_hash: "a".repeat(64),
+                commit: "0123456789abcdef",
+                dirty: false,
             });
         case "stats":
             return json(base, statsFixture());

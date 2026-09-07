@@ -83,12 +83,16 @@ const API_DOC_PROTOCOL_HTML: &str = generated_asset!("api-doc-protocol.html");
 const API_VERSION: &str = env!("SYMBOL_API_VERSION");
 const API_REVISION: &str = env!("SYMBOL_API_REVISION");
 const API_SOURCE_HASH: &str = env!("SYMBOL_API_SOURCE_HASH");
+const API_COMMIT: &str = env!("SYMBOL_API_COMMIT");
+const API_DIRTY: &str = env!("SYMBOL_API_DIRTY");
 static NEXT_MUTATION_SIGNAL_ID: AtomicU64 = AtomicU64::new(1);
 static API_VERSION_DOCUMENT: LazyLock<String> = LazyLock::new(|| {
     serde_json::json!({
         "api_version": API_VERSION,
         "absolute_revision": API_REVISION.parse::<u64>().expect("generated API revision"),
         "source_hash": API_SOURCE_HASH,
+        "commit": API_COMMIT,
+        "dirty": API_DIRTY == "true",
     })
     .to_string()
 });
@@ -5053,5 +5057,7 @@ mod tests {
         assert_eq!(version["api_version"], API_VERSION);
         assert_eq!(version["absolute_revision"].to_string(), API_REVISION);
         assert_eq!(version["source_hash"], API_SOURCE_HASH);
+        assert_eq!(version["commit"], API_COMMIT);
+        assert_eq!(version["dirty"], API_DIRTY == "true");
     }
 }

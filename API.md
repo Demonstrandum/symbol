@@ -137,8 +137,8 @@ streaming.
 
 `docs`, `installer`, `shellClient`, `apiClient`, and `apiManual` return
 cache-aware text assets. Their matching `*Hash` methods return raw Blake3
-digests. `apiVersion` returns the server version tuple, absolute revision, and
-source hash.
+digests. `apiVersion` returns the server version tuple, absolute revision,
+source hash, git commit, and dirty bit.
 
 ### `apiIdentity` and `assertExactApi()`
 
@@ -421,7 +421,8 @@ to the hierarchy. Leaving a `with` block closes only owned transports.
 `ServingStats`, `CacheStats`, and `ReaderStats`. `sites` returns
 `DirectoryListing`. `create` publishes an unnamed site. `site` constructs a
 site client. `api_client`, `api_client_hash`, `api_manual`, and `api_version`
-read built-in resources. `request` is the raw escape hatch.
+read built-in resources. `api_version` returns `ApiVersionDocument`, including
+the server git commit and dirty bit. `request` is the raw escape hatch.
 
 ```python
 from symbol_api import ApiClientAsset, ApiManual, Symbol
@@ -716,6 +717,9 @@ chmod +x symbol
 `SYMBOL_HOST` selects the server and defaults to `http://symbol`.
 `SYMBOL_TOKEN` supplies a management token. `-t/--token` takes precedence and
 may appear before or after the command, before `--`.
+`SYMBOL_STDIN` is `tty` (default), `always`, or `never`: a pipe without `-`
+is stdin only when no file source is given, and only in a terminal unless
+set to `always`. `never` requires `-`.
 
 `-` means stdin in an upload/source position and stdout in a download
 destination position. The client keeps binary stdout clean so archives can be
@@ -736,6 +740,11 @@ symbol help remix
 symbol put [-u|--unpack] [--managed] [NAME [FILE [DEST]]]
 command | symbol put [NAME] -
 ```
+
+A pipe without `-` is stdin only when no file source is given and stdout
+or stderr is a terminal. `SYMBOL_STDIN=always` treats any non-terminal
+stdin as a pipe; `SYMBOL_STDIN=never` requires `-`. Scripts and CI should
+pass `-` or set `never`.
 
 Without `NAME`, Symbol creates a random site. A single HTML input becomes
 `index.html`. Directories are packed and unpacked automatically. `-u` unpacks
@@ -833,18 +842,22 @@ symbol manage NAME --release
 Management is optional write protection. Reads remain public. Claim and rotate
 return a token once; release makes writes open again.
 
-### `ls`, `stats`, and `url`
+### `ls`, `stats`, `url`, and `api`
 
 ```sh
 symbol ls
 symbol ls -l NAME
 symbol stats
 symbol url NAME
+symbol api
+symbol api --json
 ```
 
 `ls` lists sites or a linked file tree. `stats` shows logical/physical bytes,
 deduplication, distributions, cache, and reader metrics. `url` prints one
-canonical site URL for scripting.
+canonical site URL for scripting. `api` prints the live `/API/VERSION`
+document: semantic version, absolute revision, source hash, git commit, and
+dirty bit. `--json` writes the server JSON.
 
 ### `rm`
 
@@ -895,8 +908,8 @@ copies otherwise.
 Commands resolve by unique proper-name prefix, then by substring only when no
 prefix matches. An ambiguous input reports only distinct proper operations.
 Proper command names are `put`, `clone`, `get`, `pop`, `copy`, `remix`,
-`move`, `alias`, `sync`, `undo`, `expire`, `manage`, `recover`, `ls`, `rm`,
-`url`, `stats`, `update`, and `help`.
+`move`, `alias`, `api`, `sync`, `undo`, `expire`, `manage`, `recover`, `ls`,
+`rm`, `url`, `stats`, `update`, and `help`.
 Aliases are footnotes, not additional proper commands:
 
 1. `push` → `put`
@@ -1042,8 +1055,12 @@ digest plus a newline.
 <!-- contract:api version -->
 ### `GET /API/VERSION`
 
-Returns `api_version`, `absolute_revision`, and `source_hash` as JSON with a
-strong ETag and `Cache-Control: no-cache`.
+Returns `api_version`, `absolute_revision`, `source_hash`, `commit`, and
+`dirty` as JSON with a strong ETag and `Cache-Control: no-cache`. `commit` is
+the raw hexadecimal Git object name baked into the server, or `unknown`.
+`dirty` is true when that build included uncommitted canonical source.
+
+Canonical client: `symbol api`, or `symbol api --json`.
 
 ## Protocol conventions
 
@@ -1254,7 +1271,7 @@ Content-Type: text/plain; charset=utf-8
 ok k7qm https://symbol.example/k7qm/ (1 files, changed: true)
 ```
 
-Canonical client: `symbol put FILE`, or piped `symbol put`.
+Canonical client: `symbol put FILE`, or piped `symbol put -`.
 
 <!-- contract:docs hash -->
 ### `GET /HASH`

@@ -34,6 +34,31 @@ contains() {
   printf '%s' "$1" | awk -v wanted="$2" 'index($0,wanted){found=1} END{exit !found}'
 }
 
+with_tty() {
+  python3 -c '
+import os
+import pty
+import subprocess
+import sys
+
+cmd = sys.argv[1:]
+master, slave = pty.openpty()
+try:
+    proc = subprocess.Popen(
+        cmd,
+        stdin=sys.stdin,
+        stdout=subprocess.PIPE,
+        stderr=slave,
+    )
+finally:
+    os.close(slave)
+out, _ = proc.communicate()
+os.close(master)
+sys.stdout.buffer.write(out)
+raise SystemExit(proc.returncode)
+' "$@"
+}
+
 site_from_put() {
   awk '
     $1 == "ok" { print $2; exit }
@@ -160,19 +185,19 @@ explicit_name=$(printf '%s\n' "${explicit}" | site_from_put)
   fail "put dash publishes stdin as random index"
 ok "put dash publishes stdin as random index"
 
-implicit=$(printf '<h1>implicit</h1>\n' | "${CLIENT}" put)
+implicit=$(printf '<h1>implicit</h1>\n' | with_tty "${CLIENT}" put)
 implicit_name=$(printf '%s\n' "${implicit}" | site_from_put)
 [ -n "${implicit_name}" ] &&
   [ "$(curl -fsS "${BASE}/${implicit_name}/index.html")" = '<h1>implicit</h1>' ] ||
-  fail "bare piped put publishes random index"
+  fail "bare piped put publishes random index in a terminal"
 [ -s "${XDG_STATE_HOME}/symbol/claims/${explicit_name}" ] &&
   [ -s "${XDG_STATE_HOME}/symbol/claims/${implicit_name}" ] ||
   fail "ordinary creation pre-persists creator claims"
-ok "bare piped put publishes random index"
+ok "bare piped put publishes random index in a terminal"
 
 rm -f "${DROP_STATE}/PUT" "${DROP_STATE}/missing-pending-PUT"
 dropped_put=$(printf '<h1>dropped response</h1>\n' |
-  DROP_METHOD=PUT "${CLIENT}" put)
+  DROP_METHOD=PUT "${CLIENT}" put -)
 dropped_put_name=$(printf '%s\n' "${dropped_put}" | site_from_put)
 [ -n "${dropped_put_name}" ] &&
   [ -s "${XDG_STATE_HOME}/symbol/claims/${dropped_put_name}" ] &&
@@ -183,7 +208,7 @@ ok "dropped PUT response recovers committed site and claim"
 
 rm -f "${DROP_STATE}/always-PUT" "${DROP_STATE}/missing-pending-PUT"
 if printf '<h1>process restart</h1>\n' |
-  DROP_ALWAYS_METHOD=PUT "${CLIENT}" put >/dev/null 2>&1; then
+  DROP_ALWAYS_METHOD=PUT "${CLIENT}" put - >/dev/null 2>&1; then
   fail "repeated response loss should leave PUT pending"
 fi
 pending=$(find "${XDG_STATE_HOME}/symbol/claims" -type d -name 'pending-*' | awk 'NR==1{print}')
@@ -267,7 +292,7 @@ ok "get zip contains canonical manifest"
 [ -f "${ROOT}/work/checkout/symbol.toml" ] || fail "clone creates checkout"
 baseline_before=$(awk -F '"' '$1 ~ /^tree_hash/ { print $2 }' "${ROOT}/work/checkout/symbol.toml")
 printf 'extensionless\n' |
-  (cd "${ROOT}/work/checkout" && "${CLIENT}" put -f data >/dev/null)
+  (cd "${ROOT}/work/checkout" && "${CLIENT}" put -f data - >/dev/null)
 [ "$(curl -fsS "${BASE}/e2e-main/data")" = extensionless ] ||
   fail "forced extensionless stdin file publishes to manifest target"
 baseline_after=$(awk -F '"' '$1 ~ /^tree_hash/ { print $2 }' "${ROOT}/work/checkout/symbol.toml")

@@ -104,6 +104,7 @@ fn write_outputs(
     ledger: VersionLedger,
     schema: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let provenance = BuildProvenance::discover(root)?;
     println!("cargo::rustc-env=SYMBOL_API_VERSION={}", ledger.version);
     println!(
         "cargo::rustc-env=SYMBOL_API_REVISION={}",
@@ -113,11 +114,13 @@ fn write_outputs(
         "cargo::rustc-env=SYMBOL_API_SOURCE_HASH={}",
         ledger.source_hash
     );
+    println!("cargo::rustc-env=SYMBOL_API_COMMIT={}", provenance.commit);
+    println!(
+        "cargo::rustc-env=SYMBOL_API_DIRTY={}",
+        if provenance.dirty { "true" } else { "false" }
+    );
     write_generated_file(&out_dir.join("schema.sql"), schema)?;
-    let metadata = GenerationMetadata {
-        ledger,
-        provenance: BuildProvenance::discover(root)?,
-    };
+    let metadata = GenerationMetadata { ledger, provenance };
     generate_artifacts(root, &metadata)?.write_to(out_dir)?;
     let api_source = fs::read_to_string(root.join("API.md"))?;
     for page in generation::docs::compile(&api_source)? {

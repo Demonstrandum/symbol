@@ -25,6 +25,11 @@ export interface SymbolApiIdentity {
   readonly sourceHash: Blake3;
 }
 
+export interface SymbolApiVersion extends SymbolApiIdentity {
+  readonly commit: GitCommit;
+  readonly dirty: boolean;
+}
+
 export const METADATA_JSON: string = "{METADATA_JSON}";
 
 function parseMetadata(source: string): Readonly<SymbolApiMetadata> {
@@ -1893,7 +1898,7 @@ export type CachedTextAsset =
 export type CachedApiIdentity =
   | {
       readonly status: 200;
-      readonly identity: SymbolApiIdentity;
+      readonly identity: SymbolApiVersion;
       readonly etag: string;
       readonly cacheControl: string;
       readonly response: Response;
@@ -3157,7 +3162,7 @@ async function decodeCachedApiVersion(response: Response): Promise<CachedApiIden
   }
   const value = exactRecord(
     await jsonValue(response),
-    ["api_version", "absolute_revision", "source_hash"],
+    ["api_version", "absolute_revision", "source_hash", "commit", "dirty"],
     "API version",
   );
   const sourceHash = stringValue(value.source_hash, "API version.source_hash");
@@ -3168,6 +3173,8 @@ async function decodeCachedApiVersion(response: Response): Promise<CachedApiIden
     apiVersion: apiVersion(stringValue(value.api_version, "API version.api_version")),
     absoluteRevision: unsigned(value.absolute_revision, "API version.absolute_revision"),
     sourceHash: blake3(sourceHash),
+    commit: gitCommit(stringValue(value.commit, "API version.commit")),
+    dirty: booleanValue(value.dirty, "API version.dirty"),
   });
   return Object.freeze({
     status: 200,

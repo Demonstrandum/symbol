@@ -113,6 +113,9 @@ tree_hash = "blake3:new"
 "index.html" = "blake3:file"'
     fi
     ;;
+  GET:*/API/VERSION)
+    body='{"api_version":"0.4.1","absolute_revision":12,"source_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","commit":"0123456789abcdef","dirty":true}'
+    ;;
   GET:*/FILES)
     if [ "${MOCK_LIST_ALIASES:-0}" = 1 ]; then
       body='hello/       2 files   10 B
@@ -206,10 +209,38 @@ failures=0 tests=0
 ok() { tests=$((tests + 1)); printf 'ok %d - %s\n' "${tests}" "$1"; }
 not_ok() { tests=$((tests + 1)); failures=$((failures + 1)); printf 'not ok %d - %s\n' "${tests}" "$1"; }
 contains() { printf '%s' "$1" | awk -v wanted="$2" 'index($0,wanted){found=1} END{exit !found}'; }
+with_tty() {
+  python3 -c '
+import os
+import pty
+import subprocess
+import sys
+
+cmd = sys.argv[1:]
+master, slave = pty.openpty()
+try:
+    proc = subprocess.Popen(
+        cmd,
+        stdin=sys.stdin,
+        stdout=subprocess.PIPE,
+        stderr=slave,
+    )
+finally:
+    os.close(slave)
+out, _ = proc.communicate()
+os.close(master)
+sys.stdout.buffer.write(out)
+raise SystemExit(proc.returncode)
+' "$@"
+}
 
 out=$("${CLIENT}" help)
 contains "${out}" 'symbol sync [--check]' &&
   contains "${out}" 'symbol alias SITE PATH TARGET [PATH TARGET ...]' &&
+  contains "${out}" 'symbol api [--json]' &&
+  contains "${out}" 'put reads a pipe without - only when a terminal is attached' &&
+  contains "${out}" 'and no file source is given' &&
+  contains "${out}" 'SYMBOL_STDIN=tty|always|never' &&
   ! contains "${out}" 'alias ->' &&
   ok 'canonical help treats alias as a command' ||
   not_ok 'canonical help treats alias as a command'
@@ -249,11 +280,32 @@ done
 if SYMBOL_TEST_RESOLVE_ONLY=1 "${CLIENT}" a >"${ROOT}/out" 2>"${ROOT}/err"; then
   not_ok 'alias command participates in ambiguity resolution'
 elif contains "$(cat "${ROOT}/err")" \
-  "ambiguous command 'a': add (put), alias"; then
+  "ambiguous command 'a': add (put), alias, api"; then
   ok 'alias command participates in ambiguity resolution'
 else
   not_ok 'alias command participates in ambiguity resolution'
 fi
+
+out=$("${CLIENT}" api)
+contains "${out}" 'version   0.4.1' &&
+  contains "${out}" 'revision  12' &&
+  contains "${out}" 'source    aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' &&
+  contains "${out}" 'commit    0123456789abcdef' &&
+  contains "${out}" 'dirty     yes' &&
+  ok 'api prints a live version document' ||
+  not_ok 'api prints a live version document'
+
+out=$("${CLIENT}" api --json)
+contains "${out}" '"api_version":"0.4.1"' &&
+  contains "${out}" '"commit":"0123456789abcdef"' &&
+  contains "${out}" '"dirty":true' &&
+  ok 'api --json writes the server document' ||
+  not_ok 'api --json writes the server document'
+
+help=$("${CLIENT}" help api)
+contains "${help}" 'symbol api [--json]' &&
+  ok 'api help names the json flag' ||
+  not_ok 'api help names the json flag'
 
 : > "${LOG}"
 out=$("${CLIENT}" -t alias-token alias hello current/app.js ../assets/app.js)
@@ -328,7 +380,7 @@ out=$("${CLIENT}" get hello -)
   ok 'get dash keeps stdout binary-only' || not_ok 'get dash keeps stdout binary-only'
 
 : > "${LOG}"
-printf '<h1>x</h1>' | "${CLIENT}" -t explicit put >/dev/null
+printf '<h1>x</h1>' | "${CLIENT}" -t explicit put - >/dev/null
 log=$(cat "${LOG}")
 contains "${log}" 'METHOD=PUT URL=http://mock/' &&
   contains "${log}" 'UPLOAD=-' &&
@@ -346,12 +398,89 @@ contains "$(cat "${LOG}")" 'METHOD=PUT URL=http://mock/' &&
   not_ok 'explicit stdin dash publishes random index'
 
 : > "${LOG}"
-printf '<h1>implicit</h1>\n' | "${CLIENT}" put >/dev/null
+printf '<h1>implicit</h1>\n' | with_tty "${CLIENT}" put >/dev/null || true
 contains "$(cat "${LOG}")" 'METHOD=PUT URL=http://mock/' &&
   contains "$(cat "${LOG}")" 'UPLOAD=-' &&
   contains "$(cat "${LOG}")" 'ARCHIVE=./index.html' &&
-  ok 'implicit piped stdin publishes random index' ||
-  not_ok 'implicit piped stdin publishes random index'
+  ok 'implicit piped stdin publishes random index in a terminal' ||
+  not_ok 'implicit piped stdin publishes random index in a terminal'
+
+: > "${LOG}"
+if printf '<h1>ignored</h1>\n' | "${CLIENT}" put >/dev/null 2>&1; then
+  not_ok 'non-terminal piped put requires explicit dash'
+elif contains "$(cat "${LOG}")" 'UPLOAD=-'; then
+  not_ok 'non-terminal piped put requires explicit dash'
+else
+  ok 'non-terminal piped put requires explicit dash'
+fi
+
+: > "${LOG}"
+printf '<h1>never</h1>\n' | SYMBOL_STDIN=never with_tty "${CLIENT}" put >/dev/null || true
+if contains "$(cat "${LOG}")" 'UPLOAD=-'; then
+  not_ok 'SYMBOL_STDIN=never disables implicit piped put'
+else
+  ok 'SYMBOL_STDIN=never disables implicit piped put'
+fi
+
+: > "${LOG}"
+printf '<h1>always</h1>\n' | SYMBOL_STDIN=always "${CLIENT}" put >/dev/null 2>&1 || true
+contains "$(cat "${LOG}")" 'METHOD=PUT URL=http://mock/' &&
+  contains "$(cat "${LOG}")" 'UPLOAD=-' &&
+  ok 'SYMBOL_STDIN=always implies piped put without a terminal' ||
+  not_ok 'SYMBOL_STDIN=always implies piped put without a terminal'
+
+if SYMBOL_STDIN=bogus "${CLIENT}" put >/dev/null 2>"${ROOT}/err"; then
+  not_ok 'invalid SYMBOL_STDIN is rejected'
+elif contains "$(cat "${ROOT}/err")" 'SYMBOL_STDIN must be tty, always, or never'; then
+  ok 'invalid SYMBOL_STDIN is rejected'
+else
+  not_ok 'invalid SYMBOL_STDIN is rejected'
+fi
+
+: > "${LOG}"
+if python3 - "${CLIENT}" put <<'PY'
+import os
+import subprocess
+import sys
+
+r, w = os.pipe()
+proc = subprocess.Popen(
+    sys.argv[1:],
+    stdin=r,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
+os.close(r)
+try:
+    proc.wait(timeout=2)
+except subprocess.TimeoutExpired:
+    proc.kill()
+    proc.wait()
+    os.close(w)
+    raise SystemExit(1)
+os.close(w)
+raise SystemExit(0)
+PY
+then
+  if contains "$(cat "${LOG}")" 'UPLOAD=-'; then
+    not_ok 'non-terminal put does not block on idle stdin'
+  else
+    ok 'non-terminal put does not block on idle stdin'
+  fi
+else
+  not_ok 'non-terminal put does not block on idle stdin'
+fi
+
+printf 'from-disk\n' > "${ROOT}/work/from-disk.txt"
+: > "${LOG}"
+printf '<h1>from-stdin</h1>\n' |
+  with_tty "${CLIENT}" put hello "${ROOT}/work/from-disk.txt" >/dev/null || true
+log=$(cat "${LOG}")
+contains "${log}" 'METHOD=PUT URL=http://mock/hello/from-disk.txt' &&
+  contains "${log}" "UPLOAD=${ROOT}/work/from-disk.txt" &&
+  ! contains "${log}" 'UPLOAD=-' &&
+  ok 'file source put ignores stdin even in a terminal' ||
+  not_ok 'file source put ignores stdin even in a terminal'
 
 : > "${LOG}"
 printf '<h1>slash</h1>\n' |
@@ -362,7 +491,7 @@ contains "$(cat "${LOG}")" 'METHOD=PUT URL=http://mock/' &&
   not_ok 'trailing host slash is normalized for stdin put'
 
 rm -f "${MOCK_CURL_STATE}/dropped-PUT" "${MOCK_CURL_STATE}/missing-pending-PUT"
-out=$(printf '<h1>dropped</h1>\n' | MOCK_DROP_ONCE_METHOD=PUT "${CLIENT}" put)
+out=$(printf '<h1>dropped</h1>\n' | MOCK_DROP_ONCE_METHOD=PUT "${CLIENT}" put -)
 contains "${out}" 'created http://mock/abcd/' &&
   [ -s "${XDG_STATE_HOME}/symbol/claims/abcd" ] &&
   [ ! -f "${MOCK_CURL_STATE}/missing-pending-PUT" ] &&
@@ -389,7 +518,7 @@ contains "${out}" 'copied http://mock/hello/ -> http://mock/target/' &&
 
 rm -f "${MOCK_CURL_STATE}/committed-PUT" "${MOCK_CURL_STATE}/missing-pending-PUT"
 if printf '<h1>process loss</h1>\n' |
-  MOCK_DROP_ALWAYS_METHOD=PUT "${CLIENT}" put >/dev/null 2>&1; then
+  MOCK_DROP_ALWAYS_METHOD=PUT "${CLIENT}" put - >/dev/null 2>&1; then
   not_ok 'repeatedly dropped PUT should leave pending recovery'
 elif ls "${XDG_STATE_HOME}/symbol/claims"/pending-* >/dev/null 2>&1; then
   pending=$(find "${XDG_STATE_HOME}/symbol/claims" -type d -name 'pending-*' | awk 'NR==1{print}')

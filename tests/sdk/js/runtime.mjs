@@ -101,6 +101,8 @@ test("all 40 installed endpoint mappings execute exact decoders", async () => {
                 api_version: esm.API_VERSION,
                 absolute_revision: esm.API_REVISION,
                 source_hash: esm.SOURCE_HASH,
+                commit: esm.BUILD_COMMIT,
+                dirty: esm.BUILD_DIRTY,
             }),
         },
         { operation: "site listing", path: "/FILES", headers: { accept: "application/json" } },
@@ -207,7 +209,10 @@ test("all 40 installed endpoint mappings execute exact decoders", async () => {
     assert.equal((await client.apiClient("symbol.ts")).status, 200);
     assert.equal((await client.apiClientHash("symbol.ts")).length, 64);
     assert.equal((await client.apiManual("typescript")).status, 200);
-    assert.deepEqual((await client.apiVersion()).identity.apiVersion, esm.API_VERSION_PARTS);
+    const version = await client.apiVersion();
+    assert.deepEqual(version.identity.apiVersion, esm.API_VERSION_PARTS);
+    assert.equal(version.identity.commit, esm.BUILD_COMMIT);
+    assert.equal(version.identity.dirty, esm.BUILD_DIRTY);
     assert.equal((await client.sites()).entries[0].kind, "builtin");
     assert.equal((await site.redirect()).status, 307);
     const index = await site.get();
