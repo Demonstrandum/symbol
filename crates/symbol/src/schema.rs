@@ -6,7 +6,7 @@ diesel::table! {
         updated -> BigInt,
         public_url -> Text,
         content_revision -> BigInt,
-        tree_hash -> Text,
+        tree_hash -> Binary,
         creator_kind -> Nullable<BigInt>,
         creator_hash -> Nullable<Binary>,
         claim_hash -> Nullable<Binary>,
@@ -17,7 +17,7 @@ diesel::table! {
 
 diesel::table! {
     blobs (hash) {
-        hash -> Text,
+        hash -> Binary,
         bytes -> Binary,
         size -> BigInt,
     }
@@ -28,7 +28,7 @@ diesel::table! {
         site_id -> BigInt,
         path -> Text,
         kind -> BigInt,
-        hash -> Text,
+        hash -> Binary,
         size -> BigInt,
     }
 }
@@ -86,7 +86,7 @@ diesel::table! {
         created -> Nullable<BigInt>,
         updated -> BigInt,
         content_revision -> BigInt,
-        tree_hash -> Text,
+        tree_hash -> Binary,
     }
 }
 
@@ -94,7 +94,7 @@ diesel::table! {
     undo_files (token, path) {
         token -> Text,
         path -> Text,
-        hash -> Text,
+        hash -> Binary,
         size -> BigInt,
     }
 }
@@ -186,7 +186,7 @@ diesel::table! {
         path -> Text,
         existed -> BigInt,
         kind -> Nullable<BigInt>,
-        hash -> Nullable<Text>,
+        hash -> Nullable<Binary>,
         size -> Nullable<BigInt>,
     }
 }
@@ -196,7 +196,7 @@ diesel::table! {
         site_id -> BigInt,
         path -> Text,
         kind -> BigInt,
-        hash -> Text,
+        hash -> Binary,
         size -> BigInt,
         naming_mode -> BigInt,
         prefix -> Text,
@@ -211,7 +211,7 @@ diesel::table! {
         token -> Text,
         site_id -> BigInt,
         folder -> Text,
-        hash -> Text,
+        hash -> Binary,
         size -> BigInt,
         media_type -> Text,
         request_fingerprint -> Text,
@@ -225,7 +225,7 @@ diesel::table! {
         token -> Text,
         path -> Text,
         existed -> BigInt,
-        hash -> Nullable<Text>,
+        hash -> Nullable<Binary>,
         size -> Nullable<BigInt>,
         naming_mode -> Nullable<BigInt>,
         prefix -> Nullable<Text>,
@@ -242,7 +242,7 @@ diesel::table! {
         kind -> BigInt,
         canonical_target -> Text,
         resolved_kind -> Nullable<BigInt>,
-        resolved_hash -> Nullable<Text>,
+        resolved_hash -> Nullable<Binary>,
         resolved_size -> Nullable<BigInt>,
     }
 }
@@ -254,7 +254,7 @@ diesel::table! {
         existed -> BigInt,
         canonical_target -> Nullable<Text>,
         resolved_kind -> Nullable<BigInt>,
-        resolved_hash -> Nullable<Text>,
+        resolved_hash -> Nullable<Binary>,
         resolved_size -> Nullable<BigInt>,
     }
 }
