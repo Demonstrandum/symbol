@@ -1,13 +1,13 @@
 use std::fmt::Write as _;
 
-#[cfg(test)]
-use sea_query::Query;
 use sea_query::{
     Alias, ColumnDef, Expr, ExprTrait, ForeignKey, ForeignKeyAction, Iden, Index,
     IndexCreateStatement, IntoIden, IntoTableRef, SqliteQueryBuilder, Table, TableCreateStatement,
 };
+#[cfg(test)]
+use sea_query::Query;
 
-pub const LATEST_SCHEMA_VERSION: i64 = 10;
+pub const LATEST_SCHEMA_VERSION: i64 = 11;
 pub const FILE_ENTRY_KIND: i64 = 0;
 pub const ALLOCATED_ENTRY_KIND: i64 = 1;
 pub const ALIAS_ENTRY_KIND: i64 = 2;
@@ -60,6 +60,96 @@ enum FilesV8 {
 #[cfg(test)]
 #[derive(Iden)]
 enum FilesV9 {
+    Table,
+}
+
+#[derive(Iden)]
+enum BlobsV10 {
+    Table,
+}
+
+#[derive(Iden)]
+enum FilesV10 {
+    Table,
+}
+
+#[derive(Iden)]
+enum UndoFilesV10 {
+    Table,
+}
+
+#[derive(Iden)]
+enum AllocatedEntriesV10 {
+    Table,
+}
+
+#[derive(Iden)]
+enum PendingAllocationsV10 {
+    Table,
+}
+
+#[derive(Iden)]
+enum UndoFileDeltasV10 {
+    Table,
+}
+
+#[derive(Iden)]
+enum UndoAllocatedDeltasV10 {
+    Table,
+}
+
+#[derive(Iden)]
+enum AliasesV10 {
+    Table,
+}
+
+#[derive(Iden)]
+enum UndoAliasDeltasV10 {
+    Table,
+}
+
+#[derive(Iden)]
+enum SitesV10 {
+    Table,
+}
+
+#[derive(Iden)]
+enum UndoSitesV10 {
+    Table,
+}
+
+#[derive(Iden)]
+enum SitesRepair {
+    Table,
+}
+
+#[derive(Iden)]
+enum ExpiryPoliciesRepair {
+    Table,
+}
+
+#[derive(Iden)]
+enum PathAggregatesRepair {
+    Table,
+}
+
+#[derive(Iden)]
+enum BlobsRepair {
+    Table,
+}
+
+#[derive(Iden)]
+enum FilesRepair {
+    Table,
+}
+
+#[derive(Iden)]
+enum UndoFilesRepair {
+    Table,
+}
+
+#[derive(Iden)]
+enum UndoSitesRepair {
     Table,
 }
 
@@ -425,13 +515,13 @@ pub fn schema_sql() -> String {
 pub fn schema_v6_sql() -> String {
     let tables = vec![
         sites_v6_table(),
-        blobs_table(),
+        blobs_table_v10(),
         files_v6_table(),
         metadata_table(),
         undo_operations_table(),
         undo_names_table(),
         undo_sites_v6_table(),
-        undo_files_table(),
+        undo_files_table_v10(),
         expiry_policies_table(),
         undo_expiry_policies_table(),
         idempotency_records_table(),
@@ -587,7 +677,7 @@ pub fn upgrade_v6_to_v7_after_backfill() -> Vec<String> {
             .table(Files::Table, FilesV6::Table)
             .to_owned()
             .to_string(SqliteQueryBuilder),
-        files_table().to_string(SqliteQueryBuilder),
+        files_table_v10().to_string(SqliteQueryBuilder),
     ]
 }
 
@@ -604,15 +694,15 @@ pub fn upgrade_v6_to_v7_after_file_copy() -> Vec<String> {
             [Files::SiteId, Files::Path],
         )
         .to_string(SqliteQueryBuilder),
-        undo_file_deltas_table().to_string(SqliteQueryBuilder),
+        undo_file_deltas_table_v10().to_string(SqliteQueryBuilder),
     ]
 }
 
 pub fn upgrade_v7_to_v8() -> Vec<String> {
     vec![
-        allocated_entries_table().to_string(SqliteQueryBuilder),
-        pending_allocations_table().to_string(SqliteQueryBuilder),
-        undo_allocated_deltas_table().to_string(SqliteQueryBuilder),
+        allocated_entries_table_v10().to_string(SqliteQueryBuilder),
+        pending_allocations_table_v10().to_string(SqliteQueryBuilder),
+        undo_allocated_deltas_table_v10().to_string(SqliteQueryBuilder),
         index(
             "files_site_hash",
             Files::Table,
@@ -650,6 +740,399 @@ pub fn upgrade_v9_to_v10() -> Vec<String> {
     ]
 }
 
+#[expect(clippy::too_many_lines)]
+pub fn upgrade_v10_to_v11() -> Vec<String> {
+    vec![
+        "PRAGMA foreign_keys=OFF".to_string(),
+        Table::rename()
+            .table(Blobs::Table, BlobsV10::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        blobs_table().to_string(SqliteQueryBuilder),
+        "INSERT INTO \"blobs\" (\"hash\", \"bytes\", \"size\")
+         SELECT unhex(\"hash\"), \"bytes\", \"size\" FROM \"blobs_v10\"".to_string(),
+        Table::rename()
+            .table(Files::Table, FilesV10::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        files_table().to_string(SqliteQueryBuilder),
+        "INSERT INTO \"files\" (\"site_id\", \"path\", \"kind\", \"hash\", \"size\")
+         SELECT \"site_id\", \"path\", \"kind\", unhex(\"hash\"), \"size\" FROM \"files_v10\""
+            .to_string(),
+        Table::drop()
+            .table(FilesV10::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        index("files_hash", Files::Table, [Files::Hash]).to_string(SqliteQueryBuilder),
+        index(
+            "files_site_prefix",
+            Files::Table,
+            [Files::SiteId, Files::Path],
+        )
+        .to_string(SqliteQueryBuilder),
+        index(
+            "files_site_hash",
+            Files::Table,
+            [Files::SiteId, Files::Hash],
+        )
+        .to_string(SqliteQueryBuilder),
+        Table::rename()
+            .table(UndoFiles::Table, UndoFilesV10::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        undo_files_table().to_string(SqliteQueryBuilder),
+        "INSERT INTO \"undo_files\" (\"token\", \"path\", \"hash\", \"size\")
+         SELECT \"token\", \"path\", unhex(\"hash\"), \"size\" FROM \"undo_files_v10\""
+            .to_string(),
+        Table::drop()
+            .table(UndoFilesV10::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        index("undo_files_hash", UndoFiles::Table, [UndoFiles::Hash])
+            .to_string(SqliteQueryBuilder),
+        Table::rename()
+            .table(AllocatedEntries::Table, AllocatedEntriesV10::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        allocated_entries_table().to_string(SqliteQueryBuilder),
+        "INSERT INTO \"allocated_entries\"
+            (\"site_id\", \"path\", \"kind\", \"hash\", \"size\", \"naming_mode\", \"prefix\",
+             \"suffix\", \"extension\", \"media_type\")
+         SELECT \"site_id\", \"path\", \"kind\", unhex(\"hash\"), \"size\", \"naming_mode\",
+                \"prefix\", \"suffix\", \"extension\", \"media_type\"
+         FROM \"allocated_entries_v10\""
+            .to_string(),
+        Table::drop()
+            .table(AllocatedEntriesV10::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        Table::rename()
+            .table(PendingAllocations::Table, PendingAllocationsV10::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        pending_allocations_table().to_string(SqliteQueryBuilder),
+        "INSERT INTO \"pending_allocations\"
+            (\"token\", \"site_id\", \"folder\", \"hash\", \"size\", \"media_type\",
+             \"request_fingerprint\", \"created\", \"expires\")
+         SELECT \"token\", \"site_id\", \"folder\", unhex(\"hash\"), \"size\", \"media_type\",
+                \"request_fingerprint\", \"created\", \"expires\"
+         FROM \"pending_allocations_v10\""
+            .to_string(),
+        Table::drop()
+            .table(PendingAllocationsV10::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        index(
+            "pending_allocations_expiry",
+            PendingAllocations::Table,
+            [PendingAllocations::Expires],
+        )
+        .to_string(SqliteQueryBuilder),
+        Table::rename()
+            .table(UndoFileDeltas::Table, UndoFileDeltasV10::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        undo_file_deltas_table().to_string(SqliteQueryBuilder),
+        "INSERT INTO \"undo_file_deltas\"
+            (\"token\", \"path\", \"existed\", \"kind\", \"hash\", \"size\")
+         SELECT \"token\", \"path\", \"existed\", \"kind\",
+                CASE WHEN \"hash\" IS NULL THEN NULL ELSE unhex(\"hash\") END,
+                \"size\"
+         FROM \"undo_file_deltas_v10\""
+            .to_string(),
+        Table::drop()
+            .table(UndoFileDeltasV10::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        Table::rename()
+            .table(UndoAllocatedDeltas::Table, UndoAllocatedDeltasV10::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        undo_allocated_deltas_table().to_string(SqliteQueryBuilder),
+        "INSERT INTO \"undo_allocated_deltas\"
+            (\"token\", \"path\", \"existed\", \"hash\", \"size\", \"naming_mode\", \"prefix\",
+             \"suffix\", \"extension\", \"media_type\")
+         SELECT \"token\", \"path\", \"existed\",
+                CASE WHEN \"hash\" IS NULL THEN NULL ELSE unhex(\"hash\") END,
+                \"size\", \"naming_mode\", \"prefix\", \"suffix\", \"extension\", \"media_type\"
+         FROM \"undo_allocated_deltas_v10\""
+            .to_string(),
+        Table::drop()
+            .table(UndoAllocatedDeltasV10::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        Table::rename()
+            .table(Aliases::Table, AliasesV10::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        aliases_table().to_string(SqliteQueryBuilder),
+        "INSERT INTO \"aliases\"
+            (\"site_id\", \"path\", \"kind\", \"canonical_target\", \"resolved_kind\",
+             \"resolved_hash\", \"resolved_size\")
+         SELECT \"site_id\", \"path\", \"kind\", \"canonical_target\", \"resolved_kind\",
+                CASE WHEN \"resolved_hash\" IS NULL THEN NULL ELSE unhex(\"resolved_hash\") END,
+                \"resolved_size\"
+         FROM \"aliases_v10\""
+            .to_string(),
+        Table::drop()
+            .table(AliasesV10::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        index(
+            "aliases_dependency",
+            Aliases::Table,
+            [Aliases::SiteId, Aliases::CanonicalTarget],
+        )
+        .to_string(SqliteQueryBuilder),
+        index(
+            "aliases_cache",
+            Aliases::Table,
+            [
+                Aliases::SiteId,
+                Aliases::ResolvedKind,
+                Aliases::ResolvedHash,
+                Aliases::ResolvedSize,
+            ],
+        )
+        .to_string(SqliteQueryBuilder),
+        Table::rename()
+            .table(UndoAliasDeltas::Table, UndoAliasDeltasV10::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        undo_alias_deltas_table().to_string(SqliteQueryBuilder),
+        "INSERT INTO \"undo_alias_deltas\"
+            (\"token\", \"path\", \"existed\", \"canonical_target\", \"resolved_kind\",
+             \"resolved_hash\", \"resolved_size\")
+         SELECT \"token\", \"path\", \"existed\", \"canonical_target\", \"resolved_kind\",
+                CASE WHEN \"resolved_hash\" IS NULL THEN NULL ELSE unhex(\"resolved_hash\") END,
+                \"resolved_size\"
+         FROM \"undo_alias_deltas_v10\""
+            .to_string(),
+        Table::drop()
+            .table(UndoAliasDeltasV10::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        "ALTER TABLE \"sites\" ADD COLUMN \"tree_hash_bin\" BLOB".to_string(),
+        "UPDATE \"sites\" SET \"tree_hash_bin\" = CASE
+            WHEN \"tree_hash\" = '' THEN zeroblob(32)
+            WHEN \"tree_hash\" LIKE 'blake3:%' THEN unhex(substr(\"tree_hash\", 8))
+            ELSE unhex(\"tree_hash\")
+        END"
+            .to_string(),
+        "ALTER TABLE \"sites\" DROP COLUMN \"tree_hash\"".to_string(),
+        "ALTER TABLE \"sites\" RENAME COLUMN \"tree_hash_bin\" TO \"tree_hash\"".to_string(),
+        "ALTER TABLE \"undo_sites\" ADD COLUMN \"tree_hash_bin\" BLOB".to_string(),
+        "UPDATE \"undo_sites\" SET \"tree_hash_bin\" = CASE
+            WHEN \"tree_hash\" = '' THEN zeroblob(32)
+            WHEN \"tree_hash\" LIKE 'blake3:%' THEN unhex(substr(\"tree_hash\", 8))
+            ELSE unhex(\"tree_hash\")
+        END"
+            .to_string(),
+        "ALTER TABLE \"undo_sites\" DROP COLUMN \"tree_hash\"".to_string(),
+        "ALTER TABLE \"undo_sites\" RENAME COLUMN \"tree_hash_bin\" TO \"tree_hash\"".to_string(),
+        Table::drop()
+            .table(BlobsV10::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        "PRAGMA foreign_keys=ON".to_string(),
+    ]
+}
+
+#[cfg(test)]
+pub fn downgrade_v11_to_v10() -> Vec<String> {
+    vec![
+        "ALTER TABLE \"sites\" ADD COLUMN \"tree_hash_text\" TEXT".to_string(),
+        "UPDATE \"sites\" SET \"tree_hash_text\" = CASE
+            WHEN \"tree_hash\" IS NULL OR \"tree_hash\" = zeroblob(32) THEN ''
+            ELSE lower(hex(\"tree_hash\"))
+        END"
+            .to_string(),
+        "ALTER TABLE \"sites\" DROP COLUMN \"tree_hash\"".to_string(),
+        "ALTER TABLE \"sites\" RENAME COLUMN \"tree_hash_text\" TO \"tree_hash\"".to_string(),
+        "ALTER TABLE \"undo_sites\" ADD COLUMN \"tree_hash_text\" TEXT".to_string(),
+        "UPDATE \"undo_sites\" SET \"tree_hash_text\" = CASE
+            WHEN \"tree_hash\" IS NULL OR \"tree_hash\" = zeroblob(32) THEN ''
+            ELSE lower(hex(\"tree_hash\"))
+        END"
+            .to_string(),
+        "ALTER TABLE \"undo_sites\" DROP COLUMN \"tree_hash\"".to_string(),
+        "ALTER TABLE \"undo_sites\" RENAME COLUMN \"tree_hash_text\" TO \"tree_hash\"".to_string(),
+        Table::rename()
+            .table(Blobs::Table, BlobsV10::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        blobs_table_v10().to_string(SqliteQueryBuilder),
+        "INSERT INTO \"blobs\" (\"hash\", \"bytes\", \"size\")
+         SELECT lower(hex(\"hash\")), \"bytes\", \"size\" FROM \"blobs_v10\""
+            .to_string(),
+        Table::drop()
+            .table(BlobsV10::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        Table::rename()
+            .table(Files::Table, FilesV10::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        files_table_v10().to_string(SqliteQueryBuilder),
+        "INSERT INTO \"files\" (\"site_id\", \"path\", \"kind\", \"hash\", \"size\")
+         SELECT \"site_id\", \"path\", \"kind\", lower(hex(\"hash\")), \"size\" FROM \"files_v10\""
+            .to_string(),
+        Table::drop()
+            .table(FilesV10::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        index("files_hash", Files::Table, [Files::Hash]).to_string(SqliteQueryBuilder),
+        index(
+            "files_site_prefix",
+            Files::Table,
+            [Files::SiteId, Files::Path],
+        )
+        .to_string(SqliteQueryBuilder),
+        index(
+            "files_site_hash",
+            Files::Table,
+            [Files::SiteId, Files::Hash],
+        )
+        .to_string(SqliteQueryBuilder),
+        Table::rename()
+            .table(UndoFiles::Table, UndoFilesV10::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        undo_files_table_v10().to_string(SqliteQueryBuilder),
+        "INSERT INTO \"undo_files\" (\"token\", \"path\", \"hash\", \"size\")
+         SELECT \"token\", \"path\", lower(hex(\"hash\")), \"size\" FROM \"undo_files_v10\""
+            .to_string(),
+        Table::drop()
+            .table(UndoFilesV10::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        index("undo_files_hash", UndoFiles::Table, [UndoFiles::Hash])
+            .to_string(SqliteQueryBuilder),
+        Table::rename()
+            .table(AllocatedEntries::Table, AllocatedEntriesV10::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        allocated_entries_table_v10().to_string(SqliteQueryBuilder),
+        "INSERT INTO \"allocated_entries\"
+            (\"site_id\", \"path\", \"kind\", \"hash\", \"size\", \"naming_mode\", \"prefix\",
+             \"suffix\", \"extension\", \"media_type\")
+         SELECT \"site_id\", \"path\", \"kind\", lower(hex(\"hash\")), \"size\", \"naming_mode\",
+                \"prefix\", \"suffix\", \"extension\", \"media_type\"
+         FROM \"allocated_entries_v10\""
+            .to_string(),
+        Table::drop()
+            .table(AllocatedEntriesV10::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        Table::rename()
+            .table(PendingAllocations::Table, PendingAllocationsV10::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        pending_allocations_table_v10().to_string(SqliteQueryBuilder),
+        "INSERT INTO \"pending_allocations\"
+            (\"token\", \"site_id\", \"folder\", \"hash\", \"size\", \"media_type\",
+             \"request_fingerprint\", \"created\", \"expires\")
+         SELECT \"token\", \"site_id\", \"folder\", lower(hex(\"hash\")), \"size\", \"media_type\",
+                \"request_fingerprint\", \"created\", \"expires\"
+         FROM \"pending_allocations_v10\""
+            .to_string(),
+        Table::drop()
+            .table(PendingAllocationsV10::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        index(
+            "pending_allocations_expiry",
+            PendingAllocations::Table,
+            [PendingAllocations::Expires],
+        )
+        .to_string(SqliteQueryBuilder),
+        Table::rename()
+            .table(UndoFileDeltas::Table, UndoFileDeltasV10::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        undo_file_deltas_table_v10().to_string(SqliteQueryBuilder),
+        "INSERT INTO \"undo_file_deltas\"
+            (\"token\", \"path\", \"existed\", \"kind\", \"hash\", \"size\")
+         SELECT \"token\", \"path\", \"existed\", \"kind\",
+                CASE WHEN \"hash\" IS NULL THEN NULL ELSE lower(hex(\"hash\")) END,
+                \"size\"
+         FROM \"undo_file_deltas_v10\""
+            .to_string(),
+        Table::drop()
+            .table(UndoFileDeltasV10::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        Table::rename()
+            .table(UndoAllocatedDeltas::Table, UndoAllocatedDeltasV10::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        undo_allocated_deltas_table_v10().to_string(SqliteQueryBuilder),
+        "INSERT INTO \"undo_allocated_deltas\"
+            (\"token\", \"path\", \"existed\", \"hash\", \"size\", \"naming_mode\", \"prefix\",
+             \"suffix\", \"extension\", \"media_type\")
+         SELECT \"token\", \"path\", \"existed\",
+                CASE WHEN \"hash\" IS NULL THEN NULL ELSE lower(hex(\"hash\")) END,
+                \"size\", \"naming_mode\", \"prefix\", \"suffix\", \"extension\", \"media_type\"
+         FROM \"undo_allocated_deltas_v10\""
+            .to_string(),
+        Table::drop()
+            .table(UndoAllocatedDeltasV10::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        Table::rename()
+            .table(Aliases::Table, AliasesV10::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        aliases_table_v10().to_string(SqliteQueryBuilder),
+        "INSERT INTO \"aliases\"
+            (\"site_id\", \"path\", \"kind\", \"canonical_target\", \"resolved_kind\",
+             \"resolved_hash\", \"resolved_size\")
+         SELECT \"site_id\", \"path\", \"kind\", \"canonical_target\", \"resolved_kind\",
+                CASE WHEN \"resolved_hash\" IS NULL THEN NULL ELSE lower(hex(\"resolved_hash\")) END,
+                \"resolved_size\"
+         FROM \"aliases_v10\""
+            .to_string(),
+        Table::drop()
+            .table(AliasesV10::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        index(
+            "aliases_dependency",
+            Aliases::Table,
+            [Aliases::SiteId, Aliases::CanonicalTarget],
+        )
+        .to_string(SqliteQueryBuilder),
+        index(
+            "aliases_cache",
+            Aliases::Table,
+            [
+                Aliases::SiteId,
+                Aliases::ResolvedKind,
+                Aliases::ResolvedHash,
+                Aliases::ResolvedSize,
+            ],
+        )
+        .to_string(SqliteQueryBuilder),
+        Table::rename()
+            .table(UndoAliasDeltas::Table, UndoAliasDeltasV10::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        undo_alias_deltas_table_v10().to_string(SqliteQueryBuilder),
+        "INSERT INTO \"undo_alias_deltas\"
+            (\"token\", \"path\", \"existed\", \"canonical_target\", \"resolved_kind\",
+             \"resolved_hash\", \"resolved_size\")
+         SELECT \"token\", \"path\", \"existed\", \"canonical_target\", \"resolved_kind\",
+                CASE WHEN \"resolved_hash\" IS NULL THEN NULL ELSE lower(hex(\"resolved_hash\")) END,
+                \"resolved_size\"
+         FROM \"undo_alias_deltas_v10\""
+            .to_string(),
+        Table::drop()
+            .table(UndoAliasDeltasV10::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+    ]
+}
+
 pub fn upgrade_v8_to_v9() -> Vec<String> {
     vec![
         Table::rename()
@@ -660,8 +1143,8 @@ pub fn upgrade_v8_to_v9() -> Vec<String> {
             .table(AllocatedEntries::Table, AllocatedEntriesV8::Table)
             .to_owned()
             .to_string(SqliteQueryBuilder),
-        files_table().to_string(SqliteQueryBuilder),
-        allocated_entries_table().to_string(SqliteQueryBuilder),
+        files_table_v10().to_string(SqliteQueryBuilder),
+        allocated_entries_table_v10().to_string(SqliteQueryBuilder),
         "INSERT INTO \"files\" (\"site_id\", \"path\", \"kind\", \"hash\", \"size\")
          SELECT \"site_id\", \"path\", \"kind\", \"hash\", \"size\" FROM \"files_v8\""
             .to_string(),
@@ -693,8 +1176,8 @@ pub fn upgrade_v8_to_v9() -> Vec<String> {
             [Files::SiteId, Files::Hash],
         )
         .to_string(SqliteQueryBuilder),
-        aliases_table().to_string(SqliteQueryBuilder),
-        undo_alias_deltas_table().to_string(SqliteQueryBuilder),
+        aliases_table_v10().to_string(SqliteQueryBuilder),
+        undo_alias_deltas_table_v10().to_string(SqliteQueryBuilder),
         index(
             "aliases_dependency",
             Aliases::Table,
@@ -858,7 +1341,156 @@ pub fn downgrade_v6_to_v2() -> Vec<String> {
     ]
 }
 
+#[cfg(test)]
+pub fn repair_downgraded_v6_schema() -> Vec<String> {
+    vec![
+        Table::rename()
+            .table(Sites::Table, SitesRepair::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        sites_v6_table().to_string(SqliteQueryBuilder),
+        "INSERT INTO \"sites\"
+            (\"id\", \"name\", \"updated\", \"public_url\", \"content_revision\", \"tree_hash\",
+             \"creator_kind\", \"creator_hash\", \"claim_hash\", \"management_hash\",
+             \"management_status\")
+         SELECT \"id\", \"name\", \"updated\", \"public_url\", \"content_revision\",
+                COALESCE(\"tree_hash\", ''),
+                \"creator_kind\", \"creator_hash\", \"claim_hash\", \"management_hash\",
+                \"management_status\"
+         FROM \"sites_repair\""
+            .to_string(),
+        Table::drop()
+            .table(SitesRepair::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        Table::rename()
+            .table(ExpiryPolicies::Table, ExpiryPoliciesRepair::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        expiry_policies_table().to_string(SqliteQueryBuilder),
+        "INSERT INTO \"expiry_policies\"
+            (\"site_id\", \"path\", \"target_kind\", \"mode\", \"duration_seconds\", \"deadline\",
+             \"min_age_seconds\", \"max_age_seconds\", \"max_size_bytes\", \"power\", \"refreshed\",
+             \"own_deadline\")
+         SELECT \"site_id\", \"path\", \"target_kind\", \"mode\", \"duration_seconds\", \"deadline\",
+                \"min_age_seconds\", \"max_age_seconds\", \"max_size_bytes\", \"power\", \"refreshed\",
+                \"own_deadline\"
+         FROM \"expiry_policies_repair\""
+            .to_string(),
+        Table::drop()
+            .table(ExpiryPoliciesRepair::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        Index::create()
+            .name("expiry_policies_site_kind")
+            .table(ExpiryPolicies::Table)
+            .col(ExpiryPolicies::SiteId)
+            .col(ExpiryPolicies::TargetKind)
+            .col(ExpiryPolicies::Path)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        Index::create()
+            .name("expiry_policies_deadline")
+            .table(ExpiryPolicies::Table)
+            .col(ExpiryPolicies::OwnDeadline)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        Table::rename()
+            .table(Blobs::Table, BlobsRepair::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        blobs_table_v10().to_string(SqliteQueryBuilder),
+        "INSERT INTO \"blobs\" (\"hash\", \"bytes\", \"size\")
+         SELECT \"hash\", \"bytes\", \"size\" FROM \"blobs_repair\""
+            .to_string(),
+        Table::drop()
+            .table(BlobsRepair::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        Table::rename()
+            .table(Files::Table, FilesRepair::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        files_v6_table().to_string(SqliteQueryBuilder),
+        "INSERT INTO \"files\" (\"site_id\", \"path\", \"hash\", \"size\")
+         SELECT \"site_id\", \"path\", \"hash\", \"size\" FROM \"files_repair\""
+            .to_string(),
+        Table::drop()
+            .table(FilesRepair::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        index("files_hash", Files::Table, [Files::Hash]).to_string(SqliteQueryBuilder),
+        index(
+            "files_site_prefix",
+            Files::Table,
+            [Files::SiteId, Files::Path],
+        )
+        .to_string(SqliteQueryBuilder),
+        Table::rename()
+            .table(UndoFiles::Table, UndoFilesRepair::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        undo_files_table_v10().to_string(SqliteQueryBuilder),
+        "INSERT INTO \"undo_files\" (\"token\", \"path\", \"hash\", \"size\")
+         SELECT \"token\", \"path\", \"hash\", \"size\" FROM \"undo_files_repair\""
+            .to_string(),
+        Table::drop()
+            .table(UndoFilesRepair::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        index("undo_files_hash", UndoFiles::Table, [UndoFiles::Hash])
+            .to_string(SqliteQueryBuilder),
+        Table::rename()
+            .table(UndoSites::Table, UndoSitesRepair::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        undo_sites_v6_table().to_string(SqliteQueryBuilder),
+        "INSERT INTO \"undo_sites\"
+            (\"token\", \"name\", \"existed\", \"public_url\", \"updated\", \"content_revision\",
+             \"tree_hash\")
+         SELECT \"token\", \"name\", \"existed\", \"public_url\", \"updated\", \"content_revision\",
+                COALESCE(\"tree_hash\", '')
+         FROM \"undo_sites_repair\""
+            .to_string(),
+        Table::drop()
+            .table(UndoSitesRepair::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        Table::rename()
+            .table(PathAggregates::Table, PathAggregatesRepair::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        path_aggregates_table().to_string(SqliteQueryBuilder),
+        "INSERT INTO \"path_aggregates\"
+            (\"site_id\", \"path\", \"logical_bytes\", \"file_count\")
+         SELECT \"site_id\", \"path\", \"logical_bytes\", \"file_count\"
+         FROM \"path_aggregates_repair\""
+            .to_string(),
+        Table::drop()
+            .table(PathAggregatesRepair::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+    ]
+}
+
 fn sites_table() -> TableCreateStatement {
+    sites_table_inner(true)
+}
+
+fn sites_table_v10() -> TableCreateStatement {
+    sites_table_inner(false)
+}
+
+fn sites_table_inner(binary_tree_hash: bool) -> TableCreateStatement {
+    let mut tree_hash_col = ColumnDef::new(Sites::TreeHash);
+    if binary_tree_hash {
+        tree_hash_col
+            .blob()
+            .not_null()
+            .default([0_u8; 32].to_vec());
+    } else {
+        tree_hash_col.text().not_null().default("");
+    }
     Table::create()
         .table(Sites::Table)
         .if_not_exists()
@@ -878,12 +1510,7 @@ fn sites_table() -> TableCreateStatement {
                 .not_null()
                 .default(0),
         )
-        .col(
-            ColumnDef::new(Sites::TreeHash)
-                .text()
-                .not_null()
-                .default(""),
-        )
+        .col(tree_hash_col)
         .col(ColumnDef::new(Sites::CreatorKind).integer())
         .col(ColumnDef::new(Sites::CreatorHash).blob())
         .col(ColumnDef::new(Sites::ClaimHash).blob())
@@ -920,11 +1547,42 @@ fn site_events_table() -> TableCreateStatement {
         .to_owned()
 }
 
+fn hash_column(iden: impl Iden, binary_hashes: bool) -> ColumnDef {
+    let mut col = ColumnDef::new(iden);
+    if binary_hashes {
+        col.blob();
+    } else {
+        col.text();
+    }
+    col
+}
+
+fn hash_column_primary_key(iden: impl Iden, binary_hashes: bool) -> ColumnDef {
+    let mut col = hash_column(iden, binary_hashes);
+    col.primary_key();
+    col
+}
+
+fn hash_column_not_null(iden: impl Iden, binary_hashes: bool) -> ColumnDef {
+    let mut col = hash_column(iden, binary_hashes);
+    col.not_null();
+    col
+}
+
 fn blobs_table() -> TableCreateStatement {
+    blobs_table_inner(true)
+}
+
+fn blobs_table_v10() -> TableCreateStatement {
+    blobs_table_inner(false)
+}
+
+fn blobs_table_inner(binary_hashes: bool) -> TableCreateStatement {
+    let hash_col = hash_column_primary_key(Blobs::Hash, binary_hashes);
     Table::create()
         .table(Blobs::Table)
         .if_not_exists()
-        .col(ColumnDef::new(Blobs::Hash).text().primary_key())
+        .col(hash_col)
         .col(
             ColumnDef::new(Blobs::Bytes)
                 .blob()
@@ -936,6 +1594,15 @@ fn blobs_table() -> TableCreateStatement {
 }
 
 fn files_table() -> TableCreateStatement {
+    files_table_inner(true)
+}
+
+fn files_table_v10() -> TableCreateStatement {
+    files_table_inner(false)
+}
+
+fn files_table_inner(binary_hashes: bool) -> TableCreateStatement {
+    let hash_col = hash_column_not_null(Files::Hash, binary_hashes);
     Table::create()
         .table(Files::Table)
         .if_not_exists()
@@ -948,7 +1615,7 @@ fn files_table() -> TableCreateStatement {
                 .default(FILE_ENTRY_KIND)
                 .check(Expr::col(Files::Kind).eq(FILE_ENTRY_KIND)),
         )
-        .col(ColumnDef::new(Files::Hash).text().not_null())
+        .col(hash_col)
         .col(ColumnDef::new(Files::Size).integer().not_null())
         .primary_key(Index::create().col(Files::SiteId).col(Files::Path))
         .foreign_key(
@@ -1132,6 +1799,20 @@ fn undo_names_table() -> TableCreateStatement {
 }
 
 fn undo_sites_table() -> TableCreateStatement {
+    undo_sites_table_inner(true)
+}
+
+fn undo_sites_table_v10() -> TableCreateStatement {
+    undo_sites_table_inner(false)
+}
+
+fn undo_sites_table_inner(binary_tree_hash: bool) -> TableCreateStatement {
+    let mut tree_hash_col = ColumnDef::new(UndoSites::TreeHash);
+    if binary_tree_hash {
+        tree_hash_col.blob().not_null();
+    } else {
+        tree_hash_col.text().not_null().default("");
+    }
     Table::create()
         .table(UndoSites::Table)
         .if_not_exists()
@@ -1146,7 +1827,7 @@ fn undo_sites_table() -> TableCreateStatement {
                 .integer()
                 .not_null(),
         )
-        .col(ColumnDef::new(UndoSites::TreeHash).text().not_null())
+        .col(tree_hash_col)
         .foreign_key(
             ForeignKey::create()
                 .from(UndoSites::Table, UndoSites::Token)
@@ -1157,12 +1838,21 @@ fn undo_sites_table() -> TableCreateStatement {
 }
 
 fn undo_files_table() -> TableCreateStatement {
+    undo_files_table_inner(true)
+}
+
+fn undo_files_table_v10() -> TableCreateStatement {
+    undo_files_table_inner(false)
+}
+
+fn undo_files_table_inner(binary_hashes: bool) -> TableCreateStatement {
+    let hash_col = hash_column_not_null(UndoFiles::Hash, binary_hashes);
     Table::create()
         .table(UndoFiles::Table)
         .if_not_exists()
         .col(ColumnDef::new(UndoFiles::Token).text().not_null())
         .col(ColumnDef::new(UndoFiles::Path).text().not_null())
-        .col(ColumnDef::new(UndoFiles::Hash).text().not_null())
+        .col(hash_col)
         .col(ColumnDef::new(UndoFiles::Size).integer().not_null())
         .primary_key(Index::create().col(UndoFiles::Token).col(UndoFiles::Path))
         .foreign_key(
@@ -1364,6 +2054,15 @@ fn path_aggregates_table() -> TableCreateStatement {
 }
 
 fn undo_file_deltas_table() -> TableCreateStatement {
+    undo_file_deltas_table_inner(true)
+}
+
+fn undo_file_deltas_table_v10() -> TableCreateStatement {
+    undo_file_deltas_table_inner(false)
+}
+
+fn undo_file_deltas_table_inner(binary_hashes: bool) -> TableCreateStatement {
+    let hash_col = hash_column(UndoFileDeltas::Hash, binary_hashes);
     Table::create()
         .table(UndoFileDeltas::Table)
         .if_not_exists()
@@ -1371,7 +2070,7 @@ fn undo_file_deltas_table() -> TableCreateStatement {
         .col(ColumnDef::new(UndoFileDeltas::Path).text().not_null())
         .col(ColumnDef::new(UndoFileDeltas::Existed).integer().not_null())
         .col(ColumnDef::new(UndoFileDeltas::Kind).integer())
-        .col(ColumnDef::new(UndoFileDeltas::Hash).text())
+        .col(hash_col)
         .col(ColumnDef::new(UndoFileDeltas::Size).integer())
         .primary_key(
             Index::create()
@@ -1388,6 +2087,15 @@ fn undo_file_deltas_table() -> TableCreateStatement {
 }
 
 fn allocated_entries_table() -> TableCreateStatement {
+    allocated_entries_table_inner(true)
+}
+
+fn allocated_entries_table_v10() -> TableCreateStatement {
+    allocated_entries_table_inner(false)
+}
+
+fn allocated_entries_table_inner(binary_hashes: bool) -> TableCreateStatement {
+    let hash_col = hash_column_not_null(AllocatedEntries::Hash, binary_hashes);
     Table::create()
         .table(AllocatedEntries::Table)
         .if_not_exists()
@@ -1404,7 +2112,7 @@ fn allocated_entries_table() -> TableCreateStatement {
                 .default(ALLOCATED_ENTRY_KIND)
                 .check(Expr::col(AllocatedEntries::Kind).eq(ALLOCATED_ENTRY_KIND)),
         )
-        .col(ColumnDef::new(AllocatedEntries::Hash).text().not_null())
+        .col(hash_col)
         .col(ColumnDef::new(AllocatedEntries::Size).integer().not_null())
         .col(
             ColumnDef::new(AllocatedEntries::NamingMode)
@@ -1445,6 +2153,15 @@ fn allocated_entries_table() -> TableCreateStatement {
 }
 
 fn pending_allocations_table() -> TableCreateStatement {
+    pending_allocations_table_inner(true)
+}
+
+fn pending_allocations_table_v10() -> TableCreateStatement {
+    pending_allocations_table_inner(false)
+}
+
+fn pending_allocations_table_inner(binary_hashes: bool) -> TableCreateStatement {
+    let hash_col = hash_column_not_null(PendingAllocations::Hash, binary_hashes);
     Table::create()
         .table(PendingAllocations::Table)
         .if_not_exists()
@@ -1459,7 +2176,7 @@ fn pending_allocations_table() -> TableCreateStatement {
                 .not_null(),
         )
         .col(ColumnDef::new(PendingAllocations::Folder).text().not_null())
-        .col(ColumnDef::new(PendingAllocations::Hash).text().not_null())
+        .col(hash_col)
         .col(
             ColumnDef::new(PendingAllocations::Size)
                 .integer()
@@ -1500,6 +2217,15 @@ fn pending_allocations_table() -> TableCreateStatement {
 }
 
 fn undo_allocated_deltas_table() -> TableCreateStatement {
+    undo_allocated_deltas_table_inner(true)
+}
+
+fn undo_allocated_deltas_table_v10() -> TableCreateStatement {
+    undo_allocated_deltas_table_inner(false)
+}
+
+fn undo_allocated_deltas_table_inner(binary_hashes: bool) -> TableCreateStatement {
+    let hash_col = hash_column(UndoAllocatedDeltas::Hash, binary_hashes);
     Table::create()
         .table(UndoAllocatedDeltas::Table)
         .if_not_exists()
@@ -1510,7 +2236,7 @@ fn undo_allocated_deltas_table() -> TableCreateStatement {
                 .integer()
                 .not_null(),
         )
-        .col(ColumnDef::new(UndoAllocatedDeltas::Hash).text())
+        .col(hash_col)
         .col(ColumnDef::new(UndoAllocatedDeltas::Size).integer())
         .col(ColumnDef::new(UndoAllocatedDeltas::NamingMode).integer())
         .col(ColumnDef::new(UndoAllocatedDeltas::Prefix).text())
@@ -1532,6 +2258,15 @@ fn undo_allocated_deltas_table() -> TableCreateStatement {
 }
 
 fn aliases_table() -> TableCreateStatement {
+    aliases_table_inner(true)
+}
+
+fn aliases_table_v10() -> TableCreateStatement {
+    aliases_table_inner(false)
+}
+
+fn aliases_table_inner(binary_hashes: bool) -> TableCreateStatement {
+    let hash_col = hash_column(Aliases::ResolvedHash, binary_hashes);
     Table::create()
         .table(Aliases::Table)
         .if_not_exists()
@@ -1546,7 +2281,7 @@ fn aliases_table() -> TableCreateStatement {
         )
         .col(ColumnDef::new(Aliases::CanonicalTarget).text().not_null())
         .col(ColumnDef::new(Aliases::ResolvedKind).integer())
-        .col(ColumnDef::new(Aliases::ResolvedHash).text())
+        .col(hash_col)
         .col(ColumnDef::new(Aliases::ResolvedSize).integer())
         .primary_key(Index::create().col(Aliases::SiteId).col(Aliases::Path))
         .foreign_key(
@@ -1565,6 +2300,15 @@ fn aliases_table() -> TableCreateStatement {
 }
 
 fn undo_alias_deltas_table() -> TableCreateStatement {
+    undo_alias_deltas_table_inner(true)
+}
+
+fn undo_alias_deltas_table_v10() -> TableCreateStatement {
+    undo_alias_deltas_table_inner(false)
+}
+
+fn undo_alias_deltas_table_inner(binary_hashes: bool) -> TableCreateStatement {
+    let hash_col = hash_column(UndoAliasDeltas::ResolvedHash, binary_hashes);
     Table::create()
         .table(UndoAliasDeltas::Table)
         .if_not_exists()
@@ -1577,7 +2321,7 @@ fn undo_alias_deltas_table() -> TableCreateStatement {
         )
         .col(ColumnDef::new(UndoAliasDeltas::CanonicalTarget).text())
         .col(ColumnDef::new(UndoAliasDeltas::ResolvedKind).integer())
-        .col(ColumnDef::new(UndoAliasDeltas::ResolvedHash).text())
+        .col(hash_col)
         .col(ColumnDef::new(UndoAliasDeltas::ResolvedSize).integer())
         .primary_key(
             Index::create()
