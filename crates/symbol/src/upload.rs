@@ -62,10 +62,8 @@ pub enum UploadError {
     ReservedPath,
     #[error("error: supported archive contains a Symbol management secret; unpack or remove it")]
     OpaqueSecret,
-    #[allow(dead_code)]
     #[error("error: archive alias target is invalid")]
     InvalidAlias,
-    #[allow(dead_code)]
     #[error("error: archive alias cycle detected")]
     AliasCycle,
     #[error("{0}")]
@@ -77,7 +75,6 @@ pub enum UploadError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum ArchiveMember {
     File {
         path: String,
@@ -89,12 +86,10 @@ pub enum ArchiveMember {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct ArchivePlan {
     pub members: Vec<ArchiveMember>,
 }
 
-#[allow(dead_code)]
 pub fn plan_archive(source: &Path, kind: Kind) -> Result<ArchivePlan, UploadError> {
     let members = match kind {
         Kind::Zip => plan_zip(std::fs::File::open(source)?)?,
@@ -411,7 +406,6 @@ fn strip_gz_name(name: &str) -> Option<&str> {
     }
 }
 
-#[allow(dead_code)]
 fn plan_zip<R: Read + Seek>(reader: R) -> Result<Vec<ArchiveMember>, UploadError> {
     let limits = archive_limits();
     let mut archive = zip::ZipArchive::new(reader)?;
@@ -461,7 +455,6 @@ fn plan_zip<R: Read + Seek>(reader: R) -> Result<Vec<ArchiveMember>, UploadError
     Ok(members)
 }
 
-#[allow(dead_code)]
 fn plan_tar<R: Read>(reader: R) -> Result<Vec<ArchiveMember>, UploadError> {
     let limits = archive_limits();
     let mut archive = tar::Archive::new(reader);
@@ -499,7 +492,6 @@ fn plan_tar<R: Read>(reader: R) -> Result<Vec<ArchiveMember>, UploadError> {
     Ok(members)
 }
 
-#[allow(dead_code)]
 fn canonical_archive_target(path: &str, target: &str) -> Result<String, UploadError> {
     if target.is_empty()
         || target.len() > MAX_ALIAS_TARGET_BYTES
@@ -560,7 +552,6 @@ fn relative_archive_target(path: &str, target: &str) -> String {
     }
 }
 
-#[allow(dead_code)]
 fn looks_like_external_archive_target(target: &str) -> bool {
     let lower = target.to_ascii_lowercase();
     lower.contains("://")
@@ -582,7 +573,6 @@ fn looks_like_external_archive_target(target: &str) -> bool {
         .any(|scheme| lower.starts_with(scheme))
 }
 
-#[allow(dead_code)]
 fn archive_reserved(path: &str) -> bool {
     const RESERVED: [&str; 7] = [
         "FILES",
@@ -596,7 +586,6 @@ fn archive_reserved(path: &str) -> bool {
     RESERVED.contains(&path.rsplit('/').next().unwrap_or(path))
 }
 
-#[allow(dead_code)]
 fn validate_archive_members(mut members: Vec<ArchiveMember>) -> Result<ArchivePlan, UploadError> {
     if members.is_empty() {
         return Err(UploadError::EmptyArchive);
@@ -717,14 +706,12 @@ fn strip_archive_root(path: &mut String, prefix: &str) {
     }
 }
 
-#[allow(dead_code)]
 fn member_path(member: &ArchiveMember) -> &str {
     match member {
         ArchiveMember::File { path } | ArchiveMember::Alias { path, .. } => path,
     }
 }
 
-#[allow(dead_code)]
 fn archive_alias_substitution<'a>(
     aliases: &'a BTreeMap<String, String>,
     path: &str,

@@ -746,7 +746,7 @@ mod tests {
         assert!(body.contains(r#"class="see-site" href="/hello/docs/""#));
         assert!(body.contains(">see site</a>"));
         assert!(body.contains(r#"href="/hello/docs/index""#));
-        assert!(body.contains(r#">index</span>"#));
+        assert!(body.contains(r">index</span>"));
         assert!(!body.contains("index.html"));
 
         let body = render_html("hello", "docs", &list, false);

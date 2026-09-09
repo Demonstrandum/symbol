@@ -65,7 +65,7 @@ pub fn html_suffix(name: &str) -> Option<(&str, HtmlSuffix)> {
     None
 }
 
-pub fn pretty_html_name<'a>(name: &'a str, occupied: impl Fn(&str) -> bool) -> &'a str {
+pub fn pretty_html_name(name: &str, occupied: impl Fn(&str) -> bool) -> &str {
     match html_suffix(name) {
         Some((stem, HtmlSuffix::Html)) if !occupied(stem) => stem,
         Some((stem, HtmlSuffix::Htm)) if !occupied(stem) && !occupied(&format!("{stem}.html")) => {

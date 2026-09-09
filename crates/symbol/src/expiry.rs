@@ -104,7 +104,7 @@ impl DecayPolicy {
     ///
     /// The endpoint cases are handled exactly. Interior values use:
     /// `min_age + (max_age - min_age) * (1 - min(size, max_size) / max_size)^power`.
-    #[allow(
+    #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_precision_loss,
         clippy::cast_sign_loss
