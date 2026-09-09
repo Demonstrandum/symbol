@@ -1349,6 +1349,14 @@ async fn expire_target(app: &App, name: &str, path: &str, headers: &HeaderMap) -
         Ok(token) => token,
         Err(err) => return err.into_response(),
     };
+    let auth = authorization.clone();
+    let auth_name = name.to_string();
+    if let Err(err) = app
+        .run_store(move |store| store.authorize_mutation(&auth_name, auth.as_ref()))
+        .await
+    {
+        return err.into_response();
+    }
     if let Err(err) = store::validate_mutation_target(path) {
         return err.into_response();
     }
@@ -2151,6 +2159,14 @@ async fn delete_file(
         Ok(token) => token,
         Err(err) => return err.into_response(),
     };
+    let auth = authorization.clone();
+    let auth_name = name.clone();
+    if let Err(err) = app
+        .run_store(move |store| store.authorize_mutation(&auth_name, auth.as_ref()))
+        .await
+    {
+        return err.into_response();
+    }
     if let Err(err) = store::validate_mutation_target(&path) {
         return err.into_response();
     }
