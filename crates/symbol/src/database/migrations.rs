@@ -1061,6 +1061,11 @@ mod tests {
             .execute(&mut db)
             .unwrap();
         downgrade_to_v2(&mut db).unwrap();
+        assert_eq!(
+            files::table.count().get_result::<i64>(&mut db).unwrap(),
+            1,
+            "downgrade must preserve seeded files in v6 catalog"
+        );
 
         let outcome = migrate(&mut db).unwrap();
 

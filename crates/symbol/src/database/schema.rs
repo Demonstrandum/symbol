@@ -144,7 +144,17 @@ enum FilesRepair {
 }
 
 #[derive(Iden)]
+enum FilesRepairSource {
+    Table,
+}
+
+#[derive(Iden)]
 enum UndoFilesRepair {
+    Table,
+}
+
+#[derive(Iden)]
+enum UndoFilesRepairSource {
     Table,
 }
 
@@ -1344,6 +1354,12 @@ pub fn downgrade_v6_to_v2() -> Vec<String> {
 #[cfg(test)]
 pub fn repair_downgraded_v6_schema() -> Vec<String> {
     vec![
+        "CREATE TABLE \"files_repair_source\" AS
+         SELECT \"site_id\", \"path\", \"hash\", \"size\" FROM \"files\""
+            .to_string(),
+        "CREATE TABLE \"undo_files_repair_source\" AS
+         SELECT \"token\", \"path\", \"hash\", \"size\" FROM \"undo_files\""
+            .to_string(),
         Table::rename()
             .table(Sites::Table, SitesRepair::Table)
             .to_owned()
@@ -1413,10 +1429,14 @@ pub fn repair_downgraded_v6_schema() -> Vec<String> {
             .to_string(SqliteQueryBuilder),
         files_v6_table().to_string(SqliteQueryBuilder),
         "INSERT INTO \"files\" (\"site_id\", \"path\", \"hash\", \"size\")
-         SELECT \"site_id\", \"path\", \"hash\", \"size\" FROM \"files_repair\""
+         SELECT \"site_id\", \"path\", \"hash\", \"size\" FROM \"files_repair_source\""
             .to_string(),
         Table::drop()
             .table(FilesRepair::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        Table::drop()
+            .table(FilesRepairSource::Table)
             .to_owned()
             .to_string(SqliteQueryBuilder),
         index("files_hash", Files::Table, [Files::Hash]).to_string(SqliteQueryBuilder),
@@ -1432,10 +1452,14 @@ pub fn repair_downgraded_v6_schema() -> Vec<String> {
             .to_string(SqliteQueryBuilder),
         undo_files_table_v10().to_string(SqliteQueryBuilder),
         "INSERT INTO \"undo_files\" (\"token\", \"path\", \"hash\", \"size\")
-         SELECT \"token\", \"path\", \"hash\", \"size\" FROM \"undo_files_repair\""
+         SELECT \"token\", \"path\", \"hash\", \"size\" FROM \"undo_files_repair_source\""
             .to_string(),
         Table::drop()
             .table(UndoFilesRepair::Table)
+            .to_owned()
+            .to_string(SqliteQueryBuilder),
+        Table::drop()
+            .table(UndoFilesRepairSource::Table)
             .to_owned()
             .to_string(SqliteQueryBuilder),
         index("undo_files_hash", UndoFiles::Table, [UndoFiles::Hash])
