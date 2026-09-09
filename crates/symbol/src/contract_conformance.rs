@@ -1065,6 +1065,7 @@ fn target_uri(target: Target, store: &Store) -> String {
             else {
                 panic!("fixture file must be a blob");
             };
+            let hash = hash.strip_prefix("blake3:").unwrap_or(&hash);
             format!("/.blob/hello/{hash}")
         }
     }
@@ -1521,7 +1522,7 @@ async fn mutation_contract_executes_noop_and_stale_write_paths() {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 async fn phase_five_mutations_cover_replay_conflict_limits_and_two_phase_outcomes() {
     let (_root, store, app) = fixture(Fixture::Site).await;
 
@@ -2199,7 +2200,7 @@ async fn fetch_absolute_location(app: &Router, location: &str) -> Response {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 async fn phase_five_mutation_urls_encode_each_stored_path_segment_and_are_fetchable() {
     const ENCODED_SEGMENT: &str = "100%25%20caf%C3%A9%20%3F%23";
     let root = tempfile::tempdir().unwrap();
@@ -2378,7 +2379,7 @@ async fn alias_batch_rejects_manifest_unsafe_paths_and_accepts_safe_punctuation(
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 async fn alias_responses_inherit_target_and_intermediate_expiry_caps() {
     let root = tempfile::tempdir().unwrap();
     let store = Store::new(root.path().to_path_buf()).unwrap();
@@ -2548,7 +2549,7 @@ async fn alias_responses_inherit_target_and_intermediate_expiry_caps() {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 async fn phase_five_content_mutations_report_and_store_sanitized_bytes() {
     let root = tempfile::tempdir().unwrap();
     let store = Store::new(root.path().to_path_buf()).unwrap();
@@ -2788,7 +2789,7 @@ async fn pending_allocations_remain_bound_to_the_proposing_bearer() {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 async fn every_phase_five_endpoint_exercises_stale_noop_conflict_and_limits() {
     let root = tempfile::tempdir().unwrap();
     let store = Store::new(root.path().to_path_buf()).unwrap();

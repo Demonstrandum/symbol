@@ -16,6 +16,7 @@ mod browse;
 mod contract_conformance;
 mod database;
 mod expiry;
+mod hash;
 mod http_cache;
 mod mutation_http;
 mod name;
@@ -364,18 +365,19 @@ fn configured_identity_provider(args: &mut Args) -> IdentityProvider {
         };
     }
     let peers: Arc<[IpAddr]> = std::mem::take(&mut args.trusted_proxy).into();
-    match configured.as_slice() {
-        [] if peers.is_empty() => IdentityProvider::Receipt,
-        [(1, principal_header)] if !peers.is_empty() => IdentityProvider::TrustedProxy {
-            principal_header: principal_header.clone(),
+    let mut configured = configured;
+    match (configured.len(), configured.pop(), peers.is_empty()) {
+        (0, None, true) => IdentityProvider::Receipt,
+        (1, Some((1, principal_header)), false) => IdentityProvider::TrustedProxy {
+            principal_header,
             peers,
         },
-        [(2, principal_header)] if !peers.is_empty() => IdentityProvider::Mtls {
-            principal_header: principal_header.clone(),
+        (1, Some((2, principal_header)), false) => IdentityProvider::Mtls {
+            principal_header,
             peers,
         },
-        [(3, principal_header)] if !peers.is_empty() => IdentityProvider::Tailscale {
-            principal_header: principal_header.clone(),
+        (1, Some((3, principal_header)), false) => IdentityProvider::Tailscale {
+            principal_header,
             peers,
         },
         _ => {
@@ -1072,10 +1074,7 @@ async fn list_sites(State(app): State<App>, headers: HeaderMap) -> Response {
 
 async fn undo_stack(State(app): State<App>, Path(name): Path<String>) -> Response {
     let result = app
-        .run_store({
-            let name = name.clone();
-            move |store| store.undo_stack(&name)
-        })
+        .run_store(move |store| store.undo_stack(&name))
         .await;
     match result {
         Ok(stack) => {
@@ -1095,7 +1094,7 @@ async fn expiry_worker(app: App) {
     }
 }
 
-#[allow(clippy::cognitive_complexity)]
+#[expect(clippy::cognitive_complexity)]
 async fn expiry_worker_iteration(app: &App) {
     let delay = match app.run_store(|store| store.next_expiry_delay()).await {
         Ok(delay) => delay,
@@ -1350,14 +1349,6 @@ async fn expire_target(app: &App, name: &str, path: &str, headers: &HeaderMap) -
         Ok(token) => token,
         Err(err) => return err.into_response(),
     };
-    let auth = authorization.clone();
-    let auth_name = name.to_string();
-    if let Err(err) = app
-        .run_store(move |store| store.authorize_mutation(&auth_name, auth.as_ref()))
-        .await
-    {
-        return err.into_response();
-    }
     if let Err(err) = store::validate_mutation_target(path) {
         return err.into_response();
     }
@@ -1514,14 +1505,6 @@ async fn undo_site(app: &App, name: &str, headers: &HeaderMap) -> Response {
         Ok(token) => token,
         Err(err) => return err.into_response(),
     };
-    let auth = authorization.clone();
-    let auth_name = name.to_string();
-    if let Err(err) = app
-        .run_store(move |store| store.authorize_mutation(&auth_name, auth.as_ref()))
-        .await
-    {
-        return err.into_response();
-    }
     let guard = headers
         .get("undo-token")
         .and_then(|value| value.to_str().ok())
@@ -1591,14 +1574,6 @@ async fn move_site(app: &App, source: &str, headers: &HeaderMap) -> Response {
         Ok(token) => token,
         Err(err) => return err.into_response(),
     };
-    let auth = authorization.clone();
-    let auth_source = source.to_string();
-    if let Err(err) = app
-        .run_store(move |store| store.authorize_mutation(&auth_source, auth.as_ref()))
-        .await
-    {
-        return err.into_response();
-    }
     let Some(destination) = (match destination_from(headers, true) {
         Ok(destination) => destination,
         Err(message) => return plain(StatusCode::BAD_REQUEST, message),
@@ -1702,7 +1677,7 @@ fn creator_identity(headers: &HeaderMap) -> Option<CreatorIdentity> {
         })
 }
 
-#[allow(clippy::result_large_err)]
+#[expect(clippy::result_large_err)]
 fn creation_request(headers: &HeaderMap) -> Result<CreationRequest, Response> {
     let managed = match headers
         .get("management-action")
@@ -1809,25 +1784,33 @@ async fn put_site(
     publish(&app, Some(name), &headers, body).await
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines, clippy::cognitive_complexity)]
 async fn publish(app: &App, wanted: Option<String>, headers: &HeaderMap, body: Body) -> Response {
     let authorization = match management_bearer(headers) {
         Ok(token) => token,
         Err(err) => return err.into_response(),
     };
-    if let Some(name) = wanted.as_deref()
-        && app.store.site_exists(name)
-    {
-        if headers.contains_key("management-action") {
-            return StoreError::AlreadyManaged.into_response();
-        }
-        let auth = authorization.clone();
-        let name_owned = name.to_string();
-        if let Err(err) = app
-            .run_store(move |store| store.authorize_mutation(&name_owned, auth.as_ref()))
+    if let Some(name) = wanted.as_deref() {
+        let lookup = name.to_string();
+        let exists = match app
+            .run_store(move |store| Ok(store.site_exists(&lookup)))
             .await
         {
-            return err.into_response();
+            Ok(exists) => exists,
+            Err(err) => return err.into_response(),
+        };
+        if exists {
+            if headers.contains_key("management-action") {
+                return StoreError::AlreadyManaged.into_response();
+            }
+            let auth = authorization.clone();
+            let name_owned = name.to_string();
+            if let Err(err) = app
+                .run_store(move |store| store.authorize_mutation(&name_owned, auth.as_ref()))
+                .await
+            {
+                return err.into_response();
+            }
         }
     }
     let creation = match creation_request(headers) {
@@ -2121,14 +2104,6 @@ async fn delete_site(
         Ok(token) => token,
         Err(err) => return err.into_response(),
     };
-    let auth_name = archive_download(&name).map_or_else(|| name.clone(), |request| request.name);
-    let auth = authorization.clone();
-    if let Err(err) = app
-        .run_store(move |store| store.authorize_mutation(&auth_name, auth.as_ref()))
-        .await
-    {
-        return err.into_response();
-    }
     let request = archive_download(&name).unwrap_or(ArchiveDownload {
         name,
         format: ArchiveFormat::TarGz,
@@ -2176,14 +2151,6 @@ async fn delete_file(
         Ok(token) => token,
         Err(err) => return err.into_response(),
     };
-    let auth = authorization.clone();
-    let auth_name = name.clone();
-    if let Err(err) = app
-        .run_store(move |store| store.authorize_mutation(&auth_name, auth.as_ref()))
-        .await
-    {
-        return err.into_response();
-    }
     if let Err(err) = store::validate_mutation_target(&path) {
         return err.into_response();
     }
@@ -2308,14 +2275,12 @@ async fn redirect_site(State(app): State<App>, Path(name): Path<String>) -> Resp
     if name.contains('.') {
         return plain(StatusCode::BAD_REQUEST, "error: unsupported archive suffix");
     }
+    let location = format!("/{name}/");
     let exists = app
-        .run_store({
-            let name = name.clone();
-            move |store| Ok(store.site_exists(&name))
-        })
+        .run_store(move |store| Ok(store.site_exists(&name)))
         .await;
     match exists {
-        Ok(true) => Redirect::temporary(&format!("/{name}/")).into_response(),
+        Ok(true) => Redirect::temporary(&location).into_response(),
         Ok(false) => StoreError::NotFound.into_response(),
         Err(err) => err.into_response(),
     }
@@ -3088,7 +3053,6 @@ impl IntoResponse for StoreError {
         let status = match &self {
             Self::NotFound | Self::InvalidPendingAllocation => StatusCode::NOT_FOUND,
             Self::StaleUndo(_)
-            | Self::ReservedCollision(_)
             | Self::DestinationConflict
             | Self::AliasConflict
             | Self::AliasWrite
@@ -4602,7 +4566,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn managed_mutations_authorize_before_spooling_and_rotation_is_idempotent() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -4754,7 +4718,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     async fn receipt_claim_copy_isolation_move_and_managed_delete_undo_follow_contract() {
         let root = tempfile::tempdir().unwrap();
         let store = Store::new(root.path().to_path_buf()).unwrap();

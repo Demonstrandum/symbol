@@ -1,8 +1,7 @@
-#![allow(clippy::result_large_err)]
+#![expect(clippy::result_large_err)]
 
 use std::fmt::Write as _;
 use std::io;
-use std::path::PathBuf;
 
 use axum::Json;
 use axum::body::{Body, to_bytes};
@@ -21,7 +20,7 @@ use crate::splice::{self, ProtocolError};
 use crate::store::{
     AliasEntry, AliasResolvedKind, AliasSpec, AllocatedFile, AllocatedName, AllocationSource,
     AllocationSpec, FileExpiry, FileMutationOptions, Idempotency, MutationResult,
-    PendingAllocationSpec, Store, StoreError,
+    PendingAllocationSpec, StoreError,
 };
 use symbol_contract as contract;
 
@@ -1150,6 +1149,7 @@ fn infer_extension(media_type: &str) -> Option<&'static str> {
 }
 
 fn prefixed_hash(hash: &str) -> String {
+    let hash = hash.strip_prefix("blake3:").unwrap_or(hash);
     format!("blake3:{hash}")
 }
 
@@ -1380,6 +1380,3 @@ fn encode_path_segment(output: &mut String, segment: &str) {
         }
     }
 }
-
-#[allow(dead_code)]
-fn _store_type_anchor(_: &Store, _: PathBuf) {}
