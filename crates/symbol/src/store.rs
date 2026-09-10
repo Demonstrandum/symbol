@@ -1376,9 +1376,8 @@ impl Store {
     }
 
     pub fn blob_path(&self, hash: &str) -> PathBuf {
-        let hex = ContentHash::parse_wire(hash)
-            .map(|hash| hash.to_hex())
-            .unwrap_or_else(|_| hash.to_string());
+        let hex =
+            ContentHash::parse_wire(hash).map_or_else(|_| hash.to_string(), ContentHash::to_hex);
         self.inner.blob_files.path(&hex)
     }
 
@@ -3636,7 +3635,7 @@ impl Store {
         prune_undo_locked(&mut tx, self.now_millis())?;
         let removed = gc_blobs(&mut tx, self.now_millis())?;
         let (revision, tree_hash) =
-            site_revision_locked(&mut tx, name).unwrap_or((0, TreeHash::default()));
+            site_revision_locked(&mut tx, name).unwrap_or_else(|_| (0, TreeHash::default()));
         tx.commit()?;
         drop(db);
         self.remove_blob_files(&removed);
@@ -4668,7 +4667,7 @@ impl Store {
             .select(blobs::hash)
             .load::<ContentHash>(&mut *db)?
             .into_iter()
-            .map(|hash| hash.to_hex())
+            .map(ContentHash::to_hex)
             .collect::<HashSet<_>>();
         drop(db);
         self.inner.blob_files.restore(&live)?;
@@ -9070,7 +9069,7 @@ fn validate_alias_graph_with_staged(
         real.insert(
             file.path.clone(),
             RealEntry {
-                hash: file.hash.clone(),
+                hash: file.hash,
                 size: file.size,
             },
         );
@@ -10183,7 +10182,7 @@ fn gc_blobs(tx: &mut SqliteConnection, now: i64) -> Result<Vec<String>, diesel::
             .distinct()
             .load::<ContentHash>(tx)?
             .into_iter()
-            .map(|hash| hash.to_hex()),
+            .map(ContentHash::to_hex),
     );
     live.extend(
         undo_files::table
@@ -10194,7 +10193,7 @@ fn gc_blobs(tx: &mut SqliteConnection, now: i64) -> Result<Vec<String>, diesel::
             .distinct()
             .load::<ContentHash>(tx)?
             .into_iter()
-            .map(|hash| hash.to_hex()),
+            .map(ContentHash::to_hex),
     );
     live.extend(
         undo_file_deltas::table
@@ -10206,14 +10205,14 @@ fn gc_blobs(tx: &mut SqliteConnection, now: i64) -> Result<Vec<String>, diesel::
             .load::<Option<ContentHash>>(tx)?
             .into_iter()
             .flatten()
-            .map(|hash| hash.to_hex()),
+            .map(ContentHash::to_hex),
     );
     live.extend(
         allocated_entries::table
             .select(allocated_entries::hash)
             .load::<ContentHash>(tx)?
             .into_iter()
-            .map(|hash| hash.to_hex()),
+            .map(ContentHash::to_hex),
     );
     live.extend(
         undo_allocated_deltas::table
@@ -10227,20 +10226,20 @@ fn gc_blobs(tx: &mut SqliteConnection, now: i64) -> Result<Vec<String>, diesel::
             .load::<Option<ContentHash>>(tx)?
             .into_iter()
             .flatten()
-            .map(|hash| hash.to_hex()),
+            .map(ContentHash::to_hex),
     );
     live.extend(
         pending_allocations::table
             .select(pending_allocations::hash)
             .load::<ContentHash>(tx)?
             .into_iter()
-            .map(|hash| hash.to_hex()),
+            .map(ContentHash::to_hex),
     );
     let hashes = blobs::table
         .select(blobs::hash)
         .load::<ContentHash>(tx)?
         .into_iter()
-        .map(|hash| hash.to_hex())
+        .map(ContentHash::to_hex)
         .filter(|hash| !live.contains(hash))
         .collect::<Vec<_>>();
     for chunk in hashes.chunks(SQLITE_DELETE_BATCH_SIZE) {

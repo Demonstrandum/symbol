@@ -1,4 +1,5 @@
 use std::fmt;
+use std::fmt::Write as _;
 use std::str::FromStr;
 
 use diesel::deserialize::{self, FromSql, Queryable};
@@ -20,9 +21,9 @@ pub struct TreeHash([u8; HASH_BYTES]);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum HashParseError {
-    #[error("hash must contain exactly {HASH_HEX_LEN} hexadecimal bytes")]
+    #[error("hash must be exactly {HASH_HEX_LEN} hexadecimal characters")]
     InvalidLength,
-    #[error("hash is not lowercase hexadecimal")]
+    #[error("hash is not hexadecimal")]
     InvalidEncoding,
 }
 
@@ -54,8 +55,8 @@ impl ContentHash {
     }
 
     #[must_use]
-    pub fn to_hex(&self) -> String {
-        self.0.iter().map(|byte| format!("{byte:02x}")).collect()
+    pub fn to_hex(self) -> String {
+        encode_hex(&self.0)
     }
 }
 
@@ -86,12 +87,12 @@ impl TreeHash {
     }
 
     #[must_use]
-    pub fn to_hex(&self) -> String {
-        self.0.iter().map(|byte| format!("{byte:02x}")).collect()
+    pub fn to_hex(self) -> String {
+        encode_hex(&self.0)
     }
 
     #[must_use]
-    pub fn to_wire(&self) -> String {
+    pub fn to_wire(self) -> String {
         if self.0 == [0; HASH_BYTES] {
             String::new()
         } else {
@@ -270,15 +271,25 @@ impl Queryable<Binary, Sqlite> for TreeHash {
     }
 }
 
-fn parse_hex(value: &str) -> Result<[u8; HASH_BYTES], HashParseError> {
-    if value.len() != HASH_HEX_LEN || !value.as_bytes().iter().all(u8::is_ascii_hexdigit) {
-        return Err(HashParseError::InvalidEncoding);
+fn encode_hex(bytes: &[u8; HASH_BYTES]) -> String {
+    let mut hex = String::with_capacity(HASH_HEX_LEN);
+    for byte in bytes {
+        write!(hex, "{byte:02x}").expect("writing to a String cannot fail");
     }
+    hex
+}
+
+fn parse_hex(value: &str) -> Result<[u8; HASH_BYTES], HashParseError> {
+    if value.len() != HASH_HEX_LEN {
+        return Err(HashParseError::InvalidLength);
+    }
+    let (pairs, rest) = value.as_bytes().as_chunks::<2>();
+    debug_assert!(rest.is_empty(), "{HASH_HEX_LEN} is even");
     let mut out = [0_u8; HASH_BYTES];
-    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
-        let hi = hex_value(chunk[0]).ok_or(HashParseError::InvalidEncoding)?;
-        let lo = hex_value(chunk[1]).ok_or(HashParseError::InvalidEncoding)?;
-        out[index] = (hi << 4) | lo;
+    for (slot, pair) in out.iter_mut().zip(pairs) {
+        let hi = hex_value(pair[0]).ok_or(HashParseError::InvalidEncoding)?;
+        let lo = hex_value(pair[1]).ok_or(HashParseError::InvalidEncoding)?;
+        *slot = (hi << 4) | lo;
     }
     Ok(out)
 }
