@@ -46,8 +46,8 @@ use axum::routing::{MethodRouter, get};
 use axum::{Json, Router};
 use clap::{Parser, Subcommand};
 use expiry::{DecayPolicy, ExpiryMode, ExpiryPolicy};
-use hash::ContentHash;
 use futures_util::StreamExt as _;
+use hash::ContentHash;
 use secrets::{ClaimToken, ManagementToken};
 use store::{
     ArchiveFormat, CreationSecurity, CreatorIdentity, Idempotency, ManagementRequest,
@@ -1074,9 +1074,7 @@ async fn list_sites(State(app): State<App>, headers: HeaderMap) -> Response {
 }
 
 async fn undo_stack(State(app): State<App>, Path(name): Path<String>) -> Response {
-    let result = app
-        .run_store(move |store| store.undo_stack(&name))
-        .await;
+    let result = app.run_store(move |store| store.undo_stack(&name)).await;
     match result {
         Ok(stack) => {
             let mut response = Json(stack).into_response();
@@ -2705,9 +2703,7 @@ async fn send_blob_file(
     };
 
     if range.is_none() && size <= STREAM_THRESHOLD {
-        let bytes = app
-            .run_store(move |store| store.read_blob(hash))
-            .await;
+        let bytes = app.run_store(move |store| store.read_blob(hash)).await;
         return match bytes {
             Ok(bytes) => {
                 let mut representation =

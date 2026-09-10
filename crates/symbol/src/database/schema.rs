@@ -1,11 +1,11 @@
 use std::fmt::Write as _;
 
+#[cfg(test)]
+use sea_query::Query;
 use sea_query::{
     Alias, ColumnDef, Expr, ExprTrait, ForeignKey, ForeignKeyAction, Iden, Index,
     IndexCreateStatement, IntoIden, IntoTableRef, SqliteQueryBuilder, Table, TableCreateStatement,
 };
-#[cfg(test)]
-use sea_query::Query;
 
 pub const LATEST_SCHEMA_VERSION: i64 = 11;
 pub const FILE_ENTRY_KIND: i64 = 0;
@@ -750,7 +750,8 @@ pub fn upgrade_v10_to_v11() -> Vec<String> {
             .to_string(SqliteQueryBuilder),
         blobs_table().to_string(SqliteQueryBuilder),
         "INSERT INTO \"blobs\" (\"hash\", \"bytes\", \"size\")
-         SELECT unhex(\"hash\"), \"bytes\", \"size\" FROM \"blobs_v10\"".to_string(),
+         SELECT unhex(\"hash\"), \"bytes\", \"size\" FROM \"blobs_v10\""
+            .to_string(),
         Table::rename()
             .table(Files::Table, FilesV10::Table)
             .to_owned()
@@ -788,8 +789,7 @@ pub fn upgrade_v10_to_v11() -> Vec<String> {
             .table(UndoFilesV10::Table)
             .to_owned()
             .to_string(SqliteQueryBuilder),
-        index("undo_files_hash", UndoFiles::Table, [UndoFiles::Hash])
-            .to_string(SqliteQueryBuilder),
+        index("undo_files_hash", UndoFiles::Table, [UndoFiles::Hash]).to_string(SqliteQueryBuilder),
         Table::rename()
             .table(AllocatedEntries::Table, AllocatedEntriesV10::Table)
             .to_owned()
@@ -918,7 +918,7 @@ pub fn upgrade_v10_to_v11() -> Vec<String> {
             WHEN \"tree_hash\" LIKE 'blake3:%' THEN unhex(substr(\"tree_hash\", 8))
             ELSE unhex(\"tree_hash\")
         END"
-            .to_string(),
+        .to_string(),
         "ALTER TABLE \"sites\" DROP COLUMN \"tree_hash\"".to_string(),
         "ALTER TABLE \"sites\" RENAME COLUMN \"tree_hash_bin\" TO \"tree_hash\"".to_string(),
         "ALTER TABLE \"undo_sites\" ADD COLUMN \"tree_hash_bin\" BLOB".to_string(),
@@ -927,7 +927,7 @@ pub fn upgrade_v10_to_v11() -> Vec<String> {
             WHEN \"tree_hash\" LIKE 'blake3:%' THEN unhex(substr(\"tree_hash\", 8))
             ELSE unhex(\"tree_hash\")
         END"
-            .to_string(),
+        .to_string(),
         "ALTER TABLE \"undo_sites\" DROP COLUMN \"tree_hash\"".to_string(),
         "ALTER TABLE \"undo_sites\" RENAME COLUMN \"tree_hash_bin\" TO \"tree_hash\"".to_string(),
         Table::drop()
@@ -1505,10 +1505,7 @@ pub fn normalize_v6_schema() -> Vec<String> {
 
 fn sites_table() -> TableCreateStatement {
     let mut tree_hash_col = ColumnDef::new(Sites::TreeHash);
-    tree_hash_col
-        .blob()
-        .not_null()
-        .default([0_u8; 32].to_vec());
+    tree_hash_col.blob().not_null().default([0_u8; 32].to_vec());
     Table::create()
         .table(Sites::Table)
         .if_not_exists()

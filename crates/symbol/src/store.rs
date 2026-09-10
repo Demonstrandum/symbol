@@ -3383,7 +3383,13 @@ impl Store {
                 aliases::resolved_hash,
                 aliases::resolved_size,
             ))
-            .load::<(String, String, Option<i64>, Option<ContentHash>, Option<i64>)>(&mut *tx)?;
+            .load::<(
+                String,
+                String,
+                Option<i64>,
+                Option<ContentHash>,
+                Option<i64>,
+            )>(&mut *tx)?;
         for (path, target, resolved_kind, resolved_hash, resolved_size) in copied_aliases {
             diesel::insert_into(site_entries::table)
                 .values((
@@ -4415,9 +4421,9 @@ impl Store {
                 .find((site_id, current_path))
                 .select((allocated_entries::hash, allocated_entries::size))
                 .first::<(ContentHash, i64)>(tx)?;
-            if expected_content_hash.is_some_and(|expected| {
-                ContentHash::try_from(expected).ok() != Some(current_hash)
-            }) {
+            if expected_content_hash
+                .is_some_and(|expected| ContentHash::try_from(expected).ok() != Some(current_hash))
+            {
                 return Err(stale_content_hash_error(current_hash));
             }
             if current_hash == staged.hash {
@@ -5784,7 +5790,12 @@ fn pending_fingerprint(input: &PendingFingerprint<'_>) -> String {
     let hash_hex = input.hash.to_hex();
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"symbol-pending-allocation-v1\0");
-    for value in [input.site, input.folder, hash_hex.as_str(), input.media_type] {
+    for value in [
+        input.site,
+        input.folder,
+        hash_hex.as_str(),
+        input.media_type,
+    ] {
         hasher.update(&(value.len() as u64).to_le_bytes());
         hasher.update(value.as_bytes());
     }
@@ -5952,7 +5963,15 @@ fn allocated_metadata_locked(
             allocated_entries::extension,
             allocated_entries::media_type,
         ))
-        .first::<(ContentHash, i64, i64, String, String, Option<String>, String)>(db)
+        .first::<(
+            ContentHash,
+            i64,
+            i64,
+            String,
+            String,
+            Option<String>,
+            String,
+        )>(db)
         .map_err(map_sql)?;
     Ok(AllocatedMetadata {
         hash,
@@ -5997,9 +6016,9 @@ fn validate_allocated_commit_locked(
             .find((site_id, current_path))
             .select(allocated_entries::hash)
             .first::<ContentHash>(tx)?;
-        if expected_content_hash.is_some_and(|expected| {
-            ContentHash::try_from(expected).ok() != Some(current_hash)
-        }) {
+        if expected_content_hash
+            .is_some_and(|expected| ContentHash::try_from(expected).ok() != Some(current_hash))
+        {
             return Err(stale_content_hash_error(current_hash));
         }
         if current_hash == staged_hash {
@@ -8478,8 +8497,13 @@ fn regenerate_site(
         tree_hash_wire
     );
     for (path, hash) in &entries {
-        writeln!(manifest, "\"{}\" = \"blake3:{}\"", toml_escape(path), hash.to_hex())
-            .expect("writing to String cannot fail");
+        writeln!(
+            manifest,
+            "\"{}\" = \"blake3:{}\"",
+            toml_escape(path),
+            hash.to_hex()
+        )
+        .expect("writing to String cannot fail");
     }
     if !alias_entries.is_empty() {
         manifest.push_str("\n[aliases]\n");
@@ -10169,7 +10193,7 @@ fn gc_blobs(
         files::table
             .select(files::hash)
             .distinct()
-            .load::<ContentHash>(tx)?
+            .load::<ContentHash>(tx)?,
     );
     live.extend(
         undo_files::table
@@ -10178,23 +10202,25 @@ fn gc_blobs(
             .filter(undo_operations::expires.gt(now))
             .select(undo_files::hash)
             .distinct()
-            .load::<ContentHash>(tx)?
+            .load::<ContentHash>(tx)?,
     );
     live.extend(
         undo_file_deltas::table
-            .inner_join(undo_operations::table.on(undo_operations::token.eq(undo_file_deltas::token)))
+            .inner_join(
+                undo_operations::table.on(undo_operations::token.eq(undo_file_deltas::token)),
+            )
             .filter(undo_operations::consumed.eq(0_i64))
             .filter(undo_operations::expires.gt(now))
             .filter(undo_file_deltas::hash.is_not_null())
             .select(undo_file_deltas::hash)
             .load::<Option<ContentHash>>(tx)?
             .into_iter()
-            .flatten()
+            .flatten(),
     );
     live.extend(
         allocated_entries::table
             .select(allocated_entries::hash)
-            .load::<ContentHash>(tx)?
+            .load::<ContentHash>(tx)?,
     );
     live.extend(
         undo_allocated_deltas::table
@@ -10207,12 +10233,12 @@ fn gc_blobs(
             .select(undo_allocated_deltas::hash)
             .load::<Option<ContentHash>>(tx)?
             .into_iter()
-            .flatten()
+            .flatten(),
     );
     live.extend(
         pending_allocations::table
             .select(pending_allocations::hash)
-            .load::<ContentHash>(tx)?
+            .load::<ContentHash>(tx)?,
     );
     let hashes = blobs::table
         .select(blobs::hash)
@@ -13202,7 +13228,10 @@ mod tests {
                 blake3::hash(b"payload").to_hex()
             )
         );
-        assert_eq!(store.read_blob(wire_hash(&first.hash)).unwrap().as_ref(), b"payload");
+        assert_eq!(
+            store.read_blob(wire_hash(&first.hash)).unwrap().as_ref(),
+            b"payload"
+        );
         let first_metadata = store.allocated_metadata("assets", &first.path).unwrap();
         assert_eq!(
             first_metadata.naming_mode,
@@ -13257,7 +13286,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            store.read_blob(wire_hash(&from_file.hash)).unwrap().as_ref(),
+            store
+                .read_blob(wire_hash(&from_file.hash))
+                .unwrap()
+                .as_ref(),
             b"file payload"
         );
         store
@@ -13290,7 +13322,10 @@ mod tests {
         store.expiry_report("assets", &moved.path).unwrap();
         assert!(store.blob_path(wire_hash(&first.hash)).is_file());
         store.undo("assets", None).unwrap();
-        assert_eq!(node_hash(&store, "assets", &first.path), wire_hash(&first.hash));
+        assert_eq!(
+            node_hash(&store, "assets", &first.path),
+            wire_hash(&first.hash)
+        );
         assert_eq!(
             store.allocated_metadata("assets", &first.path).unwrap(),
             first_metadata
@@ -13303,7 +13338,10 @@ mod tests {
         store.delete_file("assets", &first.path).unwrap();
         assert!(store.blob_path(wire_hash(&first.hash)).is_file());
         store.undo("assets", None).unwrap();
-        assert_eq!(node_hash(&store, "assets", &first.path), wire_hash(&first.hash));
+        assert_eq!(
+            node_hash(&store, "assets", &first.path),
+            wire_hash(&first.hash)
+        );
     }
 
     #[test]
@@ -13346,10 +13384,16 @@ mod tests {
                 blake3::hash(allocation_output.as_bytes()).to_hex()
             )
         );
-        let hash_hex = allocated.hash.strip_prefix("blake3:").unwrap_or(&allocated.hash);
+        let hash_hex = allocated
+            .hash
+            .strip_prefix("blake3:")
+            .unwrap_or(&allocated.hash);
         assert!(allocated.path.contains(hash_hex));
         assert_eq!(
-            store.read_blob(wire_hash(&allocated.hash)).unwrap().as_ref(),
+            store
+                .read_blob(wire_hash(&allocated.hash))
+                .unwrap()
+                .as_ref(),
             allocation_output.as_bytes()
         );
 
@@ -13787,7 +13831,10 @@ mod tests {
             .unwrap();
         assert_eq!(sanitized.mutation.unwrap().sanitized.management, 1);
         assert_eq!(
-            store.read_blob(wire_hash(&sanitized.hash)).unwrap().as_ref(),
+            store
+                .read_blob(wire_hash(&sanitized.hash))
+                .unwrap()
+                .as_ref(),
             format!("sym_mgmt_{}\nA01BC56789Z", "*".repeat(64)).as_bytes()
         );
     }
@@ -13947,7 +13994,10 @@ mod tests {
             .unwrap();
         assert_eq!(allocated.size, b"original allocation".len() as u64);
         assert_eq!(
-            store.read_blob(wire_hash(&allocated.hash)).unwrap().as_ref(),
+            store
+                .read_blob(wire_hash(&allocated.hash))
+                .unwrap()
+                .as_ref(),
             b"original allocation"
         );
 
@@ -14019,7 +14069,10 @@ mod tests {
             wire_hash(&destination.hash)
         );
         store.undo("reuse", None).unwrap();
-        assert_eq!(node_hash(&store, "reuse", &first.path), wire_hash(&first.hash));
+        assert_eq!(
+            node_hash(&store, "reuse", &first.path),
+            wire_hash(&first.hash)
+        );
         assert_eq!(
             node_hash(&store, "reuse", &destination.path),
             wire_hash(&destination.hash)
@@ -14238,7 +14291,10 @@ mod tests {
             store.lookup("survivor", "temporary.txt"),
             Err(StoreError::NotFound)
         ));
-        assert_eq!(node_hash(&store, "survivor", &survivor.path), wire_hash(&survivor.hash));
+        assert_eq!(
+            node_hash(&store, "survivor", &survivor.path),
+            wire_hash(&survivor.hash)
+        );
     }
 
     #[test]

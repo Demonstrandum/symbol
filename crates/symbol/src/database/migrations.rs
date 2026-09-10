@@ -939,7 +939,10 @@ mod tests {
 
             migrate(&mut db).unwrap();
 
-            assert_eq!(schema_version(&mut db).unwrap(), schema::LATEST_SCHEMA_VERSION);
+            assert_eq!(
+                schema_version(&mut db).unwrap(),
+                schema::LATEST_SCHEMA_VERSION
+            );
             let record = metadata::table
                 .find("schema.migration.v11")
                 .select(metadata::value)
@@ -1125,11 +1128,7 @@ mod tests {
                 .select((files::path, files::hash, files::size))
                 .first::<(String, ContentHash, i64)>(&mut db)
                 .unwrap(),
-            (
-                "legacy.txt".to_string(),
-                test_content_hash("v2-hash"),
-                7
-            )
+            ("legacy.txt".to_string(), test_content_hash("v2-hash"), 7)
         );
     }
 

@@ -262,7 +262,10 @@ mod tests {
         let hash = ContentHash::from(digest);
         let wire = format!("blake3:{}", digest.to_hex());
         assert_eq!(ContentHash::try_from(wire.as_str()).unwrap(), hash);
-        assert_eq!(ContentHash::try_from(digest.to_hex().as_str()).unwrap(), hash);
+        assert_eq!(
+            ContentHash::try_from(digest.to_hex().as_str()).unwrap(),
+            hash
+        );
     }
 
     #[test]
