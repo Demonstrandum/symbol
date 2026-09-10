@@ -46,6 +46,7 @@ use axum::routing::{MethodRouter, get};
 use axum::{Json, Router};
 use clap::{Parser, Subcommand};
 use expiry::{DecayPolicy, ExpiryMode, ExpiryPolicy};
+use hash::ContentHash;
 use futures_util::StreamExt as _;
 use secrets::{ClaimToken, ManagementToken};
 use store::{
@@ -884,13 +885,13 @@ async fn send_hash(app: &App, name: &str, rel: &str) -> Response {
     match lookup {
         Ok(hash) => hash.map_or_else(
             || StoreError::NotFound.into_response(),
-            |hash| plain(StatusCode::OK, hash),
+            |hash| plain(StatusCode::OK, hash.to_wire()),
         ),
         Err(err) => err.into_response(),
     }
 }
 
-fn lookup_hash(store: &Store, name: &str, rel: &str) -> Result<Option<String>, StoreError> {
+fn lookup_hash(store: &Store, name: &str, rel: &str) -> Result<Option<ContentHash>, StoreError> {
     if rel.is_empty() {
         return Ok(["index.html", "index.htm"].iter().find_map(|index| {
             store
@@ -1685,7 +1686,7 @@ fn creator_identity(headers: &HeaderMap) -> Option<CreatorIdentity> {
         })
 }
 
-#[expect(clippy::result_large_err)]
+#[expect(clippy::result_large_err)] // the large variant is Response, not StoreError
 fn creation_request(headers: &HeaderMap) -> Result<CreationRequest, Response> {
     let managed = match headers
         .get("management-action")
@@ -2451,7 +2452,7 @@ async fn serve_from(app: &App, name: &str, rel: &str, headers: &HeaderMap) -> Re
                 .await;
             match index {
                 Ok(Some((logical, hash))) => {
-                    return send_expiring_blob(headers, name, &logical, &hash, app).await;
+                    return send_expiring_blob(headers, name, &logical, hash, app).await;
                 }
                 Ok(None) => {}
                 Err(err) => return err.into_response(),
@@ -2461,7 +2462,7 @@ async fn serve_from(app: &App, name: &str, rel: &str, headers: &HeaderMap) -> Re
             response
         }
         Ok(SiteGet::Node(store::Node::File { logical, hash })) => {
-            send_expiring_blob(headers, name, &logical, &hash, app).await
+            send_expiring_blob(headers, name, &logical, hash, app).await
         }
         Err(err) => err.into_response(),
     }
@@ -2556,7 +2557,7 @@ fn find_index(
     store: &Store,
     name: &str,
     rel: &str,
-) -> Result<Option<(String, String)>, StoreError> {
+) -> Result<Option<(String, ContentHash)>, StoreError> {
     for index in ["index.html", "index.htm"] {
         match store.child_blob(name, rel, index) {
             Ok(store::Node::File { logical, hash }) => return Ok(Some((logical, hash))),
@@ -2572,11 +2573,13 @@ async fn serve_immutable_blob(
     Path((name, hash)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
+    let Ok(hash) = ContentHash::parse_wire(&hash) else {
+        return StoreError::NotFound.into_response();
+    };
     let referenced = app
         .run_store({
             let name = name.clone();
-            let hash = hash.clone();
-            move |store| store.site_references_blob(&name, &hash)
+            move |store| store.site_references_blob(&name, hash)
         })
         .await;
     match referenced {
@@ -2587,14 +2590,19 @@ async fn serve_immutable_blob(
     send_blob_file(
         &headers,
         "application/octet-stream",
-        &hash,
+        hash,
         http_cache::Policy::Immutable,
         &app,
     )
     .await
 }
 
-async fn send_blob(headers: &HeaderMap, content_type: &str, hash: &str, app: &App) -> Response {
+async fn send_blob(
+    headers: &HeaderMap,
+    content_type: &str,
+    hash: ContentHash,
+    app: &App,
+) -> Response {
     send_blob_file(
         headers,
         content_type,
@@ -2609,7 +2617,7 @@ async fn send_expiring_blob(
     headers: &HeaderMap,
     name: &str,
     logical: &str,
-    hash: &str,
+    hash: ContentHash,
     app: &App,
 ) -> Response {
     let report = app
@@ -2675,11 +2683,11 @@ async fn add_target_expiry_headers(app: &App, name: &str, rel: &str, headers: &m
 async fn send_blob_file(
     headers: &HeaderMap,
     content_type: &str,
-    hash: &str,
+    hash: ContentHash,
     policy: http_cache::Policy,
     app: &App,
 ) -> Response {
-    let etag = format!("\"{hash}\"");
+    let etag = format!("\"{}\"", hash.to_wire());
     if let Some(mut response) = http_cache::not_modified(headers, &etag, policy, None) {
         response
             .headers_mut()
@@ -2698,10 +2706,7 @@ async fn send_blob_file(
 
     if range.is_none() && size <= STREAM_THRESHOLD {
         let bytes = app
-            .run_store({
-                let hash = hash.to_string();
-                move |store| store.read_blob(&hash)
-            })
+            .run_store(move |store| store.read_blob(hash))
             .await;
         return match bytes {
             Ok(bytes) => {
@@ -3050,7 +3055,8 @@ impl IntoResponse for StoreError {
             let headers = response.headers_mut();
             headers.insert(
                 header::ETAG,
-                HeaderValue::from_str(&format!("\"{tree_hash}\"")).expect("valid site ETag"),
+                HeaderValue::from_str(&format!("\"{}\"", tree_hash.to_wire()))
+                    .expect("valid site ETag"),
             );
             headers.insert(
                 "content-revision",
@@ -3062,7 +3068,8 @@ impl IntoResponse for StoreError {
             let mut response = plain(StatusCode::PRECONDITION_FAILED, self.to_string());
             response.headers_mut().insert(
                 header::ETAG,
-                HeaderValue::from_str(&format!("\"{current_hash}\"")).expect("valid content ETag"),
+                HeaderValue::from_str(&format!("\"{}\"", current_hash.to_wire()))
+                    .expect("valid content ETag"),
             );
             return response;
         }
@@ -3679,7 +3686,7 @@ mod tests {
 
         let response = serve_immutable_blob(
             State(app.clone()),
-            Path(("hello".to_string(), hash.clone())),
+            Path(("hello".to_string(), hash.to_wire())),
             HeaderMap::new(),
         )
         .await;
@@ -3698,7 +3705,7 @@ mod tests {
         conditional.insert(header::IF_NONE_MATCH, etag);
         let response = serve_immutable_blob(
             State(app.clone()),
-            Path(("hello".to_string(), hash.clone())),
+            Path(("hello".to_string(), hash.to_wire())),
             conditional,
         )
         .await;
@@ -3706,7 +3713,7 @@ mod tests {
 
         let response = serve_immutable_blob(
             State(app),
-            Path(("other".to_string(), hash)),
+            Path(("other".to_string(), hash.to_wire())),
             HeaderMap::new(),
         )
         .await;
@@ -4653,7 +4660,7 @@ mod tests {
         let store::Node::File { hash, .. } = store.lookup("secure", "leak.txt").unwrap() else {
             panic!("expected sanitized file");
         };
-        let stored = store.read_blob(&hash).unwrap();
+        let stored = store.read_blob(hash).unwrap();
         assert_eq!(stored.len(), token.len());
         assert!(stored.starts_with(secrets::MANAGEMENT_TOKEN_PREFIX.as_bytes()));
         assert!(!stored.windows(16).any(|window| {

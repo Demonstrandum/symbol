@@ -145,9 +145,18 @@ binary_hash!(TreeHash);
 
 impl ContentHash {
     /// Parse an incoming content hash: bare hex, or hex behind the wire
-    /// prefix, which is accepted so callers may echo back a tree hash form.
+    /// prefix, which both `ETag` and `If-Match` headers carry.
     pub fn parse_wire(value: &str) -> Result<Self, HashParseError> {
         Self::parse_hex(value.strip_prefix(WIRE_PREFIX).unwrap_or(value))
+    }
+
+    /// Render for the wire: `blake3:{hex}`, as used by `ETag`s and manifests.
+    ///
+    /// Blob filesystem paths use [`Self::to_hex`] instead, which is why this
+    /// is a separate method rather than the `Display` form.
+    #[must_use]
+    pub fn to_wire(self) -> String {
+        format!("{WIRE_PREFIX}{}", self.to_hex())
     }
 }
 

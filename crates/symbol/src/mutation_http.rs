@@ -1,3 +1,5 @@
+// `Result<_, Response>` is pervasive here and `axum::response::Response` is the
+// large variant; this is not about StoreError's size.
 #![expect(clippy::result_large_err)]
 
 use std::fmt::Write as _;
@@ -15,6 +17,7 @@ use super::{
     App, ExpiryRequest, TemporaryUpload, expiry_policy_from, has_expiry_parameters, if_match_from,
     insert_sanitized_headers, insert_undo_headers, management_bearer, plain,
 };
+use crate::hash::ContentHash;
 use crate::secrets::ManagementToken;
 use crate::splice::{self, ProtocolError};
 use crate::store::{
@@ -644,7 +647,7 @@ pub async fn replace_file(
         .run_store({
             let name = name.to_string();
             let path = path.to_string();
-            let base_hash = base_hash.clone();
+            let base_hash = base_hash.to_hex();
             let source = temporary.path.clone();
             move |store| {
                 store.replace_file_content(
@@ -687,7 +690,7 @@ pub async fn replace_file(
         old_path: path.to_string(),
         new_path: replaced.path.clone(),
         relocated,
-        old_hash: prefixed_hash(&base_hash),
+        old_hash: base_hash.to_wire(),
         new_hash: prefixed_hash(&replaced.hash),
         size: replaced.size,
         mutation,
@@ -753,7 +756,7 @@ async fn splice_file_inner(
         Ok(parsed) => parsed,
         Err(error) => return splice_error(&error),
     };
-    let old_size = tokio::fs::metadata(app.store.blob_path(&base_hash))
+    let old_size = tokio::fs::metadata(app.store.blob_path(base_hash))
         .await
         .ok()
         .map(|metadata| metadata.len());
@@ -763,7 +766,7 @@ async fn splice_file_inner(
         .run_store({
             let name = name.clone();
             let path = path.clone();
-            let base_hash = base_hash.clone();
+            let base_hash = base_hash.to_hex();
             move |store| {
                 let old_size = old_size.unwrap_or(0);
                 let count = parsed.count();
@@ -801,7 +804,7 @@ async fn splice_file_inner(
         old_path: path.clone(),
         new_path: spliced.path.clone(),
         relocated: spliced.path != path,
-        old_hash: prefixed_hash(&base_hash),
+        old_hash: base_hash.to_wire(),
         new_hash: prefixed_hash(&spliced.hash),
         old_size,
         new_size: spliced.size,
@@ -1019,7 +1022,7 @@ fn generated_idempotency_key() -> Result<String, StoreError> {
     Ok(encoded)
 }
 
-fn content_match(headers: &HeaderMap) -> Result<String, Response> {
+fn content_match(headers: &HeaderMap) -> Result<ContentHash, Response> {
     let value = required_text_header(headers, "if-content-match", "If-Content-Match")?;
     let value = value.trim();
     let value = value
@@ -1037,7 +1040,12 @@ fn content_match(headers: &HeaderMap) -> Result<String, Response> {
             "error: If-Content-Match must contain one raw Blake3 hash",
         ));
     }
-    Ok(value.to_string())
+    ContentHash::parse_hex(value).map_err(|_| {
+        plain(
+            StatusCode::BAD_REQUEST,
+            "error: If-Content-Match must contain one raw Blake3 hash",
+        )
+    })
 }
 
 fn required_text_header(
@@ -1324,7 +1332,10 @@ async fn mutation_error(app: &App, name: &str, error: StoreError) -> Response {
             .map_or(0, |snapshot| snapshot.content_revision);
         let mut response = plain(
             StatusCode::PRECONDITION_FAILED,
-            format!("error: file content hash is stale; current hash is {current_hash}"),
+            format!(
+                "error: file content hash is stale; current hash is {}",
+                current_hash.to_wire()
+            ),
         );
         response.headers_mut().insert(
             header::ETAG,

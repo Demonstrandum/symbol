@@ -517,8 +517,8 @@ struct BlobCache {
 }
 
 struct BlobCacheState {
-    entries: HashMap<String, CachedBlob>,
-    recency: BTreeMap<u64, String>,
+    entries: HashMap<ContentHash, CachedBlob>,
+    recency: BTreeMap<u64, ContentHash>,
     charge: usize,
     generation: u64,
 }
@@ -906,7 +906,7 @@ pub struct PopResult {
 #[derive(Debug)]
 pub enum Node {
     Dir,
-    File { logical: String, hash: String },
+    File { logical: String, hash: ContentHash },
 }
 
 struct StagedFile {
@@ -987,9 +987,9 @@ pub enum StoreError {
     #[error("error: idempotency key must be 1-256 visible ASCII characters")]
     InvalidIdempotencyKey,
     #[error("error: upstream changed; nothing was written")]
-    PreconditionFailed { revision: u64, tree_hash: Box<str> },
-    #[error("error: file content hash is stale; current hash is {0}")]
-    StaleContentHash(Box<str>),
+    PreconditionFailed { revision: u64, tree_hash: TreeHash },
+    #[error("error: file content hash is stale; current hash is {}", _0.to_wire())]
+    StaleContentHash(ContentHash),
     #[error("{0}")]
     HashParse(#[from] HashParseError),
     #[error("error: invalid allocated file name")]
@@ -1165,11 +1165,11 @@ impl BlobCache {
         }
     }
 
-    fn get(&self, hash: &str) -> Option<Bytes> {
+    fn get(&self, hash: ContentHash) -> Option<Bytes> {
         let mut state = self.state.lock().unwrap();
         let Some((last_used, bytes)) = state
             .entries
-            .get(hash)
+            .get(&hash)
             .map(|entry| (entry.last_used, entry.bytes.clone()))
         else {
             drop(state);
@@ -1185,7 +1185,7 @@ impl BlobCache {
         state.recency.insert(generation, key);
         state
             .entries
-            .get_mut(hash)
+            .get_mut(&hash)
             .expect("cached blob still exists")
             .last_used = generation;
         drop(state);
@@ -1193,17 +1193,17 @@ impl BlobCache {
         Some(bytes)
     }
 
-    fn insert(&self, hash: &str, bytes: Bytes) {
+    fn insert(&self, hash: ContentHash, bytes: Bytes) {
         let charge = bytes
             .len()
-            .saturating_add(hash.len().saturating_mul(2))
+            .saturating_add(size_of::<ContentHash>().saturating_mul(2))
             .saturating_add(BLOB_CACHE_ENTRY_OVERHEAD);
         if charge > self.capacity || self.max_entries == 0 {
             return;
         }
 
         let mut state = self.state.lock().unwrap();
-        if let Some(previous) = state.entries.remove(hash) {
+        if let Some(previous) = state.entries.remove(&hash) {
             state.recency.remove(&previous.last_used);
             state.charge -= previous.charge;
         }
@@ -1218,8 +1218,7 @@ impl BlobCache {
         }
         state.generation += 1;
         let generation = state.generation;
-        let hash = hash.to_string();
-        state.recency.insert(generation, hash.clone());
+        state.recency.insert(generation, hash);
         state.entries.insert(
             hash,
             CachedBlob {
@@ -1238,7 +1237,7 @@ impl BlobCache {
         }
     }
 
-    fn remove(&self, hashes: &[String]) {
+    fn remove(&self, hashes: &[ContentHash]) {
         let mut state = self.state.lock().unwrap();
         for hash in hashes {
             if let Some(removed) = state.entries.remove(hash) {
@@ -1249,8 +1248,8 @@ impl BlobCache {
     }
 
     #[cfg(test)]
-    fn contains(&self, hash: &str) -> bool {
-        self.state.lock().unwrap().entries.contains_key(hash)
+    fn contains(&self, hash: ContentHash) -> bool {
+        self.state.lock().unwrap().entries.contains_key(&hash)
     }
 }
 
@@ -1375,10 +1374,8 @@ impl Store {
         self.inner.expiry_defaults
     }
 
-    pub fn blob_path(&self, hash: &str) -> PathBuf {
-        let hex =
-            ContentHash::parse_wire(hash).map_or_else(|_| hash.to_string(), ContentHash::to_hex);
-        self.inner.blob_files.path(&hex)
+    pub fn blob_path(&self, hash: ContentHash) -> PathBuf {
+        self.inner.blob_files.path(hash)
     }
 
     pub fn upload_path(&self) -> PathBuf {
@@ -2204,10 +2201,7 @@ impl Store {
         let node = match node_locked(&mut db, name, &rel)? {
             NodeKind::Missing => return Err(StoreError::NotFound),
             NodeKind::Dir => Node::Dir,
-            NodeKind::File { hash } => Node::File {
-                logical: rel,
-                hash: format!("blake3:{}", hash.to_hex()),
-            },
+            NodeKind::File { hash } => Node::File { logical: rel, hash },
         };
         Ok(node)
     }
@@ -2221,19 +2215,18 @@ impl Store {
         self.lookup(name, &path)
     }
 
-    pub fn read_blob(&self, hash: &str) -> Result<Bytes, StoreError> {
+    pub fn read_blob(&self, hash: ContentHash) -> Result<Bytes, StoreError> {
         if let Some(bytes) = self.inner.blobs.get(hash) {
             return Ok(bytes);
         }
-        let content_hash = ContentHash::parse_wire(hash)?;
         let mut db = self.inner.readers.get();
         blobs::table
-            .find(content_hash)
+            .find(hash)
             .select(blobs::hash)
             .first::<ContentHash>(&mut *db)
             .map_err(map_sql)?;
         drop(db);
-        let bytes = Bytes::from(self.inner.blob_files.read(&content_hash.to_hex())?);
+        let bytes = Bytes::from(self.inner.blob_files.read(hash)?);
         self.inner.blobs.insert(hash, bytes.clone());
         Ok(bytes)
     }
@@ -2267,11 +2260,9 @@ impl Store {
             .map_err(StoreError::from)
     }
 
-    pub fn site_references_blob(&self, name: &str, hash: &str) -> Result<bool, StoreError> {
+    pub fn site_references_blob(&self, name: &str, hash: ContentHash) -> Result<bool, StoreError> {
         let name = parse_site_name(name)?;
-        let Ok(content_hash) = ContentHash::try_from(hash) else {
-            return Ok(false);
-        };
+        let content_hash = hash;
         let mut db = self.inner.readers.get();
         let count = files::table
             .inner_join(sites::table)
@@ -2810,12 +2801,11 @@ impl Store {
                 custom_destination(&pending.folder, basename, &pending.media_type)?
             }
         };
-        let hash_hex = pending.hash.to_hex();
         let staged = StagedFile {
             path: destination.path.clone(),
             size: pending.size,
             hash: pending.hash,
-            source: StagedSource::File(self.inner.blob_files.path(&hash_hex)),
+            source: StagedSource::File(self.inner.blob_files.path(pending.hash)),
             sanitized: pending.sanitized,
         };
         let result = self.commit_allocated_locked(
@@ -3121,7 +3111,7 @@ impl Store {
         drop(db);
         self.run_before_content_commit();
         splice_blob_to_path(
-            &self.inner.blob_files.path(&current_hash.to_hex()),
+            &self.inner.blob_files.path(current_hash),
             old_size,
             &prepared,
             &output,
@@ -3722,7 +3712,7 @@ impl Store {
         if options.expected_tree_hash.is_some() {
             return Err(StoreError::PreconditionFailed {
                 revision: 0,
-                tree_hash: TreeHash::EMPTY.to_wire().into_boxed_str(),
+                tree_hash: TreeHash::EMPTY,
             });
         }
         let files = files
@@ -3903,7 +3893,7 @@ impl Store {
             if TreeHash::try_from(expected)? != tree_hash {
                 return Err(StoreError::PreconditionFailed {
                     revision,
-                    tree_hash: tree_hash.to_wire().into_boxed_str(),
+                    tree_hash,
                 });
             }
         }
@@ -4622,9 +4612,9 @@ impl Store {
 
     fn materialize(&self, file: &StagedFile) -> Result<(), StoreError> {
         match &file.source {
-            StagedSource::Bytes(bytes) => self.inner.blob_files.put_bytes(file.hash.to_hex().as_str(), bytes)?,
+            StagedSource::Bytes(bytes) => self.inner.blob_files.put_bytes(file.hash, bytes)?,
             StagedSource::File(path) | StagedSource::Temporary(path) => {
-                self.inner.blob_files.put_file(file.hash.to_hex().as_str(), path)?;
+                self.inner.blob_files.put_file(file.hash, path)?;
             }
         }
         Ok(())
@@ -4652,9 +4642,9 @@ impl Store {
         }
     }
 
-    fn remove_blob_files(&self, hashes: &[String]) {
+    fn remove_blob_files(&self, hashes: &[ContentHash]) {
         self.inner.blobs.remove(hashes);
-        for hash in hashes {
+        for &hash in hashes {
             if let Err(err) = self.inner.blob_files.quarantine(hash) {
                 tracing::warn!(%hash, %err, "failed to quarantine unreferenced blob file");
             }
@@ -4667,7 +4657,6 @@ impl Store {
             .select(blobs::hash)
             .load::<ContentHash>(&mut *db)?
             .into_iter()
-            .map(ContentHash::to_hex)
             .collect::<HashSet<_>>();
         drop(db);
         self.inner.blob_files.restore(&live)?;
@@ -4692,17 +4681,16 @@ impl Store {
                 .order(blobs::hash)
                 .load::<(ContentHash, Vec<u8>, i64)>(&mut *db)?;
             for (hash, bytes, size) in rows {
-                let hash_hex = hash.to_hex();
                 if i64::try_from(bytes.len()).expect("blob size fits in i64") != size
-                    || blake3::hash(&bytes).to_hex().as_str() != hash_hex
+                    || ContentHash::from(blake3::hash(&bytes)) != hash
                 {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!("corrupt SQLite blob {hash_hex}"),
+                        format!("corrupt SQLite blob {hash}"),
                     )
                     .into());
                 }
-                self.inner.blob_files.put_bytes(&hash_hex, &bytes)?;
+                self.inner.blob_files.put_bytes(hash, &bytes)?;
             }
         }
 
@@ -6105,7 +6093,7 @@ fn check_tree_precondition(
     } else {
         Err(StoreError::PreconditionFailed {
             revision,
-            tree_hash: tree_hash.to_wire().into_boxed_str(),
+            tree_hash,
         })
     }
 }
@@ -6569,9 +6557,7 @@ fn alias_entry(row: AliasRow) -> Result<AliasEntry, StoreError> {
         path: row.path,
         canonical_target: row.canonical_target,
         resolved_kind,
-        resolved_hash: row
-            .resolved_hash
-            .map(|hash| format!("blake3:{}", hash.to_hex())),
+        resolved_hash: row.resolved_hash.map(ContentHash::to_wire),
         resolved_size: row.resolved_size.map(i64::cast_unsigned),
         resolved_files: None,
     })
@@ -8549,7 +8535,7 @@ fn regenerate_site(
         }
     }
     let staged = stage_bytes(MANIFEST_PATH, manifest.as_bytes());
-    blobs.put_bytes(staged.hash.to_hex().as_str(), manifest.as_bytes())?;
+    blobs.put_bytes(staged.hash, manifest.as_bytes())?;
     diesel::insert_into(blobs::table)
         .values((
             blobs::hash.eq(staged.hash),
@@ -9932,7 +9918,7 @@ fn site_files(
     for entry in entries {
         match entry {
             ArchiveEntry::File { path, hash, .. } => {
-                let bytes = blobs.read(hash.to_hex().as_str())?;
+                let bytes = blobs.read(hash)?;
                 if !is_junk(Path::new(&path), Some(&bytes)) {
                     files.push(ArchiveFile::File { path, bytes });
                 }
@@ -10024,7 +10010,7 @@ fn append_tar_entries<W: Write>(
                 header.set_size(*size);
                 header.set_mode(0o644);
                 header.set_cksum();
-                archive.append_data(&mut header, path, fs::File::open(blobs.path(&hash.to_hex()))?)?;
+                archive.append_data(&mut header, path, fs::File::open(blobs.path(*hash))?)?;
             }
             ArchiveEntry::Alias { path, target } => {
                 let relative = relative_alias_target(path, target);
@@ -10054,7 +10040,7 @@ fn write_zip_entries(
                 archive
                     .start_file(path, options)
                     .map_err(io::Error::other)?;
-                io::copy(&mut fs::File::open(blobs.path(&hash.to_hex()))?, &mut archive)?;
+                io::copy(&mut fs::File::open(blobs.path(*hash))?, &mut archive)?;
             }
             ArchiveEntry::Alias { path, target } => {
                 let relative = zip_safe_relative_alias_target(path, target)?;
@@ -10174,15 +10160,16 @@ fn pack_zip(files: &[ArchiveFile]) -> io::Result<Vec<u8>> {
         .map_err(io::Error::other)
 }
 
-fn gc_blobs(tx: &mut SqliteConnection, now: i64) -> Result<Vec<String>, diesel::result::Error> {
+fn gc_blobs(
+    tx: &mut SqliteConnection,
+    now: i64,
+) -> Result<Vec<ContentHash>, diesel::result::Error> {
     let mut live = HashSet::new();
     live.extend(
         files::table
             .select(files::hash)
             .distinct()
             .load::<ContentHash>(tx)?
-            .into_iter()
-            .map(ContentHash::to_hex),
     );
     live.extend(
         undo_files::table
@@ -10192,8 +10179,6 @@ fn gc_blobs(tx: &mut SqliteConnection, now: i64) -> Result<Vec<String>, diesel::
             .select(undo_files::hash)
             .distinct()
             .load::<ContentHash>(tx)?
-            .into_iter()
-            .map(ContentHash::to_hex),
     );
     live.extend(
         undo_file_deltas::table
@@ -10205,14 +10190,11 @@ fn gc_blobs(tx: &mut SqliteConnection, now: i64) -> Result<Vec<String>, diesel::
             .load::<Option<ContentHash>>(tx)?
             .into_iter()
             .flatten()
-            .map(ContentHash::to_hex),
     );
     live.extend(
         allocated_entries::table
             .select(allocated_entries::hash)
             .load::<ContentHash>(tx)?
-            .into_iter()
-            .map(ContentHash::to_hex),
     );
     live.extend(
         undo_allocated_deltas::table
@@ -10226,37 +10208,26 @@ fn gc_blobs(tx: &mut SqliteConnection, now: i64) -> Result<Vec<String>, diesel::
             .load::<Option<ContentHash>>(tx)?
             .into_iter()
             .flatten()
-            .map(ContentHash::to_hex),
     );
     live.extend(
         pending_allocations::table
             .select(pending_allocations::hash)
             .load::<ContentHash>(tx)?
-            .into_iter()
-            .map(ContentHash::to_hex),
     );
     let hashes = blobs::table
         .select(blobs::hash)
         .load::<ContentHash>(tx)?
         .into_iter()
-        .map(ContentHash::to_hex)
         .filter(|hash| !live.contains(hash))
         .collect::<Vec<_>>();
     for chunk in hashes.chunks(SQLITE_DELETE_BATCH_SIZE) {
-        let chunk_hashes = chunk
-            .iter()
-            .filter_map(|hash| ContentHash::parse_hex(hash).ok())
-            .collect::<Vec<_>>();
-        diesel::delete(blobs::table.filter(blobs::hash.eq_any(chunk_hashes))).execute(tx)?;
+        diesel::delete(blobs::table.filter(blobs::hash.eq_any(chunk.to_vec()))).execute(tx)?;
     }
     Ok(hashes)
 }
 
-fn stale_content_hash_error(current: ContentHash) -> StoreError {
-    StoreError::StaleContentHash(
-        format!("blake3:{}", current.to_hex())
-            .into_boxed_str(),
-    )
+const fn stale_content_hash_error(current: ContentHash) -> StoreError {
+    StoreError::StaleContentHash(current)
 }
 
 fn base_hash_matches(current: ContentHash, base_hash: &str) -> bool {
@@ -10390,7 +10361,7 @@ mod tests {
         let Node::File { hash, .. } = store.lookup("alias-test", "latest.js").unwrap() else {
             panic!("file alias must resolve");
         };
-        assert_eq!(Some(hash), direct.resolved_hash);
+        assert_eq!(Some(hash.to_wire()), direct.resolved_hash);
 
         store
             .put_aliases(
@@ -11460,7 +11431,7 @@ mod tests {
         let Node::File { hash, .. } = store.lookup("alias-paths", MANIFEST_PATH).unwrap() else {
             panic!("manifest must be a file");
         };
-        let manifest = String::from_utf8(store.read_blob(&hash).unwrap().to_vec()).unwrap();
+        let manifest = String::from_utf8(store.read_blob(hash).unwrap().to_vec()).unwrap();
         let parsed = toml::from_str::<toml::Value>(&manifest).unwrap();
         assert_eq!(
             parsed["aliases"][safe].as_str(),
@@ -11848,7 +11819,7 @@ mod tests {
         let Node::File { hash, .. } = store.lookup("hello", MANIFEST_PATH).unwrap() else {
             panic!("manifest must be stored");
         };
-        let manifest = String::from_utf8(store.read_blob(&hash).unwrap().to_vec()).unwrap();
+        let manifest = String::from_utf8(store.read_blob(hash).unwrap().to_vec()).unwrap();
         assert!(manifest.contains("host = \"https://symbol.example\""));
         assert!(manifest.contains("name = \"hello\""));
         assert!(manifest.contains("content_revision = 2"));
@@ -12180,7 +12151,7 @@ mod tests {
             Node::File { hash, .. } => hash,
             Node::Dir => panic!("expected restored file"),
         };
-        assert_eq!(store.read_blob(&hash).unwrap().as_ref(), b"keep");
+        assert_eq!(store.read_blob(hash).unwrap().as_ref(), b"keep");
 
         store.put_file("created", "index.html", b"new").unwrap();
         let create = store.undo_stack("created").unwrap().entries[0]
@@ -12300,7 +12271,7 @@ mod tests {
         let Node::File { hash, .. } = store.lookup("moved", MANIFEST_PATH).unwrap() else {
             panic!("manifest must exist");
         };
-        let manifest = String::from_utf8(store.read_blob(&hash).unwrap().to_vec()).unwrap();
+        let manifest = String::from_utf8(store.read_blob(hash).unwrap().to_vec()).unwrap();
         assert!(manifest.contains("[expiry.site]"));
         assert!(manifest.contains("[expiry.folders.\"assets\"]"));
 
@@ -12406,7 +12377,7 @@ mod tests {
         let Node::File { hash, .. } = store.lookup("renamed", MANIFEST_PATH).unwrap() else {
             panic!("manifest must be a file");
         };
-        let manifest = String::from_utf8(store.read_blob(&hash).unwrap().to_vec()).unwrap();
+        let manifest = String::from_utf8(store.read_blob(hash).unwrap().to_vec()).unwrap();
         assert!(manifest.contains("name = \"renamed\""));
 
         store
@@ -12604,19 +12575,17 @@ mod tests {
         let Node::File { hash, .. } = store.lookup("hello", "index.html").unwrap() else {
             panic!("expected file");
         };
-        let blob_path = store.blob_path(&hash);
+        let blob_path = store.blob_path(hash);
         assert_eq!(fs::read(&blob_path).unwrap(), b"<h1>x</h1>");
         let mut db = test_connection(&dir.path().join("symbol.db"));
-        let hash_hex = hash.strip_prefix("blake3:").unwrap_or(&hash);
-        let content_hash = ContentHash::parse_hex(hash_hex).unwrap();
         let stored_bytes = blobs::table
-            .find(content_hash)
+            .find(hash)
             .select(blobs::bytes)
             .first::<Vec<u8>>(&mut db)
             .unwrap();
         assert!(stored_bytes.is_empty());
         drop(db);
-        assert_eq!(store.read_blob(&hash).unwrap().as_ref(), b"<h1>x</h1>");
+        assert_eq!(store.read_blob(hash).unwrap().as_ref(), b"<h1>x</h1>");
         let tar = store.pack_site("hello", ArchiveFormat::Tar).unwrap();
         assert_eq!(&tar[257..262], b"ustar");
         let tar_gz = store.pack_site("hello", ArchiveFormat::TarGz).unwrap();
@@ -12627,15 +12596,15 @@ mod tests {
         let packed = store.pop_site("hello").unwrap();
         assert_eq!(&packed[..2], [0x1f, 0x8b]);
         assert!(store.list_sites().unwrap().entries.is_empty());
-        assert_eq!(store.read_blob(&hash).unwrap().as_ref(), b"<h1>x</h1>");
+        assert_eq!(store.read_blob(hash).unwrap().as_ref(), b"<h1>x</h1>");
         assert!(blob_path.exists());
     }
 
     #[test]
     fn startup_migrates_sqlite_blob_payloads_to_files() {
         let dir = tempfile::tempdir().unwrap();
-        let hash = blake3::hash(b"legacy").to_hex();
-        let content_hash = ContentHash::parse_hex(&hash).unwrap();
+        let content_hash = ContentHash::from(blake3::hash(b"legacy"));
+        let hash_hex = content_hash.to_hex();
         {
             let mut db = test_connection(&dir.path().join("symbol.db"));
             run_migrations(&mut db).unwrap();
@@ -12678,14 +12647,14 @@ mod tests {
         let target = dir
             .path()
             .join("blobs")
-            .join(&hash[..2])
-            .join(&hash[2..]);
+            .join(&hash_hex[..2])
+            .join(&hash_hex[2..]);
         fs::create_dir_all(target.parent().unwrap()).unwrap();
         fs::write(&target, b"broken").unwrap();
 
         let store = Store::new(dir.path().to_path_buf()).unwrap();
-        assert_eq!(fs::read(store.blob_path(&hash)).unwrap(), b"legacy");
-        assert_eq!(store.read_blob(&hash).unwrap(), "legacy");
+        assert_eq!(fs::read(store.blob_path(content_hash)).unwrap(), b"legacy");
+        assert_eq!(store.read_blob(content_hash).unwrap(), "legacy");
         let mut db = test_connection(&dir.path().join("symbol.db"));
         assert_eq!(
             blobs::table
@@ -12738,8 +12707,12 @@ mod tests {
             };
             hash = stored_hash;
         }
-        let hash_hex = hash.strip_prefix("blake3:").unwrap_or(&hash);
-        let live = dir.path().join("blobs").join(&hash_hex[..2]).join(&hash_hex[2..]);
+        let hash_hex = hash.to_hex();
+        let live = dir
+            .path()
+            .join("blobs")
+            .join(&hash_hex[..2])
+            .join(&hash_hex[2..]);
         let quarantined = dir
             .path()
             .join("blobs")
@@ -12751,7 +12724,7 @@ mod tests {
 
         let store = Store::new(dir.path().to_path_buf()).unwrap();
 
-        assert_eq!(store.read_blob(&hash).unwrap().as_ref(), b"live");
+        assert_eq!(store.read_blob(hash).unwrap().as_ref(), b"live");
         assert!(live.exists());
         assert!(!quarantined.exists());
     }
@@ -12920,10 +12893,7 @@ mod tests {
             panic!("expected file");
         };
         assert_eq!(logical, "docs/index.html");
-        assert_eq!(
-            hash,
-            format!("blake3:{}", blake3::hash(b"docs").to_hex())
-        );
+        assert_eq!(hash, ContentHash::from(blake3::hash(b"docs")));
         assert!(matches!(
             store.lookup("hello", "missing"),
             Err(StoreError::NotFound)
@@ -12961,18 +12931,26 @@ mod tests {
         ));
     }
 
+    /// A distinct, non-zero hash per label, for tests that only need keys.
+    fn cache_key(label: u8) -> ContentHash {
+        ContentHash::from_bytes([label; 32])
+    }
+
     #[test]
     fn blob_cache_is_byte_bounded_and_evicts_least_recently_used() {
-        let cache = BlobCache::new(266, 16, Arc::new(Metrics::default()));
-        cache.insert("a", Bytes::from_static(b"aaa"));
-        cache.insert("b", Bytes::from_static(b"bbb"));
-        assert_eq!(cache.get("a").unwrap(), "aaa");
+        // Two entries exactly: 3 payload bytes plus a key charged at twice its
+        // size plus BLOB_CACHE_ENTRY_OVERHEAD.
+        let capacity = 2 * (3 + size_of::<ContentHash>() * 2 + BLOB_CACHE_ENTRY_OVERHEAD);
+        let cache = BlobCache::new(capacity, 16, Arc::new(Metrics::default()));
+        cache.insert(cache_key(b'a'), Bytes::from_static(b"aaa"));
+        cache.insert(cache_key(b'b'), Bytes::from_static(b"bbb"));
+        assert_eq!(cache.get(cache_key(b'a')).unwrap(), "aaa");
 
-        cache.insert("c", Bytes::from_static(b"ccc"));
+        cache.insert(cache_key(b'c'), Bytes::from_static(b"ccc"));
 
-        assert!(cache.contains("a"));
-        assert!(!cache.contains("b"));
-        assert!(cache.contains("c"));
+        assert!(cache.contains(cache_key(b'a')));
+        assert!(!cache.contains(cache_key(b'b')));
+        assert!(cache.contains(cache_key(b'c')));
         let state = cache.state.lock().unwrap();
         assert!(state.charge <= cache.capacity);
         assert_eq!(state.recency.len(), state.entries.len());
@@ -12981,23 +12959,23 @@ mod tests {
     #[test]
     fn blob_cache_caps_entry_count() {
         let cache = BlobCache::new(usize::MAX, 2, Arc::new(Metrics::default()));
-        cache.insert("a", Bytes::new());
-        cache.insert("b", Bytes::new());
-        cache.insert("c", Bytes::new());
+        cache.insert(cache_key(b'a'), Bytes::new());
+        cache.insert(cache_key(b'b'), Bytes::new());
+        cache.insert(cache_key(b'c'), Bytes::new());
 
-        assert!(!cache.contains("a"));
-        assert!(cache.contains("b"));
-        assert!(cache.contains("c"));
+        assert!(!cache.contains(cache_key(b'a')));
+        assert!(cache.contains(cache_key(b'b')));
+        assert!(cache.contains(cache_key(b'c')));
     }
 
     #[test]
     fn serving_metrics_count_cache_activity_and_reader_waits() {
         let metrics = Arc::new(Metrics::default());
         let cache = BlobCache::new(1024, 1, Arc::clone(&metrics));
-        assert!(cache.get("missing").is_none());
-        cache.insert("a", Bytes::from_static(b"a"));
-        assert_eq!(cache.get("a").unwrap(), "a");
-        cache.insert("b", Bytes::from_static(b"b"));
+        assert!(cache.get(cache_key(b'z')).is_none());
+        cache.insert(cache_key(b'a'), Bytes::from_static(b"a"));
+        assert_eq!(cache.get(cache_key(b'a')).unwrap(), "a");
+        cache.insert(cache_key(b'b'), Bytes::from_static(b"b"));
 
         let dir = tempfile::tempdir().unwrap();
         let store = Store::new(dir.path().to_path_buf()).unwrap();
@@ -13034,14 +13012,14 @@ mod tests {
             panic!("expected file");
         };
 
-        let first = store.read_blob(&hash).unwrap();
-        let second = store.read_blob(&hash).unwrap();
+        let first = store.read_blob(hash).unwrap();
+        let second = store.read_blob(hash).unwrap();
         assert_eq!(first.as_ptr(), second.as_ptr());
-        assert!(store.inner.blobs.contains(&hash));
+        assert!(store.inner.blobs.contains(hash));
 
         store.put_file("hello", "index.html", b"second").unwrap();
-        assert!(store.inner.blobs.contains(&hash));
-        assert_eq!(store.read_blob(&hash).unwrap(), "first");
+        assert!(store.inner.blobs.contains(hash));
+        assert_eq!(store.read_blob(hash).unwrap(), "first");
     }
 
     #[test]
@@ -13124,11 +13102,16 @@ mod tests {
         assert_eq!(paths.lock().unwrap().len(), 32);
     }
 
-    fn node_hash(store: &Store, site: &str, path: &str) -> String {
+    fn node_hash(store: &Store, site: &str, path: &str) -> ContentHash {
         let Node::File { hash, .. } = store.lookup(site, path).unwrap() else {
             panic!("expected file");
         };
         hash
+    }
+
+    /// Parse a hash back out of a receipt, whose fields stay wire strings.
+    fn wire_hash(value: &str) -> ContentHash {
+        ContentHash::parse_wire(value).expect("receipt carries a valid hash")
     }
 
     #[test]
@@ -13137,7 +13120,7 @@ mod tests {
         let store = Store::new(dir.path().to_path_buf()).unwrap();
         store.put_file("large", "index.html", b"old").unwrap();
         let hash = node_hash(&store, "large", "index.html");
-        let hash_hex = hash.strip_prefix("blake3:").unwrap_or(&hash);
+        let hash_hex = hash.to_hex();
         {
             let mut db = store.inner.writer.lock().unwrap();
             let site_id = site_id_locked(&mut db, "large").unwrap();
@@ -13219,7 +13202,7 @@ mod tests {
                 blake3::hash(b"payload").to_hex()
             )
         );
-        assert_eq!(store.read_blob(&first.hash).unwrap().as_ref(), b"payload");
+        assert_eq!(store.read_blob(wire_hash(&first.hash)).unwrap().as_ref(), b"payload");
         let first_metadata = store.allocated_metadata("assets", &first.path).unwrap();
         assert_eq!(
             first_metadata.naming_mode,
@@ -13274,7 +13257,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            store.read_blob(&from_file.hash).unwrap().as_ref(),
+            store.read_blob(wire_hash(&from_file.hash)).unwrap().as_ref(),
             b"file payload"
         );
         store
@@ -13305,9 +13288,9 @@ mod tests {
             Err(StoreError::NotFound)
         ));
         store.expiry_report("assets", &moved.path).unwrap();
-        assert!(store.blob_path(&first.hash).is_file());
+        assert!(store.blob_path(wire_hash(&first.hash)).is_file());
         store.undo("assets", None).unwrap();
-        assert_eq!(node_hash(&store, "assets", &first.path), first.hash);
+        assert_eq!(node_hash(&store, "assets", &first.path), wire_hash(&first.hash));
         assert_eq!(
             store.allocated_metadata("assets", &first.path).unwrap(),
             first_metadata
@@ -13318,9 +13301,9 @@ mod tests {
             Err(StoreError::NotFound)
         ));
         store.delete_file("assets", &first.path).unwrap();
-        assert!(store.blob_path(&first.hash).is_file());
+        assert!(store.blob_path(wire_hash(&first.hash)).is_file());
         store.undo("assets", None).unwrap();
-        assert_eq!(node_hash(&store, "assets", &first.path), first.hash);
+        assert_eq!(node_hash(&store, "assets", &first.path), wire_hash(&first.hash));
     }
 
     #[test]
@@ -13366,7 +13349,7 @@ mod tests {
         let hash_hex = allocated.hash.strip_prefix("blake3:").unwrap_or(&allocated.hash);
         assert!(allocated.path.contains(hash_hex));
         assert_eq!(
-            store.read_blob(&allocated.hash).unwrap().as_ref(),
+            store.read_blob(wire_hash(&allocated.hash)).unwrap().as_ref(),
             allocation_output.as_bytes()
         );
 
@@ -13406,7 +13389,7 @@ mod tests {
             .replace_file_content(
                 "sanitize-mutations",
                 "regular.txt",
-                &regular_hash,
+                &regular_hash.to_hex(),
                 AllocationSource::Bytes(claim.as_bytes()),
                 FileMutationOptions::default(),
             )
@@ -13419,7 +13402,7 @@ mod tests {
             }
         );
         assert_eq!(
-            store.read_blob(&replaced.hash).unwrap().as_ref(),
+            store.read_blob(wire_hash(&replaced.hash)).unwrap().as_ref(),
             redacted_claim.as_bytes()
         );
 
@@ -13428,7 +13411,7 @@ mod tests {
             .splice_file(
                 "sanitize-mutations",
                 "splice.txt",
-                &splice_hash,
+                &splice_hash.to_hex(),
                 &[Splice {
                     offset: 7,
                     delete: 0,
@@ -13445,7 +13428,7 @@ mod tests {
             }
         );
         assert_eq!(
-            store.read_blob(&spliced.hash).unwrap().as_ref(),
+            store.read_blob(wire_hash(&spliced.hash)).unwrap().as_ref(),
             format!("prefix:{redacted_management}").as_bytes()
         );
     }
@@ -13553,10 +13536,10 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert!(store.blob_path(&abandoned.hash).is_file());
+        assert!(store.blob_path(wire_hash(&abandoned.hash)).is_file());
         clock.advance(u64::try_from(PENDING_RETENTION_MILLIS).unwrap() + 1);
         assert_eq!(store.prune_pending_allocations().unwrap(), 1);
-        assert!(!store.blob_path(&abandoned.hash).exists());
+        assert!(!store.blob_path(wire_hash(&abandoned.hash)).exists());
         assert!(blob_quarantine_path(dir.path(), &abandoned.hash).is_file());
 
         let cancelled = store
@@ -13570,7 +13553,7 @@ mod tests {
         store
             .cancel_allocation("pending", &cancelled.token, None)
             .unwrap();
-        assert!(!store.blob_path(&cancelled.hash).exists());
+        assert!(!store.blob_path(wire_hash(&cancelled.hash)).exists());
         assert!(blob_quarantine_path(dir.path(), &cancelled.hash).is_file());
     }
 
@@ -13680,11 +13663,11 @@ mod tests {
             store.lookup("expiry-allocated", &allocated.path),
             Err(StoreError::NotFound)
         ));
-        assert!(store.blob_path(&allocated.hash).is_file());
+        assert!(store.blob_path(wire_hash(&allocated.hash)).is_file());
         store.undo("expiry-allocated", None).unwrap();
         assert_eq!(
             node_hash(&store, "expiry-allocated", &allocated.path),
-            allocated.hash
+            wire_hash(&allocated.hash)
         );
     }
 
@@ -13702,13 +13685,13 @@ mod tests {
                 AllocationSource::Bytes(b"new"),
                 FileMutationOptions::default()
             ),
-            Err(StoreError::StaleContentHash(current)) if *current == *old_hash
+            Err(StoreError::StaleContentHash(current)) if current == old_hash
         ));
         let replaced = store
             .replace_file_content(
                 "replace",
                 "data.bin",
-                &old_hash,
+                &old_hash.to_hex(),
                 AllocationSource::Bytes(b"new"),
                 FileMutationOptions::default(),
             )
@@ -13728,7 +13711,7 @@ mod tests {
             .splice_file(
                 "splice",
                 "data.txt",
-                &base,
+                &base.to_hex(),
                 &[
                     Splice {
                         offset: 0,
@@ -13750,7 +13733,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            store.read_blob(&result.hash).unwrap().as_ref(),
+            store.read_blob(wire_hash(&result.hash)).unwrap().as_ref(),
             b"A01BC56789Z"
         );
         assert!(matches!(
@@ -13804,7 +13787,7 @@ mod tests {
             .unwrap();
         assert_eq!(sanitized.mutation.unwrap().sanitized.management, 1);
         assert_eq!(
-            store.read_blob(&sanitized.hash).unwrap().as_ref(),
+            store.read_blob(wire_hash(&sanitized.hash)).unwrap().as_ref(),
             format!("sym_mgmt_{}\nA01BC56789Z", "*".repeat(64)).as_bytes()
         );
     }
@@ -13830,7 +13813,7 @@ mod tests {
             .splice_file(
                 "stream",
                 "large.bin",
-                &base,
+                &base.to_hex(),
                 &[Splice {
                     offset: 8 * 1024 * 1024,
                     delete: 64 * 1024,
@@ -13840,7 +13823,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result.size, 16 * 1024 * 1024);
-        let mut file = fs::File::open(store.blob_path(&result.hash)).unwrap();
+        let mut file = fs::File::open(store.blob_path(wire_hash(&result.hash))).unwrap();
         file.seek(SeekFrom::Start(8 * 1024 * 1024)).unwrap();
         let mut marker = [0_u8; 1];
         file.read_exact(&mut marker).unwrap();
@@ -13861,16 +13844,16 @@ mod tests {
             store.replace_file_content(
                 "cas",
                 "data.txt",
-                &base,
+                &base.to_hex(),
                 AllocationSource::Bytes(b"replacement"),
                 FileMutationOptions::default(),
             ),
             Err(StoreError::StaleContentHash(current))
-                if *current == format!("blake3:{}", blake3::hash(b"racer").to_hex())
+                if current == ContentHash::from(blake3::hash(b"racer"))
         ));
         assert_eq!(
             store
-                .read_blob(&node_hash(&store, "cas", "data.txt"))
+                .read_blob(node_hash(&store, "cas", "data.txt"))
                 .unwrap()
                 .as_ref(),
             b"racer"
@@ -13885,7 +13868,7 @@ mod tests {
             store.splice_file(
                 "cas",
                 "data.txt",
-                &splice_base,
+                &splice_base.to_hex(),
                 &[Splice {
                     offset: 0,
                     delete: 0,
@@ -13894,7 +13877,7 @@ mod tests {
                 FileMutationOptions::default(),
             ),
             Err(StoreError::StaleContentHash(current))
-                if *current == format!("blake3:{}", blake3::hash(b"second racer").to_hex())
+                if current == ContentHash::from(blake3::hash(b"second racer"))
         ));
 
         let pending = store
@@ -13934,14 +13917,11 @@ mod tests {
                 FileMutationOptions::default(),
             ),
             Err(StoreError::StaleContentHash(current))
-                if *current == format!("blake3:{}", blake3::hash(b"allocated racer").to_hex())
+                if current == ContentHash::from(blake3::hash(b"allocated racer"))
         ));
         assert!(
             !store
-                .blob_path(&format!(
-                    "blake3:{}",
-                    blake3::hash(b"allocated replacement").to_hex()
-                ))
+                .blob_path(ContentHash::from(blake3::hash(b"allocated replacement")))
                 .exists()
         );
     }
@@ -13967,7 +13947,7 @@ mod tests {
             .unwrap();
         assert_eq!(allocated.size, b"original allocation".len() as u64);
         assert_eq!(
-            store.read_blob(&allocated.hash).unwrap().as_ref(),
+            store.read_blob(wire_hash(&allocated.hash)).unwrap().as_ref(),
             b"original allocation"
         );
 
@@ -13982,7 +13962,7 @@ mod tests {
             .splice_file(
                 "staged",
                 "data.txt",
-                &base,
+                &base.to_hex(),
                 &[Splice {
                     offset: 4,
                     delete: 0,
@@ -13992,7 +13972,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            store.read_blob(&spliced.hash).unwrap().as_ref(),
+            store.read_blob(wire_hash(&spliced.hash)).unwrap().as_ref(),
             b"baseoriginal insertion"
         );
     }
@@ -14036,13 +14016,13 @@ mod tests {
         ));
         assert_eq!(
             node_hash(&store, "reuse", &destination.path),
-            destination.hash
+            wire_hash(&destination.hash)
         );
         store.undo("reuse", None).unwrap();
-        assert_eq!(node_hash(&store, "reuse", &first.path), first.hash);
+        assert_eq!(node_hash(&store, "reuse", &first.path), wire_hash(&first.hash));
         assert_eq!(
             node_hash(&store, "reuse", &destination.path),
-            destination.hash
+            wire_hash(&destination.hash)
         );
     }
 
@@ -14063,7 +14043,7 @@ mod tests {
             .replace_file_content(
                 "replay",
                 "data.txt",
-                &base,
+                &base.to_hex(),
                 AllocationSource::Bytes(b"same"),
                 noop_options,
             )
@@ -14074,7 +14054,7 @@ mod tests {
             .replace_file_content(
                 "replay",
                 "data.txt",
-                &base,
+                &base.to_hex(),
                 AllocationSource::Bytes(b"same"),
                 noop_options,
             )
@@ -14082,7 +14062,7 @@ mod tests {
         assert!(replay.replayed);
         assert_eq!(
             node_hash(&store, "replay", "data.txt"),
-            format!("blake3:{}", blake3::hash(b"later").to_hex())
+            ContentHash::from(blake3::hash(b"later"))
         );
 
         let pending = store
@@ -14163,7 +14143,7 @@ mod tests {
     fn failed_allocation_authorization_never_materializes_blobs() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::new(dir.path().to_path_buf()).unwrap();
-        let missing_hash = blake3::hash(b"missing").to_hex().to_string();
+        let missing_hash = ContentHash::from(blake3::hash(b"missing"));
         assert!(matches!(
             store.allocate_bytes(
                 "missing",
@@ -14173,7 +14153,7 @@ mod tests {
             ),
             Err(StoreError::NotFound)
         ));
-        assert!(!store.blob_path(&missing_hash).exists());
+        assert!(!store.blob_path(missing_hash).exists());
 
         store.put_file("managed", "index.html", b"site").unwrap();
         let management = ManagementToken::generate().unwrap();
@@ -14187,7 +14167,7 @@ mod tests {
                 .execute(&mut *db)
                 .unwrap();
         }
-        let forbidden_hash = blake3::hash(b"forbidden").to_hex().to_string();
+        let forbidden_hash = ContentHash::from(blake3::hash(b"forbidden"));
         assert!(matches!(
             store.propose_allocation(
                 "managed",
@@ -14197,7 +14177,7 @@ mod tests {
             ),
             Err(StoreError::Unauthorized)
         ));
-        assert!(!store.blob_path(&forbidden_hash).exists());
+        assert!(!store.blob_path(forbidden_hash).exists());
     }
 
     #[test]
@@ -14258,7 +14238,7 @@ mod tests {
             store.lookup("survivor", "temporary.txt"),
             Err(StoreError::NotFound)
         ));
-        assert_eq!(node_hash(&store, "survivor", &survivor.path), survivor.hash);
+        assert_eq!(node_hash(&store, "survivor", &survivor.path), wire_hash(&survivor.hash));
     }
 
     #[test]
@@ -14553,7 +14533,7 @@ mod tests {
             store.splice_file(
                 "splice-cleanup",
                 "missing.txt",
-                &base,
+                &base.to_hex(),
                 &splice,
                 FileMutationOptions::default(),
             ),
@@ -14565,7 +14545,7 @@ mod tests {
             store.splice_file(
                 "missing-site",
                 "data.txt",
-                &base,
+                &base.to_hex(),
                 &splice,
                 FileMutationOptions::default(),
             ),
@@ -14581,7 +14561,7 @@ mod tests {
                 &splice,
                 FileMutationOptions::default(),
             ),
-            Err(StoreError::StaleContentHash(current)) if *current == *base
+            Err(StoreError::StaleContentHash(current)) if current == base
         ));
         assert_eq!(splice_directories(), 0);
     }
@@ -14600,7 +14580,7 @@ mod tests {
             )
             .unwrap();
         let stale_bytes = b"stale result";
-        let stale_hash = blake3::hash(stale_bytes).to_hex().to_string();
+        let stale_hash = ContentHash::from(blake3::hash(stale_bytes));
         assert!(matches!(
             store.replace_file_content(
                 "no-orphan",
@@ -14611,11 +14591,11 @@ mod tests {
             ),
             Err(StoreError::StaleContentHash(_))
         ));
-        assert!(!store.blob_path(&stale_hash).exists());
+        assert!(!store.blob_path(stale_hash).exists());
 
         let conflict_bytes = b"conflicting result";
-        let conflict_hash = blake3::hash(conflict_bytes).to_hex().to_string();
-        let conflict_path = conflict_hash.clone();
+        let conflict_hash = ContentHash::from(blake3::hash(conflict_bytes));
+        let conflict_path = conflict_hash.to_hex();
         store
             .put_file("no-orphan", &conflict_path, b"occupied")
             .unwrap();
@@ -14628,7 +14608,7 @@ mod tests {
             ),
             Err(StoreError::DestinationConflict)
         ));
-        assert!(!store.blob_path(&conflict_hash).exists());
+        assert!(!store.blob_path(conflict_hash).exists());
     }
 
     #[test]

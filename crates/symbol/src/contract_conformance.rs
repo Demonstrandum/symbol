@@ -1065,8 +1065,7 @@ fn target_uri(target: Target, store: &Store) -> String {
             else {
                 panic!("fixture file must be a blob");
             };
-            let hash = hash.strip_prefix("blake3:").unwrap_or(&hash);
-            format!("/.blob/hello/{hash}")
+            format!("/.blob/hello/{}", hash.to_hex())
         }
     }
 }
@@ -1076,7 +1075,7 @@ async fn execute(probe: Probe) {
     let contract = endpoint(probe.endpoint);
     assert_eq!(probe.method, contract.method, "{} method", probe.endpoint);
     let fixture_file_hash = match store.lookup("hello", "assets/app.js") {
-        Ok(store::Node::File { hash, .. }) => Some(hash),
+        Ok(store::Node::File { hash, .. }) => Some(hash.to_wire()),
         Ok(store::Node::Dir) | Err(_) => None,
     };
     let mut request = Request::builder()
@@ -1829,7 +1828,7 @@ async fn phase_five_mutations_cover_replay_conflict_limits_and_two_phase_outcome
         "REPLACE",
         "/hello/assets/app.js",
         &[
-            ("if-content-match", &original_hash),
+            ("if-content-match", &original_hash.to_wire()),
             ("idempotency-key", "replace-dropped"),
         ],
         "replacement",
@@ -1847,7 +1846,7 @@ async fn phase_five_mutations_cover_replay_conflict_limits_and_two_phase_outcome
         "REPLACE",
         "/hello/assets/app.js",
         &[
-            ("if-content-match", &original_hash),
+            ("if-content-match", &original_hash.to_wire()),
             ("idempotency-key", "replace-dropped"),
         ],
         "replacement",
@@ -1860,7 +1859,7 @@ async fn phase_five_mutations_cover_replay_conflict_limits_and_two_phase_outcome
         "REPLACE",
         "/hello/assets/app.js",
         &[
-            ("if-content-match", &original_hash),
+            ("if-content-match", &original_hash.to_wire()),
             ("idempotency-key", "replace-stale"),
         ],
         "stale",
@@ -2282,7 +2281,7 @@ async fn phase_five_mutation_urls_encode_each_stored_path_segment_and_are_fetcha
         &app,
         "REPLACE",
         &format!("/encoded/paths/{ENCODED_SEGMENT}/replace.txt"),
-        &[("if-content-match", &replace_hash)],
+        &[("if-content-match", &replace_hash.to_wire())],
         "replace after",
     )
     .await;
@@ -2311,7 +2310,7 @@ async fn phase_five_mutation_urls_encode_each_stored_path_segment_and_are_fetcha
         "PATCH",
         &format!("/encoded/paths/{ENCODED_SEGMENT}/splice.txt"),
         &[
-            ("if-content-match", &splice_hash),
+            ("if-content-match", &splice_hash.to_wire()),
             ("splice", "offset=0; delete=6; insert=6"),
         ],
         "after ",
@@ -2607,7 +2606,7 @@ async fn phase_five_content_mutations_report_and_store_sanitized_bytes() {
         &app,
         "REPLACE",
         "/redacted/replace.txt",
-        &[("if-content-match", &replacement_base)],
+        &[("if-content-match", &replacement_base.to_wire())],
         claim,
     )
     .await;
@@ -2634,7 +2633,7 @@ async fn phase_five_content_mutations_report_and_store_sanitized_bytes() {
         "PATCH",
         "/redacted/splice.txt",
         &[
-            ("if-content-match", &splice_base),
+            ("if-content-match", &splice_base.to_wire()),
             (
                 "splice",
                 &format!("offset=7; delete=0; insert={}", management.len()),
@@ -2676,7 +2675,7 @@ async fn splice_result_limit_and_stale_guard_precede_materialization() {
         "PATCH",
         "/bounded/data.bin",
         &[
-            ("if-content-match", &hash),
+            ("if-content-match", &hash.to_wire()),
             ("splice", "offset=4; delete=0; insert=1"),
         ],
         "x",
@@ -2684,7 +2683,7 @@ async fn splice_result_limit_and_stale_guard_precede_materialization() {
     .await;
     assert_eq!(too_large.status(), StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(
-        store.read_blob(&hash).unwrap().as_ref(),
+        store.read_blob(hash).unwrap().as_ref(),
         b"abcd",
         "failed splice must not replace the source"
     );
@@ -2699,7 +2698,7 @@ async fn splice_result_limit_and_stale_guard_precede_materialization() {
         "PATCH",
         "/bounded/data.bin",
         &[
-            ("if-content-match", &hash),
+            ("if-content-match", &hash.to_wire()),
             ("splice", "offset=999; delete=0; insert=0"),
         ],
         Body::empty(),
@@ -2830,7 +2829,7 @@ async fn every_phase_five_endpoint_exercises_stale_noop_conflict_and_limits() {
             "REPLACE",
             "/edge/data.bin",
             vec![
-                ("if-content-match", hash.clone()),
+                ("if-content-match", hash.to_wire()),
                 ("if-match", stale_tree.clone()),
             ],
             "replace".to_string(),
@@ -2839,7 +2838,7 @@ async fn every_phase_five_endpoint_exercises_stale_noop_conflict_and_limits() {
             "PATCH",
             "/edge/data.bin",
             vec![
-                ("if-content-match", hash.clone()),
+                ("if-content-match", hash.to_wire()),
                 ("if-match", stale_tree.clone()),
                 ("splice", "offset=0; delete=0; insert=1".to_string()),
             ],
@@ -2872,7 +2871,7 @@ async fn every_phase_five_endpoint_exercises_stale_noop_conflict_and_limits() {
         "REPLACE",
         "/edge/data.bin",
         &[
-            ("if-content-match", &hash),
+            ("if-content-match", &hash.to_wire()),
             ("idempotency-key", "edge-replace-noop"),
         ],
         "data",
@@ -2887,7 +2886,7 @@ async fn every_phase_five_endpoint_exercises_stale_noop_conflict_and_limits() {
         "REPLACE",
         "/edge/data.bin",
         &[
-            ("if-content-match", &hash),
+            ("if-content-match", &hash.to_wire()),
             ("idempotency-key", "edge-replace-noop"),
         ],
         "data",
@@ -2903,7 +2902,7 @@ async fn every_phase_five_endpoint_exercises_stale_noop_conflict_and_limits() {
         "PATCH",
         "/edge/data.bin",
         &[
-            ("if-content-match", &hash),
+            ("if-content-match", &hash.to_wire()),
             ("splice", "offset=0; delete=0; insert=0"),
             ("idempotency-key", "edge-splice-noop"),
         ],
@@ -2921,7 +2920,7 @@ async fn every_phase_five_endpoint_exercises_stale_noop_conflict_and_limits() {
         "PATCH",
         "/edge/data.bin",
         &[
-            ("if-content-match", &hash),
+            ("if-content-match", &hash.to_wire()),
             ("splice", "offset=0; delete=0; insert=0"),
             ("idempotency-key", "edge-splice-noop"),
         ],
@@ -3020,7 +3019,7 @@ async fn every_phase_five_endpoint_exercises_stale_noop_conflict_and_limits() {
         &limited,
         "REPLACE",
         "/edge/data.bin",
-        &[("if-content-match", &hash)],
+        &[("if-content-match", &hash.to_wire())],
         "12345",
     )
     .await;

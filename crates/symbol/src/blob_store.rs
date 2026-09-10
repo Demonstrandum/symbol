@@ -4,6 +4,8 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::hash::ContentHash;
+
 pub struct BlobFiles {
     root: PathBuf,
 }
@@ -14,19 +16,20 @@ impl BlobFiles {
         Ok(Self { root })
     }
 
-    pub fn path(&self, hash: &str) -> PathBuf {
-        self.root.join(&hash[..2]).join(&hash[2..])
+    pub fn path(&self, hash: ContentHash) -> PathBuf {
+        let (prefix, rest) = split_hex(hash);
+        self.root.join(prefix).join(rest)
     }
 
-    pub fn read(&self, hash: &str) -> io::Result<Vec<u8>> {
+    pub fn read(&self, hash: ContentHash) -> io::Result<Vec<u8>> {
         fs::read(self.path(hash))
     }
 
-    pub fn put_bytes(&self, hash: &str, bytes: &[u8]) -> io::Result<()> {
+    pub fn put_bytes(&self, hash: ContentHash, bytes: &[u8]) -> io::Result<()> {
         self.put(hash, |file| file.write_all(bytes))
     }
 
-    pub fn put_file(&self, hash: &str, source: &Path) -> io::Result<()> {
+    pub fn put_file(&self, hash: ContentHash, source: &Path) -> io::Result<()> {
         self.put(hash, |file| {
             let mut source = File::open(source)?;
             io::copy(&mut source, file)?;
@@ -34,7 +37,7 @@ impl BlobFiles {
         })
     }
 
-    pub fn quarantine(&self, hash: &str) -> io::Result<()> {
+    pub fn quarantine(&self, hash: ContentHash) -> io::Result<()> {
         let source = self.path(hash);
         if !source.is_file() {
             return Ok(());
@@ -49,8 +52,8 @@ impl BlobFiles {
         File::open(parent)?.sync_all()
     }
 
-    pub fn restore(&self, live: &HashSet<String>) -> io::Result<()> {
-        for hash in live {
+    pub fn restore(&self, live: &HashSet<ContentHash>) -> io::Result<()> {
+        for &hash in live {
             let target = self.path(hash);
             if target.is_file() {
                 continue;
@@ -67,14 +70,16 @@ impl BlobFiles {
         Ok(())
     }
 
-    fn quarantine_path(&self, hash: &str) -> PathBuf {
-        self.root
-            .join(".quarantine")
-            .join(&hash[..2])
-            .join(&hash[2..])
+    fn quarantine_path(&self, hash: ContentHash) -> PathBuf {
+        let (prefix, rest) = split_hex(hash);
+        self.root.join(".quarantine").join(prefix).join(rest)
     }
 
-    fn put(&self, hash: &str, write: impl FnOnce(&mut File) -> io::Result<()>) -> io::Result<()> {
+    fn put(
+        &self,
+        hash: ContentHash,
+        write: impl FnOnce(&mut File) -> io::Result<()>,
+    ) -> io::Result<()> {
         let target = self.path(hash);
         if !target.is_file() {
             let quarantined = self.quarantine_path(hash);
@@ -95,7 +100,11 @@ impl BlobFiles {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_nanos());
-        let temporary = parent.join(format!(".{hash}-{}-{nonce}.tmp", std::process::id()));
+        let temporary = parent.join(format!(
+            ".{}-{}-{nonce}.tmp",
+            hash.to_hex(),
+            std::process::id()
+        ));
         let result = (|| {
             let mut file = OpenOptions::new()
                 .create_new(true)
@@ -112,7 +121,7 @@ impl BlobFiles {
         result
     }
 
-    fn quarantine_corrupt(&self, hash: &str, source: &Path) -> io::Result<()> {
+    fn quarantine_corrupt(&self, hash: ContentHash, source: &Path) -> io::Result<()> {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_nanos());
@@ -120,7 +129,7 @@ impl BlobFiles {
             .root
             .join(".quarantine")
             .join("corrupt")
-            .join(format!("{hash}-{nonce}"));
+            .join(format!("{}-{nonce}", hash.to_hex()));
         let parent = target.parent().expect("corrupt quarantine path has parent");
         fs::create_dir_all(parent)?;
         fs::rename(source, &target)?;
@@ -128,7 +137,14 @@ impl BlobFiles {
     }
 }
 
-fn file_hash(path: &Path) -> io::Result<String> {
+/// Split a hash into the two-character directory prefix and the remainder.
+fn split_hex(hash: ContentHash) -> (String, String) {
+    let hex = hash.to_hex();
+    let (prefix, rest) = hex.split_at(2);
+    (prefix.to_owned(), rest.to_owned())
+}
+
+fn file_hash(path: &Path) -> io::Result<ContentHash> {
     let mut file = File::open(path)?;
     let mut hasher = blake3::Hasher::new();
     let mut buffer = [0_u8; 64 * 1024];
@@ -139,7 +155,7 @@ fn file_hash(path: &Path) -> io::Result<String> {
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(hasher.finalize().to_hex().to_string())
+    Ok(hasher.finalize().into())
 }
 
 #[cfg(test)]
@@ -151,12 +167,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let blobs = BlobFiles::new(root.path().join("blobs")).unwrap();
         let expected = b"expected";
-        let hash = blake3::hash(expected).to_hex().to_string();
-        let target = blobs.path(&hash);
+        let hash = ContentHash::from(blake3::hash(expected));
+        let target = blobs.path(hash);
         fs::create_dir_all(target.parent().unwrap()).unwrap();
         fs::write(&target, b"corrupt").unwrap();
 
-        blobs.put_bytes(&hash, expected).unwrap();
+        blobs.put_bytes(hash, expected).unwrap();
 
         assert_eq!(fs::read(target).unwrap(), expected);
         let corrupt = root.path().join("blobs/.quarantine/corrupt");
