@@ -1205,7 +1205,7 @@ mod tests {
                 sites::updated.eq(0_i64),
                 sites::public_url.eq(""),
                 sites::content_revision.eq(0_i64),
-                sites::tree_hash.eq(TreeHash::default()),
+                sites::tree_hash.eq(TreeHash::EMPTY),
                 sites::management_status.eq(0_i64),
             ))
             .execute(&mut db)

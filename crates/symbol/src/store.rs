@@ -3310,7 +3310,7 @@ impl Store {
                 updated: now,
                 public_url: &public_url,
                 content_revision: revision,
-                tree_hash: TreeHash::default(),
+                tree_hash: TreeHash::EMPTY,
                 creator_kind: creation.creator.map(|creator| creator.kind as i64),
                 creator_hash: creation.creator.map(|creator| creator.hash.to_vec()),
                 claim_hash: creation.claim_hash.map(|hash| hash.as_bytes().to_vec()),
@@ -3635,7 +3635,7 @@ impl Store {
         prune_undo_locked(&mut tx, self.now_millis())?;
         let removed = gc_blobs(&mut tx, self.now_millis())?;
         let (revision, tree_hash) =
-            site_revision_locked(&mut tx, name).unwrap_or_else(|_| (0, TreeHash::default()));
+            site_revision_locked(&mut tx, name).unwrap_or((0, TreeHash::EMPTY));
         tx.commit()?;
         drop(db);
         self.remove_blob_files(&removed);
@@ -3722,7 +3722,7 @@ impl Store {
         if options.expected_tree_hash.is_some() {
             return Err(StoreError::PreconditionFailed {
                 revision: 0,
-                tree_hash: TreeHash::default().to_wire().into_boxed_str(),
+                tree_hash: TreeHash::EMPTY.to_wire().into_boxed_str(),
             });
         }
         let files = files
@@ -3898,7 +3898,7 @@ impl Store {
             let (revision, tree_hash) = if existed {
                 site_revision_locked(tx, name)?
             } else {
-                (0, TreeHash::default())
+                (0, TreeHash::EMPTY)
             };
             if TreeHash::try_from(expected)? != tree_hash {
                 return Err(StoreError::PreconditionFailed {
@@ -4025,7 +4025,7 @@ impl Store {
                 updated: now,
                 public_url: &self.inner.public_url,
                 content_revision: 0,
-                tree_hash: TreeHash::default(),
+                tree_hash: TreeHash::EMPTY,
                 creator_kind: creation.creator.map(|creator| creator.kind as i64),
                 creator_hash: creation.creator.map(|creator| creator.hash.to_vec()),
                 claim_hash: creation.claim_hash.map(|hash| hash.as_bytes().to_vec()),
@@ -7216,7 +7216,7 @@ fn snapshot_site_with_description(
                 created: None,
                 updated: now,
                 content_revision: 0,
-                tree_hash: TreeHash::default(),
+                tree_hash: TreeHash::EMPTY,
             },
             |(name, public_url, created, updated, content_revision, tree_hash)| SiteSnapshot {
                 name,
@@ -12654,7 +12654,7 @@ mod tests {
                     updated: 0,
                     public_url: "",
                     content_revision: 0,
-                    tree_hash: TreeHash::default(),
+                    tree_hash: TreeHash::EMPTY,
                     creator_kind: None,
                     creator_hash: None,
                     claim_hash: None,

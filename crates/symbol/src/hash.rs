@@ -11,11 +11,14 @@ use diesel::sqlite::Sqlite;
 pub const HASH_BYTES: usize = 32;
 pub const HASH_HEX_LEN: usize = HASH_BYTES * 2;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, AsExpression)]
+/// Prefix that identifies the digest used for tree hashes on the wire.
+const WIRE_PREFIX: &str = "blake3:";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, AsExpression)]
 #[diesel(sql_type = Binary)]
 pub struct ContentHash([u8; HASH_BYTES]);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, AsExpression)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, AsExpression)]
 #[diesel(sql_type = Binary)]
 pub struct TreeHash([u8; HASH_BYTES]);
 
@@ -27,125 +30,160 @@ pub enum HashParseError {
     InvalidEncoding,
 }
 
+/// Generate the surface shared by every 32-byte hash newtype.
+///
+/// Each type keeps its own `parse_wire`, `Display` and `String` conversion,
+/// because a content hash is bare hex whereas a tree hash carries the
+/// `blake3:` prefix.
+macro_rules! binary_hash {
+    ($name:ident) => {
+        impl $name {
+            #[must_use]
+            pub const fn from_bytes(bytes: [u8; HASH_BYTES]) -> Self {
+                Self(bytes)
+            }
+
+            #[must_use]
+            pub const fn as_bytes(&self) -> &[u8; HASH_BYTES] {
+                &self.0
+            }
+
+            pub fn from_slice(bytes: &[u8]) -> Result<Self, HashParseError> {
+                let bytes: [u8; HASH_BYTES] = bytes
+                    .try_into()
+                    .map_err(|_| HashParseError::InvalidLength)?;
+                Ok(Self(bytes))
+            }
+
+            pub fn parse_hex(value: &str) -> Result<Self, HashParseError> {
+                parse_hex(value).map(Self)
+            }
+
+            #[must_use]
+            pub fn to_hex(self) -> String {
+                encode_hex(&self.0)
+            }
+        }
+
+        impl From<[u8; HASH_BYTES]> for $name {
+            fn from(bytes: [u8; HASH_BYTES]) -> Self {
+                Self(bytes)
+            }
+        }
+
+        impl From<blake3::Hash> for $name {
+            fn from(hash: blake3::Hash) -> Self {
+                Self(*hash.as_bytes())
+            }
+        }
+
+        impl From<$name> for [u8; HASH_BYTES] {
+            fn from(hash: $name) -> Self {
+                hash.0
+            }
+        }
+
+        impl AsRef<[u8]> for $name {
+            fn as_ref(&self) -> &[u8] {
+                &self.0
+            }
+        }
+
+        impl TryFrom<&str> for $name {
+            type Error = HashParseError;
+
+            fn try_from(value: &str) -> Result<Self, Self::Error> {
+                Self::parse_wire(value)
+            }
+        }
+
+        impl TryFrom<String> for $name {
+            type Error = HashParseError;
+
+            fn try_from(value: String) -> Result<Self, Self::Error> {
+                Self::parse_wire(&value)
+            }
+        }
+
+        impl FromStr for $name {
+            type Err = HashParseError;
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                Self::parse_wire(value)
+            }
+        }
+
+        impl ToSql<Binary, Sqlite> for $name {
+            fn to_sql<'b>(&'b self, out: &mut Output<'b, '_, Sqlite>) -> serialize::Result {
+                out.set_value(&self.0[..]);
+                Ok(serialize::IsNull::No)
+            }
+        }
+
+        impl FromSql<Binary, Sqlite> for $name {
+            fn from_sql(
+                value: <Sqlite as diesel::backend::Backend>::RawValue<'_>,
+            ) -> deserialize::Result<Self> {
+                let bytes = <Vec<u8> as FromSql<Binary, Sqlite>>::from_sql(value)?;
+                Self::from_slice(&bytes).map_err(|error| error.to_string().into())
+            }
+        }
+
+        impl Queryable<Binary, Sqlite> for $name {
+            type Row = <Vec<u8> as Queryable<Binary, Sqlite>>::Row;
+
+            fn build(row: Self::Row) -> deserialize::Result<Self> {
+                let bytes = <Vec<u8> as Queryable<Binary, Sqlite>>::build(row)?;
+                Self::from_slice(&bytes).map_err(|error| error.to_string().into())
+            }
+        }
+    };
+}
+
+binary_hash!(ContentHash);
+binary_hash!(TreeHash);
+
 impl ContentHash {
-    #[must_use]
-    pub const fn from_bytes(bytes: [u8; HASH_BYTES]) -> Self {
-        Self(bytes)
-    }
-
-    #[must_use]
-    pub const fn as_bytes(&self) -> &[u8; HASH_BYTES] {
-        &self.0
-    }
-
-    pub fn from_slice(bytes: &[u8]) -> Result<Self, HashParseError> {
-        let bytes: [u8; HASH_BYTES] = bytes
-            .try_into()
-            .map_err(|_| HashParseError::InvalidLength)?;
-        Ok(Self(bytes))
-    }
-
-    pub fn parse_hex(value: &str) -> Result<Self, HashParseError> {
-        parse_hex(value).map(Self)
-    }
-
+    /// Parse an incoming content hash: bare hex, or hex behind the wire
+    /// prefix, which is accepted so callers may echo back a tree hash form.
     pub fn parse_wire(value: &str) -> Result<Self, HashParseError> {
-        let value = value.strip_prefix("blake3:").unwrap_or(value);
-        Self::parse_hex(value)
-    }
-
-    #[must_use]
-    pub fn to_hex(self) -> String {
-        encode_hex(&self.0)
+        Self::parse_hex(value.strip_prefix(WIRE_PREFIX).unwrap_or(value))
     }
 }
 
 impl TreeHash {
-    #[must_use]
-    pub const fn from_bytes(bytes: [u8; HASH_BYTES]) -> Self {
-        Self(bytes)
-    }
+    /// The tree hash of a site that has no content yet.
+    ///
+    /// `sites.tree_hash` is `NOT NULL DEFAULT x'00..00'`, so absence is stored
+    /// as all zero bytes rather than as SQL `NULL`. This names that value so
+    /// it is not mistaken for a real digest, and so no `Default` impl can
+    /// produce one by accident.
+    pub const EMPTY: Self = Self([0; HASH_BYTES]);
 
     #[must_use]
-    pub const fn as_bytes(&self) -> &[u8; HASH_BYTES] {
-        &self.0
+    pub fn is_empty(self) -> bool {
+        self == Self::EMPTY
     }
 
-    pub fn from_slice(bytes: &[u8]) -> Result<Self, HashParseError> {
-        let bytes: [u8; HASH_BYTES] = bytes
-            .try_into()
-            .map_err(|_| HashParseError::InvalidLength)?;
-        Ok(Self(bytes))
-    }
-
+    /// Parse an incoming tree hash. An empty string means [`Self::EMPTY`],
+    /// matching what [`Self::to_wire`] emits for it.
     pub fn parse_wire(value: &str) -> Result<Self, HashParseError> {
-        let value = value.strip_prefix("blake3:").unwrap_or(value);
+        let value = value.strip_prefix(WIRE_PREFIX).unwrap_or(value);
         if value.is_empty() {
-            return Ok(Self::default());
+            return Ok(Self::EMPTY);
         }
-        parse_hex(value).map(Self)
+        Self::parse_hex(value)
     }
 
-    #[must_use]
-    pub fn to_hex(self) -> String {
-        encode_hex(&self.0)
-    }
-
+    /// Render for the wire: `blake3:{hex}`, or the empty string for
+    /// [`Self::EMPTY`].
     #[must_use]
     pub fn to_wire(self) -> String {
-        if self.0 == [0; HASH_BYTES] {
+        if self.is_empty() {
             String::new()
         } else {
-            format!("blake3:{}", self.to_hex())
+            format!("{WIRE_PREFIX}{}", self.to_hex())
         }
-    }
-}
-
-impl From<[u8; HASH_BYTES]> for ContentHash {
-    fn from(bytes: [u8; HASH_BYTES]) -> Self {
-        Self(bytes)
-    }
-}
-
-impl From<[u8; HASH_BYTES]> for TreeHash {
-    fn from(bytes: [u8; HASH_BYTES]) -> Self {
-        Self(bytes)
-    }
-}
-
-impl From<blake3::Hash> for ContentHash {
-    fn from(hash: blake3::Hash) -> Self {
-        Self(*hash.as_bytes())
-    }
-}
-
-impl From<blake3::Hash> for TreeHash {
-    fn from(hash: blake3::Hash) -> Self {
-        Self(*hash.as_bytes())
-    }
-}
-
-impl From<ContentHash> for [u8; HASH_BYTES] {
-    fn from(hash: ContentHash) -> Self {
-        hash.0
-    }
-}
-
-impl From<TreeHash> for [u8; HASH_BYTES] {
-    fn from(hash: TreeHash) -> Self {
-        hash.0
-    }
-}
-
-impl AsRef<[u8]> for ContentHash {
-    fn as_ref(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-impl AsRef<[u8]> for TreeHash {
-    fn as_ref(&self) -> &[u8] {
-        &self.0
     }
 }
 
@@ -170,104 +208,6 @@ impl fmt::Display for ContentHash {
 impl fmt::Display for TreeHash {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.to_wire())
-    }
-}
-
-impl TryFrom<&str> for ContentHash {
-    type Error = HashParseError;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        Self::parse_wire(value)
-    }
-}
-
-impl TryFrom<String> for ContentHash {
-    type Error = HashParseError;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        Self::parse_wire(&value)
-    }
-}
-
-impl TryFrom<&str> for TreeHash {
-    type Error = HashParseError;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        Self::parse_wire(value)
-    }
-}
-
-impl TryFrom<String> for TreeHash {
-    type Error = HashParseError;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        Self::parse_wire(&value)
-    }
-}
-
-impl FromStr for ContentHash {
-    type Err = HashParseError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Self::parse_wire(value)
-    }
-}
-
-impl FromStr for TreeHash {
-    type Err = HashParseError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Self::parse_wire(value)
-    }
-}
-
-impl ToSql<Binary, Sqlite> for ContentHash {
-    fn to_sql<'b>(&'b self, out: &mut Output<'b, '_, Sqlite>) -> serialize::Result {
-        out.set_value(&self.0[..]);
-        Ok(serialize::IsNull::No)
-    }
-}
-
-impl FromSql<Binary, Sqlite> for ContentHash {
-    fn from_sql(
-        value: <Sqlite as diesel::backend::Backend>::RawValue<'_>,
-    ) -> deserialize::Result<Self> {
-        let bytes = <Vec<u8> as FromSql<Binary, Sqlite>>::from_sql(value)?;
-        Self::from_slice(&bytes).map_err(|error| error.to_string().into())
-    }
-}
-
-impl Queryable<Binary, Sqlite> for ContentHash {
-    type Row = <Vec<u8> as Queryable<Binary, Sqlite>>::Row;
-
-    fn build(row: Self::Row) -> deserialize::Result<Self> {
-        let bytes = <Vec<u8> as Queryable<Binary, Sqlite>>::build(row)?;
-        Self::from_slice(&bytes).map_err(|error| error.to_string().into())
-    }
-}
-
-impl ToSql<Binary, Sqlite> for TreeHash {
-    fn to_sql<'b>(&'b self, out: &mut Output<'b, '_, Sqlite>) -> serialize::Result {
-        out.set_value(&self.0[..]);
-        Ok(serialize::IsNull::No)
-    }
-}
-
-impl FromSql<Binary, Sqlite> for TreeHash {
-    fn from_sql(
-        value: <Sqlite as diesel::backend::Backend>::RawValue<'_>,
-    ) -> deserialize::Result<Self> {
-        let bytes = <Vec<u8> as FromSql<Binary, Sqlite>>::from_sql(value)?;
-        Self::from_slice(&bytes).map_err(|error| error.to_string().into())
-    }
-}
-
-impl Queryable<Binary, Sqlite> for TreeHash {
-    type Row = <Vec<u8> as Queryable<Binary, Sqlite>>::Row;
-
-    fn build(row: Self::Row) -> deserialize::Result<Self> {
-        let bytes = <Vec<u8> as Queryable<Binary, Sqlite>>::build(row)?;
-        Self::from_slice(&bytes).map_err(|error| error.to_string().into())
     }
 }
 
@@ -332,5 +272,27 @@ mod tests {
         assert_eq!(TreeHash::try_from(wire.as_str()).unwrap(), hash);
         assert_eq!(TreeHash::try_from(digest.to_hex().as_str()).unwrap(), hash);
         assert_eq!(hash.to_string(), wire);
+    }
+
+    #[test]
+    fn empty_tree_hash_round_trips_as_the_empty_string() {
+        assert!(TreeHash::EMPTY.is_empty());
+        assert_eq!(TreeHash::EMPTY.to_wire(), "");
+        assert_eq!(TreeHash::parse_wire("").unwrap(), TreeHash::EMPTY);
+        assert_eq!(TreeHash::parse_wire("blake3:").unwrap(), TreeHash::EMPTY);
+        assert!(!TreeHash::from(blake3::hash(b"tree")).is_empty());
+    }
+
+    #[test]
+    fn wrong_length_and_non_hex_are_distinguished() {
+        assert_eq!(
+            ContentHash::parse_hex("abc"),
+            Err(HashParseError::InvalidLength)
+        );
+        let non_hex = "z".repeat(HASH_HEX_LEN);
+        assert_eq!(
+            ContentHash::parse_hex(&non_hex),
+            Err(HashParseError::InvalidEncoding)
+        );
     }
 }
