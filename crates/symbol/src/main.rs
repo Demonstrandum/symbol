@@ -343,7 +343,7 @@ impl App {
 }
 
 fn configured_identity_provider(args: &mut Args) -> IdentityProvider {
-    let configured = [
+    let mut configured = [
         (1_u8, args.trusted_proxy_principal_header.take()),
         (2_u8, args.mtls_principal_header.take()),
         (3_u8, args.tailscale_user_header.take()),
@@ -365,18 +365,18 @@ fn configured_identity_provider(args: &mut Args) -> IdentityProvider {
         };
     }
     let peers: Arc<[IpAddr]> = std::mem::take(&mut args.trusted_proxy).into();
-    let mut configured = configured;
-    match (configured.len(), configured.pop(), peers.is_empty()) {
-        (0, None, true) => IdentityProvider::Receipt,
-        (1, Some((1, principal_header)), false) => IdentityProvider::TrustedProxy {
+    // `configured` holds at most one entry, as asserted above.
+    match (configured.pop(), peers.is_empty()) {
+        (None, true) => IdentityProvider::Receipt,
+        (Some((1, principal_header)), false) => IdentityProvider::TrustedProxy {
             principal_header,
             peers,
         },
-        (1, Some((2, principal_header)), false) => IdentityProvider::Mtls {
+        (Some((2, principal_header)), false) => IdentityProvider::Mtls {
             principal_header,
             peers,
         },
-        (1, Some((3, principal_header)), false) => IdentityProvider::Tailscale {
+        (Some((3, principal_header)), false) => IdentityProvider::Tailscale {
             principal_header,
             peers,
         },
