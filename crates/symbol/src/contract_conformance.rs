@@ -2706,6 +2706,19 @@ async fn splice_result_limit_and_stale_guard_precede_materialization() {
     .await;
     assert_eq!(stale.status(), StatusCode::PRECONDITION_FAILED);
     assert!(stale.headers().contains_key("content-revision"));
+    // The stale-hash ETag carries the blake3: prefix, like every other content
+    // ETag, and matches the hash named in the body.
+    let current = ContentHash::from(blake3::hash(b"xy"));
+    assert_eq!(
+        stale.headers()[header::ETAG],
+        format!("\"{}\"", current.to_wire()).as_str()
+    );
+    let body = to_bytes(stale.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(
+        body.contains(&current.to_wire()),
+        "stale body must name the current hash in wire form: {body}"
+    );
 }
 
 #[tokio::test]

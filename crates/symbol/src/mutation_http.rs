@@ -1339,7 +1339,8 @@ async fn mutation_error(app: &App, name: &str, error: StoreError) -> Response {
         );
         response.headers_mut().insert(
             header::ETAG,
-            HeaderValue::from_str(&format!("\"{current_hash}\"")).expect("valid content ETag"),
+            HeaderValue::from_str(&format!("\"{}\"", current_hash.to_wire()))
+                .expect("valid content ETag"),
         );
         response.headers_mut().insert(
             "content-revision",
