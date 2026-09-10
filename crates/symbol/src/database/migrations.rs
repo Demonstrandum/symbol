@@ -9,8 +9,11 @@ use serde::{Deserialize, Serialize};
 use super::catalog::{CatalogDifference, SchemaCatalog};
 use super::legacy_schema;
 use super::schema;
+#[cfg(test)]
 use crate::hash::ContentHash;
-use crate::schema::{files, metadata, site_entries};
+#[cfg(test)]
+use crate::schema::files;
+use crate::schema::{metadata, site_entries};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MigrationOutcome {
@@ -75,7 +78,7 @@ pub fn migrate(db: &mut SqliteConnection) -> Result<MigrationOutcome, MigrationE
             for statement in schema::upgrade_v2_to_v6() {
                 execute(connection, &statement)?;
             }
-            for statement in schema::repair_downgraded_v6_schema() {
+            for statement in schema::normalize_v6_schema() {
                 execute(connection, &statement)?;
             }
             execute(connection, "PRAGMA foreign_keys=ON")?;

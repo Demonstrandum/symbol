@@ -109,16 +109,6 @@ enum UndoAliasDeltasV10 {
 }
 
 #[derive(Iden)]
-enum SitesV10 {
-    Table,
-}
-
-#[derive(Iden)]
-enum UndoSitesV10 {
-    Table,
-}
-
-#[derive(Iden)]
 enum SitesRepair {
     Table,
 }
@@ -949,6 +939,7 @@ pub fn upgrade_v10_to_v11() -> Vec<String> {
 }
 
 #[cfg(test)]
+#[expect(clippy::too_many_lines)]
 pub fn downgrade_v11_to_v10() -> Vec<String> {
     vec![
         "ALTER TABLE \"sites\" ADD COLUMN \"tree_hash_text\" TEXT".to_string(),
@@ -1351,8 +1342,23 @@ pub fn downgrade_v6_to_v2() -> Vec<String> {
     ]
 }
 
-#[cfg(test)]
-pub fn repair_downgraded_v6_schema() -> Vec<String> {
+/// Rebuild the v6 tables that `ALTER TABLE` cannot bring back into canonical shape.
+///
+/// `upgrade_v2_to_v6` only adds columns, which is enough for a database that
+/// was created as v2. It is not enough for one that reached v2 by downgrade:
+/// `downgrade_v11_to_v10` rebuilds `sites.tree_hash` through a temporary
+/// column, so it comes back appended to the end of the table, nullable, and
+/// without its default. `validate_v6_catalog` compares column position, type,
+/// nullability and defaults, so it rejects that table until it is rewritten --
+/// hence the `COALESCE("tree_hash", '')` below. The same applies to the child
+/// tables that have to be copied out and back around the `sites` rewrite.
+///
+/// Removing this step fails `v2_upgrade_reaches_v9_and_preserves_legacy_files`
+/// with `CatalogDifference { table: "sites", dimension: Columns }`. For a
+/// database that really was created as v2 the rebuild is redundant but
+/// harmless.
+#[expect(clippy::too_many_lines)]
+pub fn normalize_v6_schema() -> Vec<String> {
     vec![
         "CREATE TABLE \"files_repair_source\" AS
          SELECT \"site_id\", \"path\", \"hash\", \"size\" FROM \"files\""
@@ -1498,23 +1504,11 @@ pub fn repair_downgraded_v6_schema() -> Vec<String> {
 }
 
 fn sites_table() -> TableCreateStatement {
-    sites_table_inner(true)
-}
-
-fn sites_table_v10() -> TableCreateStatement {
-    sites_table_inner(false)
-}
-
-fn sites_table_inner(binary_tree_hash: bool) -> TableCreateStatement {
     let mut tree_hash_col = ColumnDef::new(Sites::TreeHash);
-    if binary_tree_hash {
-        tree_hash_col
-            .blob()
-            .not_null()
-            .default([0_u8; 32].to_vec());
-    } else {
-        tree_hash_col.text().not_null().default("");
-    }
+    tree_hash_col
+        .blob()
+        .not_null()
+        .default([0_u8; 32].to_vec());
     Table::create()
         .table(Sites::Table)
         .if_not_exists()
@@ -1823,20 +1817,8 @@ fn undo_names_table() -> TableCreateStatement {
 }
 
 fn undo_sites_table() -> TableCreateStatement {
-    undo_sites_table_inner(true)
-}
-
-fn undo_sites_table_v10() -> TableCreateStatement {
-    undo_sites_table_inner(false)
-}
-
-fn undo_sites_table_inner(binary_tree_hash: bool) -> TableCreateStatement {
     let mut tree_hash_col = ColumnDef::new(UndoSites::TreeHash);
-    if binary_tree_hash {
-        tree_hash_col.blob().not_null();
-    } else {
-        tree_hash_col.text().not_null().default("");
-    }
+    tree_hash_col.blob().not_null();
     Table::create()
         .table(UndoSites::Table)
         .if_not_exists()
