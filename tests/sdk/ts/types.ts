@@ -5,7 +5,6 @@ import {
   type ArchiveDownload,
   BodyNotReplayableError,
   type CachedApiIdentity,
-  type SymbolApiVersion,
   type CachedFileInventory,
   type CachedTextAsset,
   ContentFormats,
@@ -18,6 +17,7 @@ import {
   RetryPolicies,
   type SiteCreationReceipt,
   type SpliceReceipt,
+  type SymbolApiVersion,
   SymbolClient,
   type SymbolStats,
 } from "./symbol.js";

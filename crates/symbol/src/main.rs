@@ -885,7 +885,7 @@ async fn send_hash(app: &App, name: &str, rel: &str) -> Response {
     match lookup {
         Ok(hash) => hash.map_or_else(
             || StoreError::NotFound.into_response(),
-            |hash| plain(StatusCode::OK, hash.to_wire()),
+            |hash| plain(StatusCode::OK, hash.to_hex()),
         ),
         Err(err) => err.into_response(),
     }
@@ -2685,7 +2685,7 @@ async fn send_blob_file(
     policy: http_cache::Policy,
     app: &App,
 ) -> Response {
-    let etag = format!("\"{}\"", hash.to_wire());
+    let etag = format!("\"{}\"", hash.to_hex());
     if let Some(mut response) = http_cache::not_modified(headers, &etag, policy, None) {
         response
             .headers_mut()

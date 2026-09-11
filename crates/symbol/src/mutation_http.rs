@@ -306,8 +306,8 @@ async fn propose_allocation(
     let proposal_revision = pending.content_revision;
     let inferred_extension = pending.extension.clone();
     let default_name = inferred_extension.as_ref().map_or_else(
-        || pending.hash.clone(),
-        |extension| format!("{}.{}", pending.hash, extension),
+        || bare_hash(&pending.hash).to_string(),
+        |extension| format!("{}.{}", bare_hash(&pending.hash), extension),
     );
     let receipt = contract::AllocationProposalReceipt {
         allocation_token: pending.token,
@@ -828,7 +828,11 @@ async fn allocated_response(
     naming: contract::AllocationNaming,
 ) -> Response {
     let url = resource_location(app, name, &allocated.path);
-    let blob_url = format!("{}/.blob/{name}/{}", app.public_url, allocated.hash);
+    let blob_url = format!(
+        "{}/.blob/{name}/{}",
+        app.public_url,
+        bare_hash(&allocated.hash)
+    );
     let created = allocated
         .mutation
         .as_ref()
@@ -1159,6 +1163,14 @@ fn infer_extension(media_type: &str) -> Option<&'static str> {
 fn prefixed_hash(hash: &str) -> String {
     let hash = hash.strip_prefix("blake3:").unwrap_or(hash);
     format!("blake3:{hash}")
+}
+
+/// The bare hex of a content hash, for the places that are not JSON hash
+/// fields: a blob URL path segment and a generated file name. Both must not
+/// carry the `blake3:` prefix -- a URL would not resolve to the stored blob and
+/// a file name would contain a colon.
+fn bare_hash(hash: &str) -> &str {
+    hash.strip_prefix("blake3:").unwrap_or(hash)
 }
 
 fn inventory_alias(alias: AliasEntry) -> contract::InventoryAlias {

@@ -2068,7 +2068,7 @@ def _file_inventory(response: ApiResponse) -> FileInventory:
     return FileInventory(
         _string(value["site"], response),
         _date(value["created_at"], response),
-        _date(value["updated_at"], response),
+        _required_date(value["updated_at"], response),
         _integer(value["content_revision"], response),
         TreeHash(_string(value["tree_hash"], response)),
         parsed_etag,
@@ -2090,7 +2090,7 @@ def _site_event(value: object, response: ApiResponse) -> SiteEvent:
         raise MalformedResponseError(response)
     return SiteEvent(
         kind=kind,
-        at=_date(entry["at"], response),
+        at=_required_date(entry["at"], response),
         files=_integer(entry["files"], response),
     )
 
@@ -2137,6 +2137,13 @@ def _date(value: object, response: ApiResponse) -> datetime | None:
         return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
     except ValueError as error:
         raise MalformedResponseError(response) from error
+
+
+def _required_date(value: object, response: ApiResponse) -> datetime:
+    parsed = _date(value, response)
+    if parsed is None:
+        raise MalformedResponseError(response)
+    return parsed
 
 
 def _expiry_policy(value: object, response: ApiResponse) -> OwnedExpiryPolicy:
@@ -2758,7 +2765,9 @@ class _SymbolSync:
             _raise(response)
         return response
 
-    def api_version(self, options: RequestOptions = RequestOptions()) -> ApiVersionDocument:
+    def api_version(
+        self, options: RequestOptions = RequestOptions()
+    ) -> ApiVersionDocument:
         response = self._send(
             HttpMethod.GET,
             self.origin + "/API/VERSION",

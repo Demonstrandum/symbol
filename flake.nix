@@ -347,9 +347,15 @@
             sdk-js = sdkJs;
             sdk-js-real = sdkJsReal;
             sdk-ts = sdkTs;
-            sdk-browser = sdkBrowser;
             sdk-py = sdkPy;
             sdk-docs = sdkDocs;
+          }
+          # The browser smoke test needs a chromium, which nixpkgs only ships
+          # for Linux; browser-smoke.mjs refuses to run without CHROMIUM_BIN,
+          # so on other systems this check could only ever fail. Gated the same
+          # way as the busybox POSIX runtime.
+          // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+            sdk-browser = sdkBrowser;
           };
         in
         named

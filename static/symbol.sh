@@ -1875,8 +1875,11 @@ put_file_request() {
       if [ -z "${HTTP_STATUS:-}" ] || [ "${HTTP_STATUS}" = 000 ]; then
         verified=0
         verify_file=$(mktemp) || exit 1
+        # -L because an unambiguous .html now redirects to its canonical
+        # extensionless URL; without following it this reads an empty body and
+        # a committed write looks lost.
         if [ "${request_unpack}" -eq 0 ] &&
-          curl -fsS "${url}" -o "${verify_file}" &&
+          curl -fsSL "${url}" -o "${verify_file}" &&
           cmp -s "${source}" "${verify_file}"; then
           verified=1
         elif [ -n "${expected_alias_target}" ]; then
@@ -3239,7 +3242,9 @@ sync_project() {
           F)
             sync_remote=$(mktemp) || exit 1
             sync_encoded=$(urlencode_path "${sync_path}")
-            if ! curl -fsS \
+            # -L for the same reason as the file PUT verification: an
+            # unambiguous .html redirects to its canonical URL.
+            if ! curl -fsSL \
               "${MANIFEST_HOST}/${MANIFEST_NAME}/${sync_encoded}" \
               -o "${sync_remote}"; then
               printf 'error: could not verify synced path after response loss: %s\n' \
