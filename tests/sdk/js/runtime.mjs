@@ -748,7 +748,9 @@ test("non-replayable bodies, abort, and disposal follow ownership rules", async 
         .site("hello")
         .file("slow.bin")
         .get();
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    while (server.requests.length === 0) {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+    }
     delayed.abort("test abort");
     await assert.rejects(Promise.resolve(delayed));
     await delayed[Symbol.asyncDispose]();

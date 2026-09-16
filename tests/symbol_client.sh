@@ -548,7 +548,7 @@ proc = subprocess.Popen(
 )
 os.close(r)
 try:
-    proc.wait(timeout=2)
+    proc.wait(timeout=10)
 except subprocess.TimeoutExpired:
     proc.kill()
     proc.wait()
