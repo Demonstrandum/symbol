@@ -72,16 +72,7 @@ const API_JS: &str = generated_asset!("symbol.js");
 const API_GLOBAL_JS: &str = generated_asset!("symbol.global.js");
 const API_D_TS: &str = generated_asset!("symbol.d.ts");
 const API_PY: &str = generated_asset!("symbol.py");
-const API_DOC_INDEX_MD: &str = generated_asset!("api-doc-index.md");
-const API_DOC_INDEX_HTML: &str = generated_asset!("api-doc-index.html");
-const API_DOC_JS_MD: &str = generated_asset!("api-doc-js.md");
-const API_DOC_JS_HTML: &str = generated_asset!("api-doc-js.html");
-const API_DOC_PYTHON_MD: &str = generated_asset!("api-doc-python.md");
-const API_DOC_PYTHON_HTML: &str = generated_asset!("api-doc-python.html");
-const API_DOC_SHELL_MD: &str = generated_asset!("api-doc-shell.md");
-const API_DOC_SHELL_HTML: &str = generated_asset!("api-doc-shell.html");
-const API_DOC_PROTOCOL_MD: &str = generated_asset!("api-doc-protocol.md");
-const API_DOC_PROTOCOL_HTML: &str = generated_asset!("api-doc-protocol.html");
+
 const API_VERSION: &str = env!("SYMBOL_API_VERSION");
 const API_REVISION: &str = env!("SYMBOL_API_REVISION");
 const API_SOURCE_HASH: &str = env!("SYMBOL_API_SOURCE_HASH");
@@ -199,6 +190,8 @@ struct App {
     max_file_size: u64,
     max_archive_upload: u64,
     public_url: Arc<str>,
+    /// Special pages with `${host}` already resolved for this deployment.
+    pages: Arc<page::Rendered>,
     identity_provider: IdentityProvider,
     audit_trusted_proxy: Arc<[IpAddr]>,
 }
@@ -318,6 +311,7 @@ impl App {
             hashes: Arc::new(Mutex::new(HashMap::new())),
             max_file_size,
             max_archive_upload,
+            pages: Arc::new(page::Rendered::new(&public_url)),
             public_url: public_url.into(),
             identity_provider,
             audit_trusted_proxy: Arc::from([]),
@@ -848,9 +842,9 @@ fn hash_body(app: &App, key: &str, bytes: &[u8]) -> Response {
 }
 
 async fn docs_hash(State(app): State<App>, _headers: HeaderMap) -> Response {
-    let host = &app.public_url;
-    let body = page::render_plain(host);
-    hash_body(&app, &format!("docs:{host}"), body.as_bytes())
+    let key = format!("docs:{}", app.public_url);
+    let body = app.pages.guide_plain().to_owned();
+    hash_body(&app, &key, body.as_bytes())
 }
 
 async fn install_sh_hash(State(app): State<App>) -> Response {
@@ -911,56 +905,31 @@ fn lookup_hash(store: &Store, name: &str, rel: &str) -> Result<Option<ContentHas
 }
 
 async fn docs(State(app): State<App>, headers: HeaderMap) -> Response {
-    page::render(&headers, &app.public_url, page::negotiate(&headers))
+    page::respond(&headers, &app.pages, page::Special::Guide)
 }
 
 async fn api_redirect() -> Redirect {
     Redirect::temporary("/API/")
 }
 
-async fn api_index(headers: HeaderMap) -> Response {
-    api_manual_response(
-        &headers,
-        API_DOC_INDEX_MD,
-        API_DOC_INDEX_HTML,
-        "</API/>; rel=\"canonical\"",
-    )
+async fn api_index(State(app): State<App>, headers: HeaderMap) -> Response {
+    page::respond(&headers, &app.pages, page::Special::ApiIndex)
 }
 
-async fn api_javascript(headers: HeaderMap) -> Response {
-    api_manual_response(
-        &headers,
-        API_DOC_JS_MD,
-        API_DOC_JS_HTML,
-        "</API/JS>; rel=\"canonical\"",
-    )
+async fn api_javascript(State(app): State<App>, headers: HeaderMap) -> Response {
+    page::respond(&headers, &app.pages, page::Special::ApiJavaScript)
 }
 
-async fn api_python(headers: HeaderMap) -> Response {
-    api_manual_response(
-        &headers,
-        API_DOC_PYTHON_MD,
-        API_DOC_PYTHON_HTML,
-        "</API/PY>; rel=\"canonical\"",
-    )
+async fn api_python(State(app): State<App>, headers: HeaderMap) -> Response {
+    page::respond(&headers, &app.pages, page::Special::ApiPython)
 }
 
-async fn api_shell(headers: HeaderMap) -> Response {
-    api_manual_response(
-        &headers,
-        API_DOC_SHELL_MD,
-        API_DOC_SHELL_HTML,
-        "</API/SH>; rel=\"canonical\"",
-    )
+async fn api_shell(State(app): State<App>, headers: HeaderMap) -> Response {
+    page::respond(&headers, &app.pages, page::Special::ApiShell)
 }
 
-async fn api_protocol(headers: HeaderMap) -> Response {
-    api_manual_response(
-        &headers,
-        API_DOC_PROTOCOL_MD,
-        API_DOC_PROTOCOL_HTML,
-        "</API/CURL>; rel=\"canonical\"",
-    )
+async fn api_protocol(State(app): State<App>, headers: HeaderMap) -> Response {
+    page::respond(&headers, &app.pages, page::Special::ApiProtocol)
 }
 
 async fn api_version(headers: HeaderMap) -> Response {
@@ -984,22 +953,6 @@ async fn api_manual_method_not_allowed() -> Response {
         .headers_mut()
         .insert(header::ALLOW, HeaderValue::from_static("GET, HEAD"));
     response
-}
-
-fn api_manual_response(
-    headers: &HeaderMap,
-    markdown: &'static str,
-    html: &'static str,
-    canonical: &'static str,
-) -> Response {
-    let (body, content_type) = match page::negotiate(headers) {
-        page::Flavor::Html => (html, "text/html; charset=utf-8"),
-        page::Flavor::Plain | page::Flavor::Man => (markdown, "text/markdown; charset=utf-8"),
-    };
-    let mut representation = http_cache::Representation::new(body, content_type);
-    representation.vary = Some(HeaderValue::from_static("Accept, User-Agent"));
-    representation.link = Some(HeaderValue::from_static(canonical));
-    http_cache::respond(headers, representation)
 }
 
 fn generated_asset_response(

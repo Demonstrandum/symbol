@@ -33,10 +33,10 @@ import {
   MediaTypes,
   RetryPolicies,
   SymbolClient,
-} from "https://symbol.example/symbol.js";
+} from "${host}/symbol.js";
 
 await using symbol = new SymbolClient({
-  origin: "https://symbol.example",
+  origin: "${host}",
   retryPolicy: RetryPolicies.Default,
 });
 
@@ -398,7 +398,7 @@ The stdlib client is synchronous:
 ```python
 from symbol_api import MediaTypes, Symbol
 
-with Symbol(origin="https://symbol.example") as symbol:
+with Symbol(origin="${host}") as symbol:
     site = symbol.site("notes")
     site.file("index.html").put(
         "<h1>Notes</h1>",
@@ -506,7 +506,7 @@ from symbol_api import AsyncHttpClient, CreateFileOptions, GeneratedName, Symbol
 async def main() -> None:
     async with Symbol(
         AsyncHttpClient.aiohttp(),
-        origin="https://symbol.example",
+        origin="${host}",
     ) as symbol:
         receipt = await (
             symbol.site("nlab")
@@ -1025,8 +1025,9 @@ symbol get demo-next demo-next.zip
 # HTTP and curl protocol
 
 This is the implementation reference for the current public HTTP surface.
-Examples use `SYMBOL_BASE=https://symbol.example`; set it to the configured
-`SYMBOL_PUBLIC_URL`.
+Examples use `SYMBOL_BASE=${host}`. Served copies of this manual replace
+`${host}` with the deployment's `SYMBOL_PUBLIC_URL` and `${hostname}` with
+its bare authority; the copy in the repository leaves both literal.
 
 `symbol contract` emits the typed route, method, header, and status inventory
 used by conformance tests for this document.
@@ -1045,6 +1046,23 @@ CURL/HTTP/REST/PROTOCOL aliases return identical bytes, ETags, cache policy,
 and canonical `Link`. HTML is negotiated for browsers; explicit Markdown or
 plain requests receive the canonical section. Responses use `no-cache`,
 `Vary: Accept, User-Agent`, and support `If-None-Match`.
+
+These manuals and the guide at `/` are rendered at build time and share one
+serving path. The only work left at request time is content negotiation and
+variable substitution, so every example here arrives carrying this
+deployment's own origin and is runnable as printed:
+
+`${host}`
+: The configured `SYMBOL_PUBLIC_URL`, scheme included.
+
+`${hostname}`
+: Its bare authority, for an HTTP `Host:` header.
+
+Substitution is allow-listed, not shell expansion. Any other `${...}` is
+served exactly as written, so a documented variable such as `${SYMBOL_BASE}`
+survives intact and an unknown name stays visible rather than expanding to
+nothing. The copy of this file in the repository leaves every placeholder
+literal.
 
 The uppercase `API` namespace is built into the binary, absent from SQLite and
 storage statistics, and listed as `kind: "builtin"` in `/FILES`. Every
@@ -1212,7 +1230,7 @@ days are removed.
 Content mutations return some or all of:
 
 ```http
-Location: https://symbol.example/hello/
+Location: ${host}/hello/
 ETag: "blake3:<site tree hash>"
 Content-Revision: 2
 Undo-Token: <32 lowercase hex>
@@ -1266,7 +1284,7 @@ Success: `201 Created`.
 
 ```http
 PUT / HTTP/1.1
-Host: symbol.example
+Host: ${hostname}
 Content-Type: text/html
 Idempotency-Key: deploy-2026-08-20
 Content-Length: 14
@@ -1276,7 +1294,7 @@ Content-Length: 14
 
 ```http
 HTTP/1.1 201 Created
-Location: https://symbol.example/k7qm/
+Location: ${host}/k7qm/
 ETag: "blake3:..."
 Content-Revision: 1
 Undo-Token: 7d0e...
@@ -1285,7 +1303,7 @@ Creator-Claim: sym_claim_...
 Cache-Control: no-store
 Content-Type: text/plain; charset=utf-8
 
-ok k7qm https://symbol.example/k7qm/ (1 files, changed: true)
+ok k7qm ${host}/k7qm/ (1 files, changed: true)
 ```
 
 Canonical client: `symbol put FILE`, or piped `symbol put -`.
@@ -1600,14 +1618,14 @@ Content-Length: 1234
 
 ```http
 HTTP/1.1 200 OK
-Location: https://symbol.example/hello/
+Location: ${host}/hello/
 ETag: "blake3:<new tree hash>"
 Content-Revision: 5
 Undo-Token: 7d0e...
 Undo-Expires: 2026-08-21T01:30:00Z
 Content-Type: text/plain; charset=utf-8
 
-ok hello https://symbol.example/hello/ (3 files, changed: true)
+ok hello ${host}/hello/ (3 files, changed: true)
 ```
 
 Canonical client: `symbol put NAME SOURCE` or `symbol put --replace NAME SOURCE`;
@@ -1701,7 +1719,7 @@ explicit destination, idempotency is not implemented.
 Success: `201`, mutation headers, and body:
 
 ```text
-ok new-name https://symbol.example/new-name/ (3 files)
+ok new-name ${host}/new-name/ (3 files)
 ```
 
 The copy is public/unmanaged unless creation includes
@@ -1721,7 +1739,7 @@ Managed state and management token remain attached to the site.
 Success: `200`, `Location`, tree/revision and undo headers, body:
 
 ```text
-moved https://symbol.example/old/ -> https://symbol.example/new/
+moved ${host}/old/ -> ${host}/new/
 ```
 
 Canonical client: `symbol move SRC DST`.
@@ -2015,7 +2033,7 @@ Example:
 
 ```toml
 version = 1
-host = "https://symbol.example"
+host = "${host}"
 name = "hello"
 managed = false
 content_revision = 4

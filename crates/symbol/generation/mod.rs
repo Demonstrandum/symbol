@@ -1,5 +1,6 @@
 pub mod docs;
 mod ledger;
+pub mod pages;
 mod provenance;
 mod swc_generation;
 

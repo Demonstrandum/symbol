@@ -93,6 +93,7 @@ use_self = "warn"
 [build-dependencies]
 blake3 = "1"
 lightningcss = { version = "1.0.0-alpha.72", default-features = false }
+maud = "0.27.0"
 pulldown-cmark = "0.13.4"
 sea-query = { version = "1.0.2", default-features = false, features = ["backend-sqlite", "derive"] }
 serde = { version = "1", features = ["derive"] }

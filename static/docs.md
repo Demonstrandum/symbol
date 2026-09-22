@@ -1,30 +1,30 @@
 # symbol
 
-tiny static web hosting on {host}.
+tiny static web hosting on ${host}.
 give it an HTML file, a folder, or an archive; get back a URL.
 there are no accounts and reads are ordinary HTTP.
 
-see [{host}/FILES]({host}/FILES) for everything currently hosted.
+see [${host}/FILES](${host}/FILES) for everything currently hosted.
 
 ## with curl
 
 upload one page to a random short URL
 
 ```
-curl -T index.html {host}/
+curl -T index.html ${host}/
 ```
 
 choose a name, then add another file without replacing the rest of the site
 
 ```
-curl -T index.html {host}/hello
-curl -T style.css {host}/hello/style.css
+curl -T index.html ${host}/hello
+curl -T style.css ${host}/hello/style.css
 ```
 
 download the complete site as an archive
 
 ```
-curl -OJ {host}/hello.tar.gz
+curl -OJ ${host}/hello.tar.gz
 ```
 
 GET reads, PUT adds or updates, and DELETE removes. folders and archives work
@@ -35,7 +35,7 @@ too; large files support ranges and stream without being loaded into memory.
 install the small POSIX client
 
 ```
-curl -fsSL {host}/install.sh | sh
+curl -fsSL ${host}/install.sh | sh
 ```
 
 the common commands
@@ -92,10 +92,10 @@ symbol sync
 
 ## API manuals
 
-See [{host}/API/]({host}/API/)
+See [${host}/API/](${host}/API/)
 
-* [JavaScript and TypeScript]({host}/API/JS)
-* [Python]({host}/API/PY)
-* [shell client]({host}/API/SH)
-* [curl and HTTP protocol]({host}/API/CURL)
+* [JavaScript and TypeScript](${host}/API/JS)
+* [Python](${host}/API/PY)
+* [shell client](${host}/API/SH)
+* [curl and HTTP protocol](${host}/API/CURL)
 

@@ -133,6 +133,34 @@ fn write_outputs(
             &page.html,
         )?;
     }
+    write_guide(root, out_dir)
+}
+
+/// Prerenders the guide served at `/`.
+///
+/// This used to happen lazily inside the server on the first request. It has
+/// no request-dependent input, so the binary now ships the three rendered
+/// flavours and only substitutes `${host}`.
+fn write_guide(root: &Path, out_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let markdown = fs::read_to_string(root.join("static/docs.md"))?;
+    let base_css = fs::read_to_string(root.join("static/base.css"))?;
+    let page_css = fs::read_to_string(root.join("static/docs.css"))?;
+    let script = fs::read_to_string(root.join("static/docs.js"))?;
+    for name in ["docs.md", "docs.js"] {
+        println!(
+            "cargo::rerun-if-changed={}",
+            root.join("static").join(name).display()
+        );
+    }
+    let guide = generation::pages::compile(&generation::pages::PageSources {
+        markdown: &markdown,
+        base_css: &base_css,
+        page_css: &page_css,
+        script: &script,
+    })?;
+    write_generated_file(&out_dir.join("docs.html"), &guide.html)?;
+    write_generated_file(&out_dir.join("docs.plain"), &guide.plain)?;
+    write_generated_file(&out_dir.join("docs.man"), &guide.man)?;
     Ok(())
 }
 

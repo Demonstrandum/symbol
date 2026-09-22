@@ -1,13 +1,44 @@
-use std::sync::OnceLock;
+//! Serving for the prerendered special pages.
+//!
+//! The guide and the five API manuals are rendered at build time by
+//! `generation::pages` and `generation::docs`, so this module only negotiates a
+//! flavour, fills in `${host}`, and builds the response. One table, one code
+//! path: before this the guide parsed markdown in-process while the manuals
+//! were served verbatim with no substitution at all.
 
 use axum::http::{HeaderMap, HeaderValue, header};
 use axum::response::Response;
-use maud::{DOCTYPE, Markup, PreEscaped, html};
 
 use crate::http_cache::{self, Representation};
 
-const SOURCE: &str = static_asset!("docs.md");
-const HOST_PLACEHOLDER: &str = concat!("{", "host", "}");
+macro_rules! generated_page {
+    ($name:literal) => {
+        include_str!(concat!(env!("OUT_DIR"), "/", $name))
+    };
+}
+
+/// The variables the pages may use.
+///
+/// Substitution is allow-listed rather than shell-like: an unknown `${...}` is
+/// left exactly as written, so the `${SYMBOL_BASE}` in the manuals' curl
+/// examples survives, and a typo stays visible instead of silently emptying.
+///
+/// `${host}` is the full origin; `${hostname}` is its bare authority, which is
+/// what an HTTP `Host:` header needs.
+const HOST: &str = "${host}";
+const HOSTNAME: &str = "${hostname}";
+
+/// Strips the scheme, and any path, from a validated public URL.
+fn authority(host: &str) -> &str {
+    let after_scheme = host.split_once("://").map_or(host, |(_, rest)| rest);
+    after_scheme
+        .split_once('/')
+        .map_or(after_scheme, |(authority, _)| authority)
+}
+
+const HTML_TYPE: &str = "text/html; charset=utf-8";
+const PLAIN_TYPE: &str = "text/plain; charset=utf-8";
+const MARKDOWN_TYPE: &str = "text/markdown; charset=utf-8";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Flavor {
@@ -16,47 +47,165 @@ pub enum Flavor {
     Man,
 }
 
-#[derive(Debug)]
-pub struct Page {
-    pub title: String,
-    pub lead: String,
-    pub sections: Vec<Section>,
+/// Every page served from a prerendered template.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Special {
+    Guide,
+    ApiIndex,
+    ApiJavaScript,
+    ApiPython,
+    ApiShell,
+    ApiProtocol,
 }
 
-#[derive(Debug)]
-pub struct Section {
-    pub heading: String,
-    pub blocks: Vec<Block>,
+struct Template {
+    html: &'static str,
+    plain: &'static str,
+    man: &'static str,
+    /// Content type for the plain and man flavours.
+    plain_type: &'static str,
+    link_html: &'static str,
+    link_plain: &'static str,
 }
 
-#[derive(Debug)]
-pub enum Block {
-    Prose(String),
-    List(Vec<String>),
-    Example { caption: String, commands: String },
+impl Special {
+    pub const ALL: [Self; 6] = [
+        Self::Guide,
+        Self::ApiIndex,
+        Self::ApiJavaScript,
+        Self::ApiPython,
+        Self::ApiShell,
+        Self::ApiProtocol,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Guide => 0,
+            Self::ApiIndex => 1,
+            Self::ApiJavaScript => 2,
+            Self::ApiPython => 3,
+            Self::ApiShell => 4,
+            Self::ApiProtocol => 5,
+        }
+    }
+
+    const fn template(self) -> Template {
+        match self {
+            Self::Guide => Template {
+                html: generated_page!("docs.html"),
+                plain: generated_page!("docs.plain"),
+                man: generated_page!("docs.man"),
+                plain_type: PLAIN_TYPE,
+                link_html: "</>; rel=\"alternate\"; type=\"text/plain\"",
+                link_plain: "</>; rel=\"alternate\"; type=\"text/html\"",
+            },
+            Self::ApiIndex => manual(
+                generated_page!("api-doc-index.html"),
+                generated_page!("api-doc-index.md"),
+                "</API/>; rel=\"canonical\"",
+            ),
+            Self::ApiJavaScript => manual(
+                generated_page!("api-doc-js.html"),
+                generated_page!("api-doc-js.md"),
+                "</API/JS>; rel=\"canonical\"",
+            ),
+            Self::ApiPython => manual(
+                generated_page!("api-doc-python.html"),
+                generated_page!("api-doc-python.md"),
+                "</API/PY>; rel=\"canonical\"",
+            ),
+            Self::ApiShell => manual(
+                generated_page!("api-doc-shell.html"),
+                generated_page!("api-doc-shell.md"),
+                "</API/SH>; rel=\"canonical\"",
+            ),
+            Self::ApiProtocol => manual(
+                generated_page!("api-doc-protocol.html"),
+                generated_page!("api-doc-protocol.md"),
+                "</API/CURL>; rel=\"canonical\"",
+            ),
+        }
+    }
 }
 
-fn source_page() -> &'static Page {
-    static PAGE: OnceLock<Page> = OnceLock::new();
-    PAGE.get_or_init(|| parse(SOURCE).expect("static/docs.md"))
+/// A manual serves its markdown for both non-HTML flavours.
+const fn manual(html: &'static str, markdown: &'static str, canonical: &'static str) -> Template {
+    Template {
+        html,
+        plain: markdown,
+        man: markdown,
+        plain_type: MARKDOWN_TYPE,
+        link_html: canonical,
+        link_plain: canonical,
+    }
 }
 
-struct Templates {
+struct Bodies {
     html: String,
     plain: String,
     man: String,
 }
 
-fn templates() -> &'static Templates {
-    static T: OnceLock<Templates> = OnceLock::new();
-    T.get_or_init(|| {
-        let page = source_page();
-        Templates {
-            html: render_html(page),
-            plain: render_plain_template(page, false),
-            man: render_plain_template(page, true),
+/// Every page with `${host}` resolved for this deployment.
+///
+/// Built once when the server starts rather than per request: the public URL
+/// is fixed for the life of the process, and the protocol manual is large
+/// enough that substituting it per request was pure waste.
+pub struct Rendered(Vec<Bodies>);
+
+impl Rendered {
+    #[must_use]
+    pub fn new(host: &str) -> Self {
+        let name = authority(host);
+        let escaped_host = maud::html! { (host) }.into_string();
+        let escaped_name = maud::html! { (name) }.into_string();
+        let fill = |template: &str, host: &str, name: &str| {
+            template.replace(HOST, host).replace(HOSTNAME, name)
+        };
+        Self(
+            Special::ALL
+                .iter()
+                .map(|page| {
+                    let template = page.template();
+                    Bodies {
+                        html: fill(template.html, &escaped_host, &escaped_name),
+                        plain: fill(template.plain, host, name),
+                        man: fill(template.man, host, name),
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    fn body(&self, page: Special, flavor: Flavor) -> &str {
+        let bodies = &self.0[page.index()];
+        match flavor {
+            Flavor::Html => &bodies.html,
+            Flavor::Plain => &bodies.plain,
+            Flavor::Man => &bodies.man,
         }
-    })
+    }
+
+    /// The plain guide, used for the `/HASH` digest.
+    #[must_use]
+    pub fn guide_plain(&self) -> &str {
+        self.body(Special::Guide, Flavor::Plain)
+    }
+}
+
+/// Negotiates a flavour and returns the prerendered page.
+pub fn respond(headers: &HeaderMap, rendered: &Rendered, page: Special) -> Response {
+    let flavor = negotiate(headers);
+    let template = page.template();
+    let (content_type, link) = match flavor {
+        Flavor::Html => (HTML_TYPE, template.link_html),
+        Flavor::Plain | Flavor::Man => (template.plain_type, template.link_plain),
+    };
+    let mut representation =
+        Representation::new(rendered.body(page, flavor).to_owned(), content_type);
+    representation.vary = Some(HeaderValue::from_static("Accept, User-Agent"));
+    representation.link = Some(HeaderValue::from_static(link));
+    http_cache::respond(headers, representation)
 }
 
 pub fn negotiate(headers: &HeaderMap) -> Flavor {
@@ -70,580 +219,6 @@ pub fn negotiate(headers: &HeaderMap) -> Flavor {
             Flavor::Plain
         }
     })
-}
-
-pub fn render(headers: &HeaderMap, host: &str, flavor: Flavor) -> Response {
-    match flavor {
-        Flavor::Html => html_response(headers, host),
-        Flavor::Plain => plain_response(headers, host, false),
-        Flavor::Man => plain_response(headers, host, true),
-    }
-}
-
-fn html_response(headers: &HeaderMap, host: &str) -> Response {
-    let mut representation = Representation::new(fill_html(host), "text/html; charset=utf-8");
-    representation.vary = Some(HeaderValue::from_static("Accept, User-Agent"));
-    representation.link = Some(HeaderValue::from_static(
-        "</>; rel=\"alternate\"; type=\"text/plain\"",
-    ));
-    http_cache::respond(headers, representation)
-}
-
-fn plain_response(headers: &HeaderMap, host: &str, man: bool) -> Response {
-    let body = if man {
-        fill_man(host)
-    } else {
-        render_plain(host)
-    };
-    let mut representation = Representation::new(body, "text/plain; charset=utf-8");
-    representation.vary = Some(HeaderValue::from_static("Accept, User-Agent"));
-    representation.link = Some(HeaderValue::from_static(
-        "</>; rel=\"alternate\"; type=\"text/html\"",
-    ));
-    http_cache::respond(headers, representation)
-}
-
-pub fn render_plain(host: &str) -> String {
-    templates().plain.replace(HOST_PLACEHOLDER, host)
-}
-
-fn fill_man(host: &str) -> String {
-    templates().man.replace(HOST_PLACEHOLDER, host)
-}
-
-fn fill_html(host: &str) -> String {
-    templates()
-        .html
-        .replace(HOST_PLACEHOLDER, &html! { (host) }.into_string())
-}
-
-fn render_plain_template(page: &Page, tty: bool) -> String {
-    let (name, description) = intro(&page.title, &page.lead);
-    let mut out = String::new();
-    out.push_str(&banner(MAN_MID, tty));
-    out.push_str("\n\n");
-    push_heading(&mut out, "NAME", tty);
-    push_name_line(&mut out, &name, tty);
-    if !description.is_empty() {
-        out.push('\n');
-        push_heading(&mut out, "DESCRIPTION", tty);
-        for para in &description {
-            out.push('\n');
-            push_wrapped(&mut out, &inline_plain(para, tty), INDENT);
-        }
-    }
-    for section in &page.sections {
-        out.push('\n');
-        push_heading(
-            &mut out,
-            &inline_plain(&section.heading, false).to_uppercase(),
-            tty,
-        );
-        for block in &section.blocks {
-            match block {
-                Block::Prose(text) => {
-                    out.push('\n');
-                    push_wrapped(&mut out, &inline_plain(text, tty), INDENT);
-                }
-                Block::List(items) => {
-                    out.push('\n');
-                    for item in items {
-                        out.extend(std::iter::repeat_n(' ', INDENT));
-                        out.push_str("* ");
-                        out.push_str(&inline_plain(item, tty));
-                        out.push('\n');
-                    }
-                }
-                Block::Example { caption, commands } => {
-                    if !caption.is_empty() {
-                        out.push('\n');
-                        push_wrapped(&mut out, &inline_plain(caption, tty), INDENT);
-                    }
-                    out.push('\n');
-                    for line in commands.lines() {
-                        out.extend(std::iter::repeat_n(' ', EXDENT));
-                        out.push_str(line);
-                        out.push('\n');
-                    }
-                }
-            }
-        }
-    }
-    out.push('\n');
-    out.push_str(&banner(MAN_MID, tty));
-    out.push('\n');
-    out
-}
-
-fn render_html(page: &Page) -> String {
-    let (name, description) = intro(&page.title, &page.lead);
-    html! {
-        (DOCTYPE)
-        meta charset="utf-8";
-        meta name="viewport" content="width=device-width, initial-scale=1";
-        title { (&page.title) }
-        style {
-            (PreEscaped(BASE_STYLE))
-            (PreEscaped(STYLE))
-        }
-        main {
-            header {
-                span { (MAN) }
-                span { (MAN_MID) }
-                span { (MAN) }
-            }
-            h2 { "NAME" }
-            p { (inline_html(&name)) }
-            @if !description.is_empty() {
-                h2 { "DESCRIPTION" }
-                @for paragraph in &description {
-                    p { (inline_html(paragraph)) }
-                }
-            }
-            @for section in &page.sections {
-                h2 { (&section.heading) }
-                @for block in &section.blocks {
-                    @match block {
-                        Block::Prose(text) => {
-                            p { (inline_html(text)) }
-                        }
-                        Block::List(items) => {
-                            .ascii-list {
-                                @for item in items {
-                                    p.list-item {
-                                        span.bullet { "* " }
-                                        (inline_html(item))
-                                    }
-                                }
-                            }
-                        }
-                        Block::Example { caption, commands } => {
-                            .row {
-                                @if !caption.is_empty() {
-                                    p.cap { (inline_html(caption)) }
-                                }
-                                pre { (highlight_shell(commands)) }
-                            }
-                        }
-                    }
-                }
-            }
-            footer {
-                span { (MAN) }
-                span { "click a command to copy" }
-                span { (MAN) }
-            }
-        }
-        .toast #toast { "copied" }
-        script { (PreEscaped(SCRIPT)) }
-    }
-    .into_string()
-}
-
-const MAN: &str = "SYMBOL(1)";
-const MAN_MID: &str = "Tailnet static hosting";
-const COLS: usize = 78;
-const INDENT: usize = 7;
-const EXDENT: usize = 14;
-
-fn banner(mid: &str, tty: bool) -> String {
-    let ends = MAN.len() * 2;
-    let line = if COLS <= ends + mid.len() {
-        format!("{MAN} {mid} {MAN}")
-    } else {
-        let gap = COLS - ends;
-        let left_pad = gap.saturating_sub(mid.len()) / 2;
-        let right_pad = gap - mid.len() - left_pad;
-        let mut s = String::with_capacity(COLS);
-        s.push_str(MAN);
-        s.extend(std::iter::repeat_n(' ', left_pad));
-        s.push_str(mid);
-        s.extend(std::iter::repeat_n(' ', right_pad));
-        s.push_str(MAN);
-        s
-    };
-    if !tty {
-        return line;
-    }
-    let inner = &line[MAN.len()..line.len() - MAN.len()];
-    let mut out = overstrike(MAN);
-    out.push_str(inner);
-    out.push_str(&overstrike(MAN));
-    out
-}
-
-fn overstrike(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() * 3);
-    for c in s.chars() {
-        out.push(c);
-        out.push('\u{8}');
-        out.push(c);
-    }
-    out
-}
-
-fn vis(s: &str) -> usize {
-    let mut n = 0;
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\u{8}' {
-            continue;
-        }
-        n += 1;
-        if chars.peek() == Some(&'\u{8}') {
-            chars.next();
-            chars.next();
-        }
-    }
-    n
-}
-
-fn push_heading(out: &mut String, s: &str, tty: bool) {
-    if tty {
-        out.push_str(&overstrike(s));
-    } else {
-        out.push_str(s);
-    }
-    out.push('\n');
-}
-
-fn push_name_line(out: &mut String, name: &str, tty: bool) {
-    let (title, rest) = name.split_once(" - ").unwrap_or((name, ""));
-    let rest = inline_plain(rest, tty);
-    out.extend(std::iter::repeat_n(' ', INDENT));
-    if tty {
-        out.push_str(&overstrike(title));
-    } else {
-        out.push_str(title);
-    }
-    if rest.is_empty() {
-        out.push('\n');
-        return;
-    }
-    out.push_str(" - ");
-    let first_fill = COLS
-        .saturating_sub(INDENT + title.chars().count() + 3)
-        .max(1);
-    let fill = COLS.saturating_sub(INDENT).max(1);
-    let mut line = String::new();
-    let mut first = true;
-    for word in rest.split_whitespace() {
-        if line.is_empty() {
-            line.push_str(word);
-            continue;
-        }
-        let limit = if first { first_fill } else { fill };
-        if vis(&line) + 1 + vis(word) > limit {
-            out.push_str(&line);
-            out.push('\n');
-            out.extend(std::iter::repeat_n(' ', INDENT));
-            line.clear();
-            line.push_str(word);
-            first = false;
-        } else {
-            line.push(' ');
-            line.push_str(word);
-        }
-    }
-    out.push_str(&line);
-    out.push('\n');
-}
-
-fn push_wrapped(out: &mut String, text: &str, indent: usize) {
-    let fill = COLS.saturating_sub(indent).max(1);
-    let mut line = String::new();
-    for word in text.split_whitespace() {
-        if line.is_empty() {
-            line.push_str(word);
-            continue;
-        }
-        if vis(&line) + 1 + vis(word) > fill {
-            out.extend(std::iter::repeat_n(' ', indent));
-            out.push_str(&line);
-            out.push('\n');
-            line.clear();
-        } else {
-            line.push(' ');
-        }
-        line.push_str(word);
-    }
-    if !line.is_empty() {
-        out.extend(std::iter::repeat_n(' ', indent));
-        out.push_str(&line);
-        out.push('\n');
-    }
-}
-
-fn flow(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn first_sentence(s: &str) -> (&str, &str) {
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i + 1 < bytes.len() {
-        if bytes[i] == b'.' && bytes[i + 1].is_ascii_whitespace() {
-            return (&s[..=i], s[i + 1..].trim_start());
-        }
-        i += 1;
-    }
-    (s, "")
-}
-
-fn intro(title: &str, lead: &str) -> (String, Vec<String>) {
-    let (head, tail) = first_sentence(lead.trim());
-    let name = format!("{} - {}", title, flow(head));
-    let description = tail
-        .split("\n\n")
-        .map(flow)
-        .filter(|p| !p.is_empty())
-        .collect();
-    (name, description)
-}
-
-#[derive(Clone, Copy)]
-enum Hl {
-    Cmd,
-    Flag,
-    Str,
-    Cmt,
-    Url,
-    Punct,
-    Text,
-}
-
-impl Hl {
-    const fn class(self) -> Option<&'static str> {
-        match self {
-            Self::Cmd => Some("cmd"),
-            Self::Flag => Some("flag"),
-            Self::Str => Some("str"),
-            Self::Cmt => Some("cmt"),
-            Self::Url => Some("url"),
-            Self::Punct => Some("punct"),
-            Self::Text => None,
-        }
-    }
-}
-
-fn highlight_shell(src: &str) -> Markup {
-    let mut out = Vec::new();
-    let mut continued = false;
-    for line in src.split_inclusive('\n') {
-        let body = line.strip_suffix('\n').unwrap_or(line);
-        highlight_line(body, !continued, &mut out);
-        if line.ends_with('\n') {
-            out.push(html! { "\n" });
-        }
-        continued = body.trim_end().ends_with('\\');
-    }
-    html! {
-        @for part in out {
-            (part)
-        }
-    }
-}
-
-fn highlight_line(line: &str, mut expect_cmd: bool, out: &mut Vec<Markup>) {
-    let mut rest = line;
-    while !rest.is_empty() {
-        if rest.starts_with(|ch: char| ch.is_whitespace()) {
-            let n = rest
-                .find(|ch: char| !ch.is_whitespace())
-                .unwrap_or(rest.len());
-            out.push(html! { (&rest[..n]) });
-            rest = &rest[n..];
-            continue;
-        }
-        let c = rest.as_bytes()[0];
-        if c == b'#' {
-            emit(out, Hl::Cmt, rest);
-            return;
-        }
-        if c == b'\\' {
-            emit(out, Hl::Punct, "\\");
-            rest = &rest[1..];
-            continue;
-        }
-        if c == b'|' {
-            emit(out, Hl::Punct, "|");
-            rest = &rest[1..];
-            expect_cmd = true;
-            continue;
-        }
-        if c == b'\'' || c == b'"' {
-            let (tok, next) = take_string(rest);
-            emit(out, Hl::Str, tok);
-            rest = next;
-            expect_cmd = false;
-            continue;
-        }
-        let n = rest
-            .find(|ch: char| ch.is_whitespace() || ch == '|')
-            .unwrap_or(rest.len())
-            .max(1);
-        let tok = &rest[..n];
-        rest = &rest[n..];
-        emit(out, classify(tok, expect_cmd), tok);
-        expect_cmd = false;
-    }
-}
-
-fn take_string(s: &str) -> (&str, &str) {
-    let quote = s.as_bytes()[0];
-    let mut i = 1;
-    let bytes = s.as_bytes();
-    while i < bytes.len() {
-        if bytes[i] == b'\\' && i + 1 < bytes.len() {
-            i += 2;
-            continue;
-        }
-        if bytes[i] == quote {
-            return (&s[..=i], &s[i + 1..]);
-        }
-        i += 1;
-    }
-    (s, "")
-}
-
-fn classify(tok: &str, expect_cmd: bool) -> Hl {
-    if expect_cmd && matches!(tok, "curl" | "symbol" | "tar" | "sh") {
-        return Hl::Cmd;
-    }
-    if tok.starts_with('-') {
-        return Hl::Flag;
-    }
-    if tok.contains("://") || tok.contains("{host}") {
-        return Hl::Url;
-    }
-    Hl::Text
-}
-
-fn emit(out: &mut Vec<Markup>, kind: Hl, text: &str) {
-    match kind.class() {
-        Some(class) => out.push(html! { span class=(class) { (text) } }),
-        None => out.push(html! { (text) }),
-    }
-}
-
-fn take_link(s: &str) -> Option<(&str, &str, &str)> {
-    let rest = s.strip_prefix('[')?;
-    let close = rest.find(']')?;
-    let label = &rest[..close];
-    let rest = rest[close + 1..].strip_prefix('(')?;
-    let end = rest.find(')')?;
-    Some((label, &rest[..end], &rest[end + 1..]))
-}
-
-fn inline_plain(s: &str, tty: bool) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(i) = rest.find('[') {
-        if let Some((label, href, after)) = take_link(&rest[i..]) {
-            out.push_str(&rest[..i]);
-            out.push_str(label);
-            if label != href {
-                out.push_str(" (");
-                out.push_str(href);
-                out.push(')');
-            }
-            rest = after;
-        } else {
-            out.push_str(&rest[..=i]);
-            rest = &rest[i + 1..];
-        }
-    }
-    out.push_str(rest);
-    ticks(&out, tty)
-}
-
-fn ticks(s: &str, tty: bool) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(start) = rest.find('`') {
-        out.push_str(&rest[..start]);
-        rest = &rest[start + 1..];
-        if let Some(end) = rest.find('`') {
-            let code = &rest[..end];
-            if tty && !code.contains("{host}") {
-                out.push_str(&overstrike(code));
-            } else {
-                out.push_str(code);
-            }
-            rest = &rest[end + 1..];
-        } else {
-            out.push('`');
-            break;
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
-fn inline_html(s: &str) -> Markup {
-    let mut out = Vec::new();
-    let mut rest = s;
-    loop {
-        let tick = rest.find('`');
-        let brack = rest.find('[');
-        let next = match (tick, brack) {
-            (None, None) => {
-                out.push(html! { (rest) });
-                return html! {
-                    @for part in out {
-                        (part)
-                    }
-                };
-            }
-            (Some(t), None) => t,
-            (None, Some(b)) => b,
-            (Some(t), Some(b)) => t.min(b),
-        };
-        out.push(html! { (&rest[..next]) });
-        rest = &rest[next..];
-        if rest.starts_with('`') {
-            rest = &rest[1..];
-            if let Some(end) = rest.find('`') {
-                out.push(html! { code { (&rest[..end]) } });
-                rest = &rest[end + 1..];
-            } else {
-                out.push(html! { "`" (rest) });
-                return html! {
-                    @for part in out {
-                        (part)
-                    }
-                };
-            }
-        } else if let Some((label, href, after)) = take_link(rest) {
-            out.push(html! { a href=(href) { (codes_html(label)) } });
-            rest = after;
-        } else {
-            out.push(html! { "[" });
-            rest = &rest[1..];
-        }
-    }
-}
-
-fn codes_html(s: &str) -> Markup {
-    let mut out = Vec::new();
-    let mut rest = s;
-    while let Some(start) = rest.find('`') {
-        out.push(html! { (&rest[..start]) });
-        rest = &rest[start + 1..];
-        if let Some(end) = rest.find('`') {
-            out.push(html! { code { (&rest[..end]) } });
-            rest = &rest[end + 1..];
-        } else {
-            out.push(html! { "`" });
-            break;
-        }
-    }
-    out.push(html! { (rest) });
-    html! {
-        @for part in out {
-            (part)
-        }
-    }
 }
 
 fn header_str(headers: &HeaderMap, name: header::HeaderName) -> &str {
@@ -694,159 +269,21 @@ fn accept_flavor(accept: &str) -> Option<Flavor> {
     }
 }
 
-fn flush_pending(pending: &mut Option<String>, lead: &mut String, sections: &mut [Section]) {
-    let Some(text) = pending.take() else {
-        return;
-    };
-    if sections.is_empty() {
-        if lead.is_empty() {
-            *lead = text;
-        } else {
-            lead.push_str("\n\n");
-            lead.push_str(&text);
-        }
-    } else if let Some(section) = sections.last_mut() {
-        section.blocks.push(Block::Prose(text));
-    }
-}
-
-fn parse(src: &str) -> Result<Page, String> {
-    let mut title = String::new();
-    let mut lead = String::new();
-    let mut sections: Vec<Section> = Vec::new();
-    let mut pending: Option<String> = None;
-    let mut prev_blank = false;
-    let mut in_fence = false;
-    let mut fence_buf = String::new();
-
-    for line in src.lines() {
-        if in_fence {
-            if line.starts_with("```") {
-                in_fence = false;
-                let commands = fence_buf.trim_end_matches('\n').to_string();
-                fence_buf.clear();
-                let caption = pending.take().unwrap_or_default();
-                let section = sections
-                    .last_mut()
-                    .ok_or_else(|| "command block before any section".to_string())?;
-                section.blocks.push(Block::Example { caption, commands });
-                prev_blank = false;
-            } else {
-                fence_buf.push_str(line);
-                fence_buf.push('\n');
-            }
-            continue;
-        }
-        if line.starts_with("```") {
-            in_fence = true;
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("# ") {
-            flush_pending(&mut pending, &mut lead, &mut sections);
-            title = rest.to_string();
-            prev_blank = false;
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("## ") {
-            flush_pending(&mut pending, &mut lead, &mut sections);
-            sections.push(Section {
-                heading: rest.to_string(),
-                blocks: Vec::new(),
-            });
-            prev_blank = false;
-            continue;
-        }
-        if line.trim().is_empty() {
-            prev_blank = true;
-            continue;
-        }
-        if let Some(item) = line.strip_prefix("* ") {
-            flush_pending(&mut pending, &mut lead, &mut sections);
-            let section = sections
-                .last_mut()
-                .ok_or_else(|| "list before any section".to_string())?;
-            match section.blocks.last_mut() {
-                Some(Block::List(items)) => items.push(item.to_string()),
-                Some(Block::Prose(_) | Block::Example { .. }) | None => {
-                    section.blocks.push(Block::List(vec![item.to_string()]));
-                }
-            }
-            prev_blank = false;
-            continue;
-        }
-        if prev_blank {
-            flush_pending(&mut pending, &mut lead, &mut sections);
-        }
-        match pending.as_mut() {
-            Some(buf) => {
-                buf.push('\n');
-                buf.push_str(line);
-            }
-            None => pending = Some(line.to_string()),
-        }
-        prev_blank = false;
-    }
-    if in_fence {
-        return Err("unclosed command block".into());
-    }
-    flush_pending(&mut pending, &mut lead, &mut sections);
-    if title.is_empty() {
-        return Err("missing title".into());
-    }
-    Ok(Page {
-        title,
-        lead,
-        sections,
-    })
-}
-
-const BASE_STYLE: &str = static_asset!("base.css");
-const STYLE: &str = static_asset!("docs.css");
-const SCRIPT: &str = static_asset!("docs.js");
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn rendered_docs_support_conditional_requests() {
-        let response = render(&HeaderMap::new(), "https://symbol.test", Flavor::Html);
-        let etag = response.headers()[header::ETAG].clone();
+    fn accept(value: &'static str) -> HeaderMap {
         let mut headers = HeaderMap::new();
-        headers.insert(header::IF_NONE_MATCH, etag);
-
-        let response = render(&headers, "https://symbol.test", Flavor::Html);
-        assert_eq!(response.status(), axum::http::StatusCode::NOT_MODIFIED);
+        headers.insert(header::ACCEPT, HeaderValue::from_static(value));
+        headers
     }
 
-    #[test]
-    fn parses_real_docs() {
-        let page = parse(SOURCE).unwrap();
-        assert!(page.title.contains("symbol"));
-        assert!(!page.lead.is_empty());
-        assert!(page.sections.iter().any(|s| s.heading == "API manuals"));
-        assert!(page.sections.iter().any(|section| {
-            section
-                .blocks
-                .iter()
-                .any(|block| matches!(block, Block::List(items) if items.len() == 4))
-        }));
-        assert!(page.sections.iter().any(|s| {
-            s.blocks.iter().any(|b| matches!(b, Block::Example { commands, .. } if commands.contains("symbol put hello")))
-        }));
-    }
-
-    #[test]
-    fn caption_binds_to_following_commands() {
-        let src = "# t\n\nlead\n\n## s\n\nhello there\n\n```\ncmd\n```\n";
-        let page = parse(src).unwrap();
-        match &page.sections[0].blocks[0] {
-            Block::Example { caption, commands } => {
-                assert_eq!(caption, "hello there");
-                assert_eq!(commands, "cmd");
-            }
-            other => panic!("{other:?}"),
-        }
+    async fn body_of(response: Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
     }
 
     #[test]
@@ -876,81 +313,131 @@ mod tests {
     }
 
     #[test]
-    fn host_is_filled_in_plain() {
-        let text = render_plain("http://symbol");
-        assert!(text.starts_with("SYMBOL(1)"));
-        assert!(text.contains("NAME\n"));
-        assert!(text.contains("symbol - tiny static web hosting on http://symbol."));
-        assert!(text.contains("DESCRIPTION\n"));
-        assert!(text.contains("http://symbol/API/JS"));
-        assert!(text.contains("http://symbol/API/CURL"));
-        assert!(!text.contains("{host}"));
-        assert!(!text.contains('`'));
-        assert!(text.trim_end().ends_with("SYMBOL(1)"));
-        assert!(!text.contains('\u{8}'));
+    fn authority_drops_scheme_and_path() {
+        assert_eq!(authority("https://symbol.example"), "symbol.example");
+        assert_eq!(authority("http://symbol"), "symbol");
+        assert_eq!(
+            authority("https://symbol.example:8443"),
+            "symbol.example:8443"
+        );
+        assert_eq!(authority("symbol.example"), "symbol.example");
     }
 
     #[test]
-    fn man_overstrike_for_less() {
-        let text = fill_man("http://symbol");
-        assert!(text.contains('\u{8}'));
-        assert!(text.contains("http://symbol/API/JS"));
-        assert!(!text.contains("{host}"));
-        assert!(text.contains(&overstrike("NAME")));
-        assert!(text.contains(&overstrike("symbol")));
-        assert!(!render_plain("http://symbol").contains('\u{8}'));
+    fn no_placeholder_survives_on_any_page_or_flavour() {
+        let rendered = Rendered::new("https://symbol.test");
+        for page in Special::ALL {
+            for flavor in [Flavor::Html, Flavor::Plain, Flavor::Man] {
+                let body = rendered.body(page, flavor);
+                assert!(
+                    !body.contains(HOST),
+                    "{page:?}/{flavor:?} still contains ${{host}}"
+                );
+                assert!(
+                    !body.contains(HOSTNAME),
+                    "{page:?}/{flavor:?} still contains ${{hostname}}"
+                );
+                assert!(
+                    !body.contains("symbol.example"),
+                    "{page:?}/{flavor:?} still advertises the placeholder host"
+                );
+            }
+        }
     }
 
     #[test]
-    fn html_is_prebuilt_and_host_is_filled() {
-        let html = fill_html("http://symbol");
+    fn substitution_is_allow_listed() {
+        let rendered = Rendered::new("https://symbol.test");
+        // The Python and shell manuals document a variable the reader exports.
+        // It must survive verbatim rather than being expanded or emptied,
+        // while `${host}` beside it is still replaced.
+        for page in [Special::ApiPython, Special::ApiShell] {
+            let body = rendered.body(page, Flavor::Plain);
+            assert!(
+                body.contains("${SYMBOL_BASE}"),
+                "{page:?} lost an unrelated shell variable"
+            );
+        }
+        let python = rendered.body(Special::ApiPython, Flavor::Plain);
+        assert!(python.contains("origin=\"https://symbol.test\""));
+
+        // The protocol manual sets it from the real origin instead.
+        let protocol = rendered.body(Special::ApiProtocol, Flavor::Plain);
+        assert!(protocol.contains("SYMBOL_BASE=https://symbol.test"));
+        assert!(protocol.contains("Host: symbol.test"));
+    }
+
+    #[test]
+    fn guide_keeps_its_rendered_shape_after_substitution() {
+        let rendered = Rendered::new("http://symbol");
+        let plain = rendered.guide_plain();
+        assert!(plain.starts_with("SYMBOL(1)"));
+        assert!(plain.contains("symbol - tiny static web hosting on http://symbol."));
+        assert!(plain.contains("http://symbol/API/JS"));
+        assert!(!plain.contains('\u{8}'));
+
+        let man = rendered.body(Special::Guide, Flavor::Man);
+        assert!(man.contains('\u{8}'));
+        assert!(man.contains("http://symbol/API/CURL"));
+
+        let html = rendered.body(Special::Guide, Flavor::Html);
         assert!(html.contains("<a href=\"http://symbol/API/JS\">"));
         assert!(html.contains("class=\"cmd\">symbol</span>"));
         assert!(html.contains("<h2>NAME</h2>"));
-        assert!(!html.contains("{host}"));
-        assert!(templates().html.contains("{host}"));
-        assert!(templates().html.contains("class=\"cmd\">symbol</span>"));
     }
 
     #[test]
-    fn html_code_blocks_are_not_horizontally_indented() {
-        assert!(
-            !STYLE.contains(".row pre { margin-left:"),
-            "code blocks should align with the content column"
-        );
-        assert!(STYLE.contains("padding-left: 2ch"));
-        assert!(STYLE.contains("margin-left: 2ch"));
-    }
-
-    #[test]
-    fn markdown_links() {
+    fn manuals_carry_the_real_host_and_their_canonical_link() {
+        let rendered = Rendered::new("https://symbol.test");
+        let headers = accept("text/html");
+        let response = respond(&headers, &rendered, Special::ApiProtocol);
         assert_eq!(
-            inline_plain("see [a](b) and [c](c)", false),
-            "see a (b) and c"
+            response.headers()[header::LINK],
+            "</API/CURL>; rel=\"canonical\""
         );
         assert_eq!(
-            inline_html("see [`x`]({host}/x)").into_string(),
-            "see <a href=\"{host}/x\"><code>x</code></a>"
+            response.headers()[header::CONTENT_TYPE],
+            "text/html; charset=utf-8"
         );
-        assert_eq!(inline_html("not [a link").into_string(), "not [a link");
+    }
+
+    #[tokio::test]
+    async fn manuals_still_negotiate_markdown_for_non_browsers() {
+        let rendered = Rendered::new("https://symbol.test");
+        let response = respond(&accept("text/markdown"), &rendered, Special::ApiPython);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/markdown; charset=utf-8"
+        );
+        assert_eq!(response.headers()[header::VARY], "Accept, User-Agent");
+        let body = body_of(response).await;
+        assert!(body.contains("https://symbol.test"));
+        assert!(!body.contains("${host}"));
     }
 
     #[test]
-    fn highlights_shell_in_html() {
-        let html = highlight_shell("curl -T index.html {host}/hello  # put\n'quoted' | sh \\\n")
-            .into_string();
-        assert!(html.contains("class=\"cmd\">curl</span>"));
-        assert!(html.contains("class=\"flag\">-T</span>"));
-        assert!(html.contains("class=\"url\">{host}/hello</span>"));
-        assert!(html.contains("class=\"cmt\"># put</span>"));
-        assert!(html.contains("class=\"str\">'quoted'</span>"));
-        assert!(html.contains("class=\"cmd\">sh</span>"));
-        assert!(html.contains("class=\"punct\">|</span>"));
-        assert!(html.contains("class=\"punct\">\\</span>"));
-        assert!(!html.contains("<script>"));
-        let html = highlight_shell("echo '<b>'").into_string();
-        assert!(html.contains("&lt;b&gt;"));
-        let html = highlight_shell("ls \u{00a0}# nbsp").into_string();
-        assert!(html.contains("class=\"cmt\"># nbsp</span>"));
+    fn every_special_page_supports_conditional_requests() {
+        let rendered = Rendered::new("https://symbol.test");
+        for page in Special::ALL {
+            let response = respond(&HeaderMap::new(), &rendered, page);
+            let etag = response.headers()[header::ETAG].clone();
+            let mut headers = HeaderMap::new();
+            headers.insert(header::IF_NONE_MATCH, etag);
+            let response = respond(&headers, &rendered, page);
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::NOT_MODIFIED,
+                "{page:?} did not revalidate"
+            );
+        }
+    }
+
+    #[test]
+    fn distinct_hosts_produce_distinct_bodies() {
+        let a = Rendered::new("https://one.test");
+        let b = Rendered::new("https://two.test");
+        assert_ne!(a.guide_plain(), b.guide_plain());
+        assert!(a.guide_plain().contains("one.test"));
+        assert!(b.guide_plain().contains("two.test"));
     }
 }
