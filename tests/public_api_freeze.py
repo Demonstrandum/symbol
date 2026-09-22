@@ -84,6 +84,24 @@ def endpoint_hash(endpoint: Endpoint) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def baseline_aggregate_hash(baseline_endpoints: tuple[Endpoint, ...]) -> str:
+    """Hash the frozen endpoint set as a whole.
+
+    Covers the baseline subset rather than the entire contract, so that adding
+    an approved endpoint does not disable the check. The per-endpoint hashes
+    pin each shape; this pins the membership of the frozen set.
+    """
+    payload = json.dumps(
+        [
+            dataclasses.asdict(endpoint)
+            for endpoint in sorted(baseline_endpoints, key=lambda e: e.name)
+        ],
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
 def validate_contract(freeze: Freeze, endpoints: tuple[Endpoint, ...]) -> None:
     assert len({endpoint.name for endpoint in endpoints}) == len(endpoints), (
         "contract endpoint names must be unique"
@@ -104,6 +122,9 @@ def validate_contract(freeze: Freeze, endpoints: tuple[Endpoint, ...]) -> None:
         assert endpoint_hash(endpoint) == expected.sha256, (
             f"frozen endpoint changed: {expected.name}"
         )
+    assert baseline_aggregate_hash(baseline_endpoints) == (
+        freeze.baseline_contract_sha256
+    ), "frozen endpoint set changed without updating baseline_contract_sha256"
 
     approved = freeze.approved_additions
     assert approved.endpoint_names == tuple(
@@ -171,11 +192,7 @@ contract_raw = json.loads(
     subprocess.check_output([symbol_bin, "contract"], text=True)
 )
 contract = tuple(endpoint_from_json(endpoint) for endpoint in contract_raw)
-canonical = json.dumps(contract_raw, sort_keys=True, separators=(",", ":")).encode()
-observed = hashlib.sha256(canonical).hexdigest()
 validate_contract(freeze, contract)
-if len(contract) == len(freeze.baseline_endpoint_sha256):
-    assert observed == freeze.baseline_contract_sha256
 
 for field in dataclasses.fields(ApprovedAdditions):
     value = getattr(freeze.approved_additions, field.name)
@@ -196,6 +213,19 @@ except AssertionError:
     pass
 else:
     raise AssertionError("changed baseline endpoint was accepted")
+
+# Shrinking the frozen set is only visible to the aggregate hash: the removed
+# entry takes its own per-endpoint hash with it, and the remaining ones still
+# match. This is what the aggregate exists to catch.
+shrunk_freeze = dataclasses.replace(
+    freeze, baseline_endpoint_sha256=freeze.baseline_endpoint_sha256[1:]
+)
+try:
+    validate_contract(shrunk_freeze, contract)
+except AssertionError as error:
+    assert "baseline_contract_sha256" in str(error), error
+else:
+    raise AssertionError("a shrunken frozen baseline was accepted")
 
 approved_extra = next(
     endpoint

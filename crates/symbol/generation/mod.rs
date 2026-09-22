@@ -490,8 +490,10 @@ pub fn generate_artifacts(
         source,
     })?;
 
-    emit_typescript(&ts_template, "symbol.ts")?;
-
+    // The template is not parsed on its own. Every placeholder sits inside a
+    // string literal and is replaced by another string literal, so the rendered
+    // source below is the same program structurally, and parsing it catches the
+    // same syntax errors without a second full SWC pass per build.
     let typescript_source =
         render_typescript_template(&ts_template, "symbol.ts", metadata, &ts_path)?;
     let module_source = render_typescript_template(&ts_template, "symbol.js", metadata, &ts_path)?;

@@ -296,10 +296,9 @@ fn render_html(site: &str, rel: &str, list: &DirList, files_view: bool) -> Strin
                     }
                 }
                 @for entry in &list.entries {
-                    @let shown = listing_entry_name(&entry.name, entry.kind, &occupied);
-                    a.row href=(entry_href(site, rel, shown, entry.kind, files_view)) {
+                    a.row href=(entry_href(site, rel, &entry.name, entry.kind, files_view, &occupied)) {
                         span.name {
-                            (shown)
+                            (&entry.name)
                             @if entry.kind == EntryKind::Directory { "/" }
                         }
                         span.meta {
@@ -440,22 +439,46 @@ fn listing_occupied_names<'a>(rel: &str, list: &'a DirList) -> HashSet<&'a str> 
     names
 }
 
-fn listing_entry_name<'a>(name: &'a str, kind: EntryKind, occupied: &HashSet<&str>) -> &'a str {
-    match kind {
-        EntryKind::Directory => name,
-        EntryKind::File => pretty_html_name(name, |candidate| occupied.contains(candidate)),
+/// Whether `name` is the file that the containing directory's URL serves.
+///
+/// `find_index` prefers `index.html`, so `index.htm` only stands in for the
+/// directory when there is no `index.html` beside it.
+fn serves_directory_index(name: &str, occupied: &HashSet<&str>) -> bool {
+    match name {
+        "index.html" => true,
+        "index.htm" => !occupied.contains("index.html"),
+        _ => false,
     }
 }
 
-fn entry_href(site: &str, rel: &str, name: &str, kind: EntryKind, files_view: bool) -> String {
-    let path = if rel.is_empty() {
+fn join_rel(rel: &str, name: &str) -> String {
+    if rel.is_empty() {
         name.to_string()
     } else {
         format!("{rel}/{name}")
-    };
+    }
+}
+
+/// Builds the link target for one listing row.
+///
+/// Dropping an `.html` suffix is a URL-cleaning concern and nothing else, so it
+/// happens here and never to the visible label. An index file links to the
+/// directory that serves it rather than to a path that would only redirect.
+fn entry_href(
+    site: &str,
+    rel: &str,
+    name: &str,
+    kind: EntryKind,
+    files_view: bool,
+    occupied: &HashSet<&str>,
+) -> String {
     match kind {
-        EntryKind::Directory => dir_href(site, &path, files_view),
-        EntryKind::File => format!("/{site}/{path}"),
+        EntryKind::Directory => dir_href(site, &join_rel(rel, name), files_view),
+        EntryKind::File if serves_directory_index(name, occupied) => dir_href(site, rel, false),
+        EntryKind::File => {
+            let target = pretty_html_name(name, |candidate| occupied.contains(candidate));
+            format!("/{site}/{}", join_rel(rel, target))
+        }
     }
 }
 
@@ -715,6 +738,34 @@ mod tests {
         assert!(!wants_json(&accept("*/*")));
     }
 
+    fn dir_entry(name: &str) -> DirEnt {
+        DirEnt {
+            kind: EntryKind::Directory,
+            name: name.to_string(),
+            files: 1,
+            bytes: 512,
+        }
+    }
+
+    fn file_entry(name: &str) -> DirEnt {
+        DirEnt {
+            kind: EntryKind::File,
+            name: name.to_string(),
+            files: 1,
+            bytes: 512,
+        }
+    }
+
+    fn dir_list(entries: Vec<DirEnt>) -> DirList {
+        DirList {
+            files: entries.len() as u64,
+            bytes: 512 * entries.len() as u64,
+            alias_count: 0,
+            aliases: Vec::new(),
+            entries,
+        }
+    }
+
     #[test]
     fn files_navigation_keeps_directory_links_in_files_view() {
         assert_eq!(parent_href("hello", "", true).as_deref(), Some("/FILES"));
@@ -723,35 +774,76 @@ mod tests {
             Some("/hello/FILES/assets/")
         );
         assert_eq!(
-            entry_href("hello", "assets", "css", EntryKind::Directory, true),
+            entry_href(
+                "hello",
+                "assets",
+                "css",
+                EntryKind::Directory,
+                true,
+                &HashSet::new()
+            ),
             "/hello/FILES/assets/css/"
         );
     }
 
     #[test]
-    fn files_html_links_to_site_when_directory_has_an_index() {
-        let list = DirList {
-            files: 1,
-            bytes: 512,
-            alias_count: 0,
-            aliases: Vec::new(),
-            entries: vec![DirEnt {
-                kind: EntryKind::File,
-                name: "index.html".to_string(),
-                files: 1,
-                bytes: 512,
-            }],
-        };
+    fn listing_labels_keep_the_stored_extension_while_links_stay_pretty() {
+        let list = dir_list(vec![file_entry("about.html"), file_entry("style.css")]);
+
+        for files_view in [true, false] {
+            let body = render_html("hello", "", &list, files_view);
+            assert!(
+                body.contains(">about.html</span>"),
+                "label lost its extension in files_view={files_view}: {body}"
+            );
+            assert!(body.contains(r#"href="/hello/about""#), "{body}");
+            assert!(!body.contains(r#"href="/hello/about.html""#), "{body}");
+            assert!(body.contains(">style.css</span>"), "{body}");
+            assert!(body.contains(r#"href="/hello/style.css""#), "{body}");
+        }
+    }
+
+    #[test]
+    fn an_occupied_stem_keeps_the_extension_in_both_label_and_link() {
+        let list = dir_list(vec![file_entry("about.html"), dir_entry("about")]);
+        let body = render_html("hello", "", &list, true);
+        assert!(body.contains(">about.html</span>"), "{body}");
+        assert!(body.contains(r#"href="/hello/about.html""#), "{body}");
+    }
+
+    #[test]
+    fn index_entries_link_to_the_directory_that_serves_them() {
+        let list = dir_list(vec![file_entry("index.html")]);
         let body = render_html("hello", "docs", &list, true);
         assert!(body.contains(r#"class="see-site" href="/hello/docs/""#));
         assert!(body.contains(">see site</a>"));
-        assert!(body.contains(r#"href="/hello/docs/index""#));
-        assert!(body.contains(r">index</span>"));
-        assert!(!body.contains("index.html"));
+        assert!(body.contains(">index.html</span>"), "{body}");
+        assert!(body.contains(r#"href="/hello/docs/""#), "{body}");
+        assert!(!body.contains(r#"href="/hello/docs/index""#), "{body}");
 
-        let body = render_html("hello", "docs", &list, false);
-        assert!(!body.contains(r#"class="see-site""#));
-        assert!(body.contains(r#"href="/hello/docs/index""#));
+        let root = dir_list(vec![file_entry("index.html")]);
+        let body = render_html("hello", "", &root, true);
+        assert!(body.contains(r#"href="/hello/""#), "{body}");
+        assert!(!body.contains(r#"href="/hello/index""#), "{body}");
+    }
+
+    #[test]
+    fn only_the_index_that_wins_links_to_the_directory() {
+        let mut occupied = HashSet::new();
+        occupied.insert("index.htm");
+        assert!(serves_directory_index("index.html", &occupied));
+        assert!(serves_directory_index("index.htm", &occupied));
+
+        // `find_index` prefers `index.html`, so `index.htm` must stay put.
+        occupied.insert("index.html");
+        assert!(serves_directory_index("index.html", &occupied));
+        assert!(!serves_directory_index("index.htm", &occupied));
+        assert!(!serves_directory_index("about.html", &occupied));
+
+        let list = dir_list(vec![file_entry("index.html"), file_entry("index.htm")]);
+        let body = render_html("hello", "docs", &list, true);
+        assert!(body.contains(r#"href="/hello/docs/index.htm""#), "{body}");
+        assert!(body.contains(">index.htm</span>"), "{body}");
     }
 
     #[tokio::test]

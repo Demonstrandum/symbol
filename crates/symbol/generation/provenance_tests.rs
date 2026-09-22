@@ -138,11 +138,33 @@ fn repository_dirty_scope_marks_untracked_canonical_sources_only() {
     assert_ne!(changed.commit, initial.commit);
 }
 
+/// Runs git against a throwaway repository with the ambient environment removed.
+///
+/// Global and system configuration is discarded so that a developer's own
+/// settings cannot reach these fixtures. Commit signing and `core.hooksPath` in
+/// particular would otherwise make `commit` fail outright.
 fn run_git(root: &Path, arguments: &[&str]) {
     let output = Command::new("git")
         .arg("-C")
         .arg(root)
+        .args([
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "tag.gpgsign=false",
+            "-c",
+            "core.hooksPath=",
+        ])
         .args(arguments)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_AUTHOR_NAME", "Phase Six Tests")
+        .env("GIT_AUTHOR_EMAIL", "phase-six@example.invalid")
+        .env("GIT_AUTHOR_DATE", "2026-01-02T03:04:05Z")
+        .env("GIT_COMMITTER_NAME", "Phase Six Tests")
+        .env("GIT_COMMITTER_EMAIL", "phase-six@example.invalid")
         .output()
         .unwrap();
     assert!(
@@ -153,16 +175,5 @@ fn run_git(root: &Path, arguments: &[&str]) {
 }
 
 fn commit(root: &Path, message: &str) {
-    run_git(
-        root,
-        &[
-            "-c",
-            "user.name=Phase Six Tests",
-            "-c",
-            "user.email=phase-six@example.invalid",
-            "commit",
-            "-m",
-            message,
-        ],
-    );
+    run_git(root, &["commit", "-m", message]);
 }

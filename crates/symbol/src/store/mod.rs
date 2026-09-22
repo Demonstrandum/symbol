@@ -1459,11 +1459,19 @@ impl Store {
         }
 
         {
-            let rows = blobs::table
-                .select((blobs::hash, blobs::bytes, blobs::size))
+            // Read the index first and fetch payloads one at a time. Selecting
+            // `bytes` for every row at once would hold the entire legacy inline
+            // blob store in memory, which is exactly the size problem this
+            // migration exists to fix.
+            let index = blobs::table
+                .select((blobs::hash, blobs::size))
                 .order(blobs::hash)
-                .load::<(ContentHash, Vec<u8>, i64)>(&mut *db)?;
-            for (hash, bytes, size) in rows {
+                .load::<(ContentHash, i64)>(&mut *db)?;
+            for (hash, size) in index {
+                let bytes = blobs::table
+                    .find(hash)
+                    .select(blobs::bytes)
+                    .first::<Vec<u8>>(&mut *db)?;
                 if i64::try_from(bytes.len()).expect("blob size fits in i64") != size
                     || ContentHash::from(blake3::hash(&bytes)) != hash
                 {

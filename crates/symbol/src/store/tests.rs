@@ -2285,6 +2285,59 @@ fn inventory_and_conditional_put_abort_strictly_on_drift() {
     ));
 }
 
+/// The tree hash is a content hash, so expiry has to stay outside it.
+///
+/// `regenerate_site` finalises the hash over files, allocated entries and
+/// aliases before it appends the expiry section to `symbol.toml`. That is
+/// deliberate: it keeps the site `ETag` covering exactly what
+/// `GET /{name}/FILES` inventory JSON reports, which excludes the generated
+/// manifest for the same reason. Folding expiry in would change every existing
+/// site's tree hash and invalidate stored `If-Match` values for a property that
+/// is not content.
+#[test]
+fn expiry_changes_leave_the_content_tree_hash_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::new(dir.path().to_path_buf()).unwrap();
+    store.put_file("hello", "index.html", b"body").unwrap();
+    let baseline = store.site_inventory("hello").unwrap();
+
+    store
+        .set_expiry(
+            "hello",
+            "",
+            Some(ExpiryPolicy::Relative {
+                duration_seconds: 604_800,
+            }),
+        )
+        .unwrap();
+
+    let after = store.site_inventory("hello").unwrap();
+    assert_eq!(after.tree_hash, baseline.tree_hash);
+    assert_eq!(after.content_revision, baseline.content_revision);
+
+    // The manifest really did change, so this is an exclusion rather than a
+    // no-op that happens to leave the hash alone.
+    let Node::File { hash, .. } = store.lookup("hello", "symbol.toml").unwrap() else {
+        panic!("generated manifest is a file");
+    };
+    let manifest = String::from_utf8(store.read_blob(hash).unwrap().to_vec()).unwrap();
+    assert!(manifest.contains("[expiry.site]"), "{manifest}");
+    assert!(manifest.contains("duration_seconds = 604800"), "{manifest}");
+
+    // An `If-Match` carrying the pre-expiry hash must still be accepted.
+    let update = dir.path().join("update");
+    fs::write(&update, b"changed").unwrap();
+    store
+        .put_uploaded_file("hello", "index.html", update, Some(&baseline.tree_hash))
+        .unwrap();
+
+    // Content changes still move it.
+    assert_ne!(
+        store.site_inventory("hello").unwrap().tree_hash,
+        baseline.tree_hash
+    );
+}
+
 #[test]
 fn sqlite_index_and_blob() {
     let dir = tempfile::tempdir().unwrap();

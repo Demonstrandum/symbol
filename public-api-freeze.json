@@ -1,6 +1,6 @@
 {
   "format": 1,
-  "baseline_contract_sha256": "3e672acb1c1bece10c2daf485e10e2f6f6c349af4f04de53e46a9d6d5364a5cd",
+  "baseline_contract_sha256": "8fb320ef498f006330268806b21116994be914b5270c767b16d33482dbeeb9aa",
   "baseline_endpoint_sha256": {
     "archive get": "6ae0a4026b29693b62df0ab0ff81feb1671d06c1abf4996418295bb26f0745df",
     "archive pop": "d5873a32e83f622c84641a05fb89f04cee62889d06ec92a824e78636d138fa09",

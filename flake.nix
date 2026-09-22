@@ -298,6 +298,7 @@
             export SYMBOL_BIN="${package}/bin/symbol"
             python3 tests/api_contract.py
             python3 tests/documentation_surface.py
+            python3 tests/command_matrix.py
             ${pythonSdk}/bin/python3 tests/manual_examples.py
           '';
           e2eInputs = [

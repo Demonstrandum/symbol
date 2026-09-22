@@ -1453,9 +1453,12 @@ an exact extensionless file or directory always wins. Explicit missing
 Unambiguous `.html` / `.htm` files also redirect: `GET /{name}/about.html`
 returns `307` to `/{name}/about` when no file, directory, or alias occupies
 `about`. A `.htm` file stays put when `{stem}.html` exists, because the
-extensionless fallback prefers `.html`. HTML directory listings use the same
-pretty links and labels; JSON and plain listings keep the stored names. `PUT`,
-`DELETE`, `EXPIRE`, and `HASH` stay on the real path.
+extensionless fallback prefers `.html`. HTML directory listings link to those
+same pretty paths, but every listing labels an entry with its stored name,
+extension included. An `index.html` entry, or an `index.htm` entry with no
+`index.html` beside it, links to the directory that serves it rather than to a
+path that would only redirect. `PUT`, `DELETE`, `EXPIRE`, and `HASH` stay on
+the real path.
 
 These control suffixes are reserved:
 
@@ -1998,7 +2001,17 @@ errors are `400`, `416`, or `413`; stale content or tree guards return `412`.
 
 Every site contains a server-generated `symbol.toml` and archives include it.
 Uploads cannot replace it. It is excluded from inventory/stats file counts and
-from the tree hash. Example:
+from the tree hash.
+
+The tree hash covers site content only: stored files, allocated entries, and
+aliases. Expiry policies are listed in this manifest but are deliberately
+outside the hash, so an `EXPIRE` that changes only a policy rewrites the
+manifest while leaving `tree_hash`, `content_revision`, and therefore the site
+ETag unchanged; an `If-Match` captured before it still applies. This is the
+same boundary `GET /{name}/FILES` inventory JSON draws by excluding the
+generated manifest, so the ETag covers exactly what the inventory reports.
+
+Example:
 
 ```toml
 version = 1

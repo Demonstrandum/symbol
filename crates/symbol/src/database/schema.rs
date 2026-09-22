@@ -1503,6 +1503,252 @@ pub fn normalize_v6_schema() -> Vec<String> {
     ]
 }
 
+/// One table rebuilt by [`normalize_v11_schema`].
+struct V11RepairTable {
+    /// Live table name. Its snapshot is this name plus `_v11_source`.
+    name: &'static str,
+    /// Columns carried across, in canonical order.
+    columns: &'static [&'static str],
+    /// Restore expressions, when the copy is not a plain column-for-column one.
+    ///
+    /// Positional: entry `i` overrides `columns[i]`.
+    restore: &'static [(usize, &'static str)],
+}
+
+/// Tables rebuilt by [`normalize_v11_schema`], parents before children.
+///
+/// Everything except `undo_sites` is `sites` or one of its descendants, so this
+/// order is a safe restore order and its reverse is a safe drop order.
+const V11_REPAIR_TABLES: &[V11RepairTable] = &[
+    V11RepairTable {
+        name: "sites",
+        columns: &[
+            "id",
+            "name",
+            "created",
+            "updated",
+            "public_url",
+            "content_revision",
+            "tree_hash",
+            "creator_kind",
+            "creator_hash",
+            "claim_hash",
+            "management_hash",
+            "management_status",
+        ],
+        restore: &[(6, "COALESCE(tree_hash, zeroblob(32))")],
+    },
+    V11RepairTable {
+        name: "site_entries",
+        columns: &["site_id", "path", "kind"],
+        restore: &[],
+    },
+    V11RepairTable {
+        name: "site_events",
+        columns: &["id", "site_id", "kind", "occurred", "files"],
+        restore: &[],
+    },
+    V11RepairTable {
+        name: "expiry_policies",
+        columns: &[
+            "site_id",
+            "path",
+            "target_kind",
+            "mode",
+            "duration_seconds",
+            "deadline",
+            "min_age_seconds",
+            "max_age_seconds",
+            "max_size_bytes",
+            "power",
+            "refreshed",
+            "own_deadline",
+            "size_bytes",
+        ],
+        restore: &[],
+    },
+    V11RepairTable {
+        name: "path_aggregates",
+        columns: &["site_id", "path", "logical_bytes", "file_count"],
+        restore: &[],
+    },
+    V11RepairTable {
+        name: "pending_allocations",
+        columns: &[
+            "token",
+            "site_id",
+            "folder",
+            "hash",
+            "size",
+            "media_type",
+            "request_fingerprint",
+            "created",
+            "expires",
+        ],
+        restore: &[],
+    },
+    V11RepairTable {
+        name: "files",
+        columns: &["site_id", "path", "kind", "hash", "size"],
+        restore: &[],
+    },
+    V11RepairTable {
+        name: "allocated_entries",
+        columns: &[
+            "site_id",
+            "path",
+            "kind",
+            "hash",
+            "size",
+            "naming_mode",
+            "prefix",
+            "suffix",
+            "extension",
+            "media_type",
+        ],
+        restore: &[],
+    },
+    V11RepairTable {
+        name: "aliases",
+        columns: &[
+            "site_id",
+            "path",
+            "kind",
+            "canonical_target",
+            "resolved_kind",
+            "resolved_hash",
+            "resolved_size",
+        ],
+        restore: &[],
+    },
+    V11RepairTable {
+        name: "undo_sites",
+        columns: &[
+            "token",
+            "name",
+            "existed",
+            "public_url",
+            "created",
+            "updated",
+            "content_revision",
+            "tree_hash",
+        ],
+        restore: &[(7, "COALESCE(tree_hash, zeroblob(32))")],
+    },
+];
+
+impl V11RepairTable {
+    fn snapshot(&self) -> String {
+        format!("{}_v11_source", self.name)
+    }
+
+    fn column_list(&self) -> String {
+        self.columns
+            .iter()
+            .map(|column| quote_ident(column))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn restore_list(&self) -> String {
+        self.columns
+            .iter()
+            .enumerate()
+            .map(|(position, column)| {
+                self.restore
+                    .iter()
+                    .find(|(index, _)| *index == position)
+                    .map_or_else(
+                        || quote_ident(column),
+                        |(_, expression)| (*expression).to_string(),
+                    )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+fn quote_ident(name: &str) -> String {
+    debug_assert!(
+        !name.contains('"'),
+        "schema identifiers are fixed and never quoted"
+    );
+    let mut quoted = String::with_capacity(name.len() + 2);
+    quoted.push('"');
+    quoted.push_str(name);
+    quoted.push('"');
+    quoted
+}
+
+/// Rebuild the v11 tables that `ALTER TABLE` cannot bring into canonical shape.
+///
+/// `upgrade_v10_to_v11` converts `sites.tree_hash` and `undo_sites.tree_hash`
+/// from hex text to a 32-byte blob through a temporary column, because renaming
+/// `sites` would rewrite the `REFERENCES "sites"` clause of all five tables
+/// that point at it. `PRAGMA foreign_keys=OFF` cannot prevent that: the pragma
+/// is silently ignored inside a transaction, and every migration arm runs in
+/// one.
+///
+/// The cost of the temporary-column route is that the rebuilt column comes back
+/// appended to the end of the table, nullable, and without its
+/// `DEFAULT x'00...'`, so an upgraded database does not match a fresh one. This
+/// repair closes that gap by dropping and recreating the affected tables rather
+/// than renaming them -- `DROP TABLE` does not rewrite anyone's `REFERENCES`
+/// clause. Rows are parked in unconstrained snapshot tables first, because
+/// dropping `sites` would otherwise cascade into its descendants.
+///
+/// Recreation replays the whole canonical table and index set. Every statement
+/// is `IF NOT EXISTS`, so the tables that were not dropped are untouched and the
+/// list cannot fall out of step with [`tables`] and [`indexes`].
+///
+/// This is the v11 counterpart of [`normalize_v6_schema`] and is likewise kept
+/// out of the hashed migration program: it repairs a schema rather than
+/// defining one, and folding it in would invalidate the recorded program hash
+/// of every database already at v11.
+pub fn normalize_v11_schema() -> Vec<String> {
+    let mut statements = Vec::new();
+    for table in V11_REPAIR_TABLES {
+        statements.push(format!(
+            "CREATE TABLE {} AS SELECT {} FROM {}",
+            quote_ident(&table.snapshot()),
+            table.column_list(),
+            quote_ident(table.name),
+        ));
+    }
+    for table in V11_REPAIR_TABLES.iter().rev() {
+        statements.push(
+            Table::drop()
+                .table(Alias::new(table.name))
+                .to_owned()
+                .to_string(SqliteQueryBuilder),
+        );
+    }
+    for table in tables() {
+        statements.push(table.to_string(SqliteQueryBuilder));
+    }
+    for index in indexes() {
+        statements.push(index.to_string(SqliteQueryBuilder));
+    }
+    for table in V11_REPAIR_TABLES {
+        statements.push(format!(
+            "INSERT INTO {} ({}) SELECT {} FROM {}",
+            quote_ident(table.name),
+            table.column_list(),
+            table.restore_list(),
+            quote_ident(&table.snapshot()),
+        ));
+    }
+    for table in V11_REPAIR_TABLES {
+        statements.push(
+            Table::drop()
+                .table(Alias::new(table.snapshot()))
+                .to_owned()
+                .to_string(SqliteQueryBuilder),
+        );
+    }
+    statements
+}
+
 fn sites_table() -> TableCreateStatement {
     let mut tree_hash_col = ColumnDef::new(Sites::TreeHash);
     tree_hash_col.blob().not_null().default([0_u8; 32].to_vec());
@@ -1598,6 +1844,11 @@ fn blobs_table_inner(binary_hashes: bool) -> TableCreateStatement {
         .table(Blobs::Table)
         .if_not_exists()
         .col(hash_col)
+        // Retired. Payloads moved to the on-disk blob tree in the
+        // `external_blobs_v1` migration and every writer now stores an empty
+        // vector here. The column is kept so that a database which has not run
+        // that migration yet still matches this schema; dropping it would mean
+        // another table rebuild for no gain.
         .col(
             ColumnDef::new(Blobs::Bytes)
                 .blob()
