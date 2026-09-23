@@ -145,7 +145,9 @@ supports:
 | `x86_64-linux` | `ubuntu-latest` |
 | `aarch64-linux` | `ubuntu-24.04-arm` |
 | `aarch64-darwin` | `macos-latest` |
-| `x86_64-darwin` | `macos-15-intel` |
+
+Intel macOS is not covered: nixpkgs 26.11 dropped `x86_64-darwin`, so the
+flake no longer lists it as a supported system.
 
 Because CI runs the flake rather than its own script, the two cannot drift:
 adding a check to `flake.nix` adds it to CI, and a green CI run means the same

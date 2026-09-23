@@ -1,5 +1,8 @@
 # The canonical gate, on every platform the flake claims to support.
 #
+# Intel macOS is absent because nixpkgs 26.11 dropped x86_64-darwin; see the
+# `systems` list in flake.nix.
+#
 # `nix/check.sh` is the same command `release-check` runs, so CI and a local
 # release check cannot drift: everything -- rustfmt, clippy, the Rust suite,
 # both e2e shell suites, all five SDK suites, the POSIX static and dash
@@ -43,8 +46,6 @@ jobs:
             runner: ubuntu-24.04-arm
           - system: aarch64-darwin
             runner: macos-latest
-          - system: x86_64-darwin
-            runner: macos-15-intel
     steps:
       - uses: actions/checkout@v7
 
