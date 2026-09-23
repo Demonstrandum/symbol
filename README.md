@@ -1,5 +1,7 @@
 # symbol
 
+[![CI](https://github.com/symbolica-ai/symbol/actions/workflows/ci.yml/badge.svg)](https://github.com/symbolica-ai/symbol/actions/workflows/ci.yml)
+
 Tiny static-site and media hosting for a tailnet.
 
 The public user guide is [`static/docs.md`](static/docs.md) and is served at
@@ -128,8 +130,34 @@ identity, so management relies on claim/management tokens by default.
 ```
 
 This runs formatting checks, strict Clippy lints, Rust tests, shell syntax
-checks, and client conformance tests. The public guide is parsed and rendered
-by the Rust page tests.
+checks, and client conformance tests. The guide and the API manuals are
+rendered at build time, so their renderers are covered by the
+`crates/symbol/generation` tests rather than at runtime.
+
+## Continuous integration
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs `sh nix/check.sh`
+— the same canonical gate as `release-check` — on all four systems the flake
+supports:
+
+| System | Runner |
+| --- | --- |
+| `x86_64-linux` | `ubuntu-latest` |
+| `aarch64-linux` | `ubuntu-24.04-arm` |
+| `aarch64-darwin` | `macos-latest` |
+| `x86_64-darwin` | `macos-15-intel` |
+
+Because CI runs the flake rather than its own script, the two cannot drift:
+adding a check to `flake.nix` adds it to CI, and a green CI run means the same
+thing as a green `release-check`. Require the `all platforms` job in branch
+protection; it stays green only when every matrix entry does, and its name
+survives changes to the matrix.
+
+`nix flake check` needs no secrets: every flake input is a public repository
+and nixpkgs itself comes from `cache.nixos.org`. The store cache only carries
+symbol's own build products, is capped well below GitHub's 10 GB per-repository
+limit so the four platforms do not evict each other, and is written only by
+pushes to `main`.
 
 The server binary exposes its typed public contract for conformance tooling:
 
