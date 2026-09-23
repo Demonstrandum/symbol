@@ -33,10 +33,12 @@
     }:
     let
       inherit (nixpkgs) lib;
+      # x86_64-darwin is deliberately absent: nixpkgs 26.11 dropped it, so
+      # evaluating any output for that system fails outright. Listing it here
+      # only advertised a platform this flake cannot build.
       systems = [
         "x86_64-linux"
         "aarch64-linux"
-        "x86_64-darwin"
         "aarch64-darwin"
       ];
       forEachSystem =
