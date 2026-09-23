@@ -1,0 +1,99 @@
+# The canonical gate, on every platform the flake claims to support.
+#
+# `nix/check.sh` is the same command `release-check` runs, so CI and a local
+# release check cannot drift: everything -- rustfmt, clippy, the Rust suite,
+# both e2e shell suites, all five SDK suites, the POSIX static and dash
+# runtimes, the docs gates, the public API freeze and the soak -- is a flake
+# check. Adding a check to `flake.nix` adds it here for free.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Weekly, to catch bit-rot in the pinned inputs rather than only on pushes.
+    - cron: "17 6 * * 1"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Superseded pull request runs are worth cancelling; main is not, because its
+  # caches and green history are.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+  # cache-nix-action deletes superseded caches through the API.
+  actions: write
+
+jobs:
+  check:
+    name: ${{ matrix.system }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      # Report every platform, not just the first to break.
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            runner: ubuntu-latest
+          - system: aarch64-linux
+            runner: ubuntu-24.04-arm
+          - system: aarch64-darwin
+            runner: macos-latest
+          - system: x86_64-darwin
+            runner: macos-15-intel
+    steps:
+      - uses: actions/checkout@v7
+
+      # The Linux images ship ~30 GB of toolchains this build never touches,
+      # and a cold Nix store plus a vendored Rust build wants that room.
+      - name: Reclaim runner disk
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /usr/local/share/boost \
+            /opt/hostedtoolcache || true
+          df -h /
+
+      - uses: DeterminateSystems/nix-installer-action@v23
+
+      # nixpkgs itself comes from cache.nixos.org; this only carries symbol's
+      # own build products between runs. The GitHub cache is 10 GB for the whole
+      # repository, so the ceiling is deliberately low -- four platforms sharing
+      # it would otherwise evict each other on every push. Only main writes,
+      # so pull requests read a warm cache without competing to fill it.
+      - uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: >-
+            nix-${{ matrix.system }}-${{
+              hashFiles('flake.lock', 'Cargo.lock', 'rust-toolchain.toml')
+            }}
+          restore-prefixes-first-match: nix-${{ matrix.system }}-
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          gc-max-store-size: 2G
+          purge: true
+          purge-prefixes: nix-${{ matrix.system }}-
+          purge-created: P7D
+
+      - name: nix flake check
+        run: sh nix/check.sh
+
+  # A single stable status to require in branch protection, so the required
+  # check does not have to be renamed whenever the matrix changes.
+  gate:
+    name: all platforms
+    runs-on: ubuntu-latest
+    needs: check
+    if: always()
+    steps:
+      - name: Verify every platform passed
+        run: |
+          result='${{ needs.check.result }}'
+          printf 'matrix result: %s\n' "${result}"
+          [ "${result}" = success ]

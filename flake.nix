@@ -79,6 +79,7 @@
           ./api-version
           ./api-version.toml
           ./check
+          ./clippy.toml
           ./crates
           ./examples
           ./flake.nix
@@ -144,6 +145,39 @@
             cargo = rust;
             rustc = rust;
           };
+          # Formatting and lints used to run only from ./check, on a developer's
+          # own machine, so a regression could reach main without the canonical
+          # gate ever noticing. Reusing the package derivation inherits its
+          # vendored registry; this toolchain is prepended so that its cargo,
+          # which carries the clippy and rustfmt components, wins over the one
+          # rustPlatform puts on PATH.
+          lintToolchain = pkgs.rust-bin.stable."1.98.0".default.override {
+            extensions = [
+              "clippy"
+              "rustfmt"
+            ];
+          };
+          cargoLint =
+            name: command:
+            package.overrideAttrs (old: {
+              pname = name;
+              nativeBuildInputs = [ lintToolchain ] ++ (old.nativeBuildInputs or [ ]);
+              buildPhase = ''
+                runHook preBuild
+                ${command}
+                runHook postBuild
+              '';
+              doCheck = false;
+              installPhase = ''
+                runHook preInstall
+                touch "$out"
+                runHook postInstall
+              '';
+            });
+          rustfmtCheck = cargoLint "symbol-rustfmt" "cargo fmt --all -- --check";
+          clippyCheck = cargoLint "symbol-clippy" (
+            "cargo clippy --workspace --all-targets --all-features --locked -- -D warnings"
+          );
           pythonWorkspace = uv2nix.lib.workspace.loadWorkspace {
             workspaceRoot = src + "/tooling";
           };
@@ -341,6 +375,8 @@
             lifecycle-e2e = lifecycleE2e;
             inherit package;
             production-guard = productionGuard;
+            rustfmt = rustfmtCheck;
+            clippy = clippyCheck;
             generated-sources = generatedSources;
             generated-provenance = provenance;
             public-api-freeze = publicApiFreeze;
